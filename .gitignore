@@ -1,0 +1,57 @@
+# macOS
+.DS_Store
+
+# logs
+*.log
+
+# env
+.env
+.env.*
+
+# node
+node_modules/
+dist/
+*.tsbuildinfo
+web-console/vite.config.js
+web-console/vite.config.d.ts
+
+# go
+bin/
+!data-plane/src/bin/
+!data-plane/src/bin/*.rs
+
+# rust
+/target/
+**/target/
+
+# ide
+.vscode/
+.idea/
+build/
+coverage/
+*.tmp
+*.swp
+Thumbs.db
+
+# build/release artifacts (e.g., holo-rocky9-x86_64.tar.gz)
+*.tar.gz
+*.tgz
+*.zip
+
+# project internal docs
+specs/
+docs/
+VeeamLogs/
+
+# Codex and Claude files
+AGENTS.md
+CLAUDE.md
+.specify/
+.agents/
+.claude/
+.playwright/
+.cargo/
+.playwright-mcp/
+.dockerignore
+.editorconfig
+security_best_practices_report.md

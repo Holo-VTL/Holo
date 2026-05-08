@@ -1,0 +1,29 @@
+[Unit]
+Description=holo TCMU Handler for %I
+After=holo-data-plane.service holo-control-plane.service tcmu-runner.service
+Requires=tcmu-runner.service
+PartOf=holo-control-plane.service
+
+[Service]
+Type=simple
+User=holo
+Group=holo
+
+# The instance name (%i) is expected to be the publication ID.
+# This template is managed by the holo control-plane when starting target mode.
+Environment=RUST_BACKTRACE=1
+ExecStart=/usr/local/bin/holo-tcmu-handler --publication-id %i --socket-path /run/holo/cdb-%i.sock
+
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+# Security / Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/holo
+
+[Install]
+WantedBy=multi-user.target

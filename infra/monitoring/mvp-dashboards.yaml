@@ -1,0 +1,11 @@
+dashboards:
+  - name: holo-mvp-overview
+    panels:
+      - title: Connection Success Rate
+        metric: holo_connection_success_rate
+      - title: Tape Command Errors
+        metric: holo_tape_command_errors_total
+      - title: Cartridge Utilization
+        metric: holo_cartridge_utilization_ratio
+      - title: Policy Denials
+        metric: holo_policy_denied_total

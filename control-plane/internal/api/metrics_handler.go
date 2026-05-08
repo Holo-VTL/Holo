@@ -1,0 +1,72 @@
+package api
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"sync/atomic"
+
+	"github.com/Holo-VTL/Holo/control-plane/internal/metrics"
+)
+
+type MetricsHandler struct {
+	registry *metrics.MetricsRegistry
+}
+
+func NewMetricsHandler(registry *metrics.MetricsRegistry) *MetricsHandler {
+	return &MetricsHandler{registry: registry}
+}
+
+func (h *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = w.Write([]byte(PrometheusText(h.registry)))
+}
+
+func PrometheusText(registry *metrics.MetricsRegistry) string {
+	if registry == nil {
+		return ""
+	}
+	var buf bytes.Buffer
+
+	fmt.Fprintf(&buf, "# HELP holo_publications_active Number of active iSCSI target publications\n")
+	fmt.Fprintf(&buf, "# TYPE holo_publications_active gauge\n")
+	fmt.Fprintf(&buf, "holo_publications_active %d\n", atomic.LoadInt64(&registry.PublicationsActive))
+
+	fmt.Fprintf(&buf, "# HELP holo_publications_total Total target publications created historically\n")
+	fmt.Fprintf(&buf, "# TYPE holo_publications_total counter\n")
+	fmt.Fprintf(&buf, "holo_publications_total %d\n", atomic.LoadInt64(&registry.PublicationsTotal))
+
+	fmt.Fprintf(&buf, "# HELP holo_audit_events_total Total number of audit events recorded\n")
+	fmt.Fprintf(&buf, "# TYPE holo_audit_events_total counter\n")
+	fmt.Fprintf(&buf, "holo_audit_events_total %d\n", atomic.LoadInt64(&registry.AuditEventsTotal))
+
+	fmt.Fprintf(&buf, "# HELP holo_audit_write_failures_total Total failed audit writes to persistent journal\n")
+	fmt.Fprintf(&buf, "# TYPE holo_audit_write_failures_total counter\n")
+	fmt.Fprintf(&buf, "holo_audit_write_failures_total %d\n", atomic.LoadInt64(&registry.AuditWriteFailures))
+
+	fmt.Fprintf(&buf, "# HELP holo_audit_journal_failed Persistent audit journal failure state (1=failed, 0=ok)\n")
+	fmt.Fprintf(&buf, "# TYPE holo_audit_journal_failed gauge\n")
+	fmt.Fprintf(&buf, "holo_audit_journal_failed %d\n", atomic.LoadInt64(&registry.AuditJournalFailed))
+
+	fmt.Fprintf(&buf, "# HELP holo_scsi_sense_errors_total Total SCSI CHECK CONDITION sense errors\n")
+	fmt.Fprintf(&buf, "# TYPE holo_scsi_sense_errors_total counter\n")
+	fmt.Fprintf(&buf, "holo_scsi_sense_errors_total %d\n", atomic.LoadInt64(&registry.ScsiSenseErrors))
+
+	fmt.Fprintf(&buf, "# HELP holo_dedup_hits_total Total storage deduplication lookup hits\n")
+	fmt.Fprintf(&buf, "# TYPE holo_dedup_hits_total counter\n")
+	fmt.Fprintf(&buf, "holo_dedup_hits_total %d\n", atomic.LoadInt64(&registry.DedupHitsTotal))
+
+	fmt.Fprintf(&buf, "# HELP holo_compression_ratio_avg Latest observed compression ratio (gauge)\n")
+	fmt.Fprintf(&buf, "# TYPE holo_compression_ratio_avg gauge\n")
+	fmt.Fprintf(&buf, "holo_compression_ratio_avg %f\n", registry.GetCompressionRatio())
+
+	fmt.Fprintf(&buf, "# HELP holo_health_status Aggregated health check status (1=ok, 0=down)\n")
+	fmt.Fprintf(&buf, "# TYPE holo_health_status gauge\n")
+	fmt.Fprintf(&buf, "holo_health_status %d\n", atomic.LoadInt64(&registry.HealthStatus))
+
+	return buf.String()
+}

@@ -1,0 +1,40 @@
+version: "3.9"
+services:
+  control-plane:
+    image: golang:1.24
+    working_dir: /workspace/control-plane
+    command: ["go", "run", "./cmd/api"]
+    environment:
+      - HOLO_HTTP_ADDR=0.0.0.0:80
+      - HOLO_API_KEY=
+    volumes:
+      - ../../control-plane:/workspace/control-plane:ro
+    ports:
+      - "80:80"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  data-plane:
+    image: rust:1.78
+    working_dir: /workspace/data-plane
+    command: ["cargo", "run", "--bin", "tcmu_handler", "--", "--socket-path", "/tmp/holo-compose.sock", "--publication-id", "compose"]
+    volumes:
+      - ../../data-plane:/workspace/data-plane:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+    restart: unless-stopped

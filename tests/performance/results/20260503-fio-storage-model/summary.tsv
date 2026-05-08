@@ -1,0 +1,9 @@
+target	test	read_mib_s	write_mib_s	read_iops	write_iops	p99_read_ms	p99_write_ms
+ssd	seqwrite-1m	0.00	1345.75	0.00	1345.75	0.000	47.448
+ssd	randwrite-64k	0.00	623.49	0.00	9975.79	0.000	25.297
+ssd	randread-64k	264.12	0.00	4225.87	0.00	4.112	0.000
+ssd	syncwrite-1m	0.00	330.51	0.00	330.51	0.000	5.079
+hdd	seqwrite-1m	0.00	52.74	0.00	52.74	0.000	7683.965
+hdd	randwrite-64k	0.00	68.95	0.00	1103.21	0.000	200.278
+hdd	randread-64k	18.29	0.00	292.57	0.00	200.278	0.000
+hdd	syncwrite-1m	0.00	52.72	0.00	52.72	0.000	95.945

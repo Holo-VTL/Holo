@@ -1,0 +1,5 @@
+test	write_mib_s	write_iops	p99_write_ms
+hdd-seq-qd1-nofsync	92.71	92.71	34.341
+hdd-seq-qd1-fsynclose	75.88	75.88	79.167
+hdd-seq-qd4-fsynclose	97.85	97.85	139.461
+hdd-seq-qd16-fsynclose-repeat	91.24	91.24	633.340

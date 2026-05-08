@@ -1,0 +1,89 @@
+Holo-VTL
+Copyright (c) 2026 Holo-VTL Contributors
+
+This product is licensed under the MIT License. See the LICENSE file for the
+full license text.
+
+================================================================================
+Trademark Attribution and Fair Use Notice
+================================================================================
+
+Holo-VTL is a virtual tape library that emulates SCSI device identities of real
+tape and library hardware so that backup software which whitelists specific
+vendor / product / firmware combinations can interoperate with virtual devices.
+The emulated identifiers (Vendor IDentification, Product IDentification, VPD
+pages, density codes, element addresses, mode pages) are derived from public
+SCSI specifications (SPC-4, SSC-3, SMC-3) and from vendor-published device
+documentation.
+
+The following names appear in device profiles, inquiry strings, or
+configuration aliases solely for the purpose of compatibility and
+interoperability. They are the property of their respective owners. Their use
+in this project does not imply endorsement, sponsorship, or any affiliation
+with the trademark holders.
+
+  - IBM, IBM ULTRIUM-HH*, IBM 03584L*, IBM TS*  — International Business
+    Machines Corporation
+  - Quantum, Quantum Scalar*, Superloader*       — Quantum Corporation
+  - HP, Hewlett Packard, HP Ultrium*, HP MSL*,
+    HP EML E-Series*                             — Hewlett Packard Enterprise
+                                                   Development LP
+  - Dell, PowerVault*                            — Dell Inc.
+  - StorageTek, STK, STK L*                      — Oracle Corporation
+  - Spectra, Spectra Logic, Spectra T*           — Spectra Logic Corporation
+  - Overland, Overland NEO*                      — Overland Storage, Inc.
+  - SGI                                          — Silicon Graphics
+                                                   International Corp.
+  - ADIC                                         — Quantum Corporation
+                                                   (formerly Advanced Digital
+                                                   Information Corporation)
+  - LTO, Linear Tape-Open                        — Hewlett Packard Enterprise
+                                                   Development LP, International
+                                                   Business Machines Corporation,
+                                                   and Quantum Corporation
+
+All other product names, logos, and brands referenced in source code, device
+profiles, documentation, or test fixtures are property of their respective
+owners. All company, product, and service names used here are for
+identification purposes only.
+
+================================================================================
+Provenance Statement
+================================================================================
+
+Holo-VTL is an independent, clean-room implementation. It contains no source
+code derived from mhvtl, quadstorvtl, or any other GPL/AGPL/LGPL-licensed
+virtual-tape-library project. Naming patterns such as "drive_type_v*" and
+"library_type_v*" exist only as configuration aliases to ease migration from
+deployments that previously used those identifiers; they are not derived code
+or copied artifacts.
+
+Every emulated SCSI command path, mode page, log page, and element-address
+layout is built from publicly available specifications (T10 documents) and
+vendor-published manuals. Where vendor-specific behavior is required for
+interoperability, the implementation derives the behavior from observation of
+the public spec, not from any proprietary source.
+
+================================================================================
+Third-Party Dependencies
+================================================================================
+
+This project depends on third-party Rust crates and Go modules, all under
+permissive licenses (MIT, Apache-2.0, BSD, ISC) except for the following:
+
+  - github.com/hashicorp/golang-lru/v2 — Mozilla Public License 2.0 (file-level
+    copyleft only; obligations are limited to modifications of the MPL-licensed
+    files themselves and do not propagate to the rest of the project).
+
+For the full list of transitive dependencies and their licenses, see:
+
+  - data-plane/Cargo.lock
+  - control-plane/go.sum
+
+================================================================================
+Reporting
+================================================================================
+
+If you believe any content in this project infringes a trademark, copyright,
+or other right, please open an issue or contact the maintainers so the
+attribution or content can be reviewed and corrected.

@@ -1,0 +1,29 @@
+groups:
+  - name: holo.rules
+    rules:
+      - alert: HoloDown
+        expr: holo_health_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "holo component down (instance {{ $labels.instance }})"
+          description: "One or more holo components (db, data-plane, runner) are failing health checks."
+
+      - alert: HoloHighSenseErrorRate
+        expr: rate(holo_scsi_sense_errors_total[1m]) > 0.166666
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High SCSI check condition rate"
+          description: "Sense errors exceed 10 per minute, indicating initiator compatibility issues or media defects."
+
+      - alert: HoloAuditStopped
+        expr: rate(holo_audit_events_total[10m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "holo audit log stopped"
+          description: "No audit events recorded in 10+ minutes. Verify control plane logging is functioning."

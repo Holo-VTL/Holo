@@ -1,0 +1,63 @@
+:root {
+  --font-sans: "Manrope", "Noto Sans SC", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", monospace;
+
+  --bg-app: #8f8b86;
+  --bg-canvas: #f1f1f1;
+  --bg-panel: rgba(251, 251, 251, 0.88);
+  --bg-panel-solid: #fbfbfb;
+  --bg-panel-soft: rgba(241, 241, 241, 0.74);
+  --bg-chip: rgba(255, 255, 255, 0.62);
+  --bg-overlay: rgba(251, 251, 251, 0.72);
+  --glass-highlight: rgba(255, 255, 255, 0.78);
+
+  --text-strong: #0d0d0d;
+  --text-body: #272727;
+  --text-muted: #75716d;
+
+  --border: rgba(13, 13, 13, 0.08);
+  --border-strong: rgba(13, 13, 13, 0.16);
+
+  --brand: #f49a51;
+  --brand-strong: #0d0d0d;
+  --brand-soft: rgba(244, 154, 81, 0.18);
+  --success: #18a84a;
+  --info: #1d82df;
+  --warning: #f49a51;
+  --danger: #d64242;
+
+  --shadow-soft: 0 16px 40px rgba(13, 13, 13, 0.06);
+  --shadow: 0 28px 74px rgba(13, 13, 13, 0.14);
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 8px;
+}
+
+:root[data-theme="dark"] {
+  --bg-app: #20201f;
+  --bg-canvas: #111111;
+  --bg-panel: rgba(32, 32, 31, 0.84);
+  --bg-panel-solid: #20201f;
+  --bg-panel-soft: rgba(255, 255, 255, 0.06);
+  --bg-chip: rgba(255, 255, 255, 0.08);
+  --bg-overlay: rgba(32, 32, 31, 0.72);
+  --glass-highlight: rgba(255, 255, 255, 0.1);
+
+  --text-strong: #fbfbfb;
+  --text-body: #ece7e1;
+  --text-muted: #a5a09a;
+
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.2);
+
+  --brand: #f49a51;
+  --brand-strong: #fbfbfb;
+  --brand-soft: rgba(244, 154, 81, 0.2);
+  --success: #25c768;
+  --info: #58a9f6;
+  --warning: #f8aa64;
+  --danger: #ff6b6b;
+
+  --shadow-soft: 0 18px 44px rgba(0, 0, 0, 0.34);
+  --shadow: 0 30px 78px rgba(0, 0, 0, 0.54);
+}
