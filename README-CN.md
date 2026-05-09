@@ -4,7 +4,7 @@
 
 <div align="center">
 
-<img src="./banner.png" alt="Holo" width="600">
+<img src="./banner.png" alt="Holo" width="100%">
 
 *芥子纳须弥——每一个碎片都蕴含完整的图景。*
 

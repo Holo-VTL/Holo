@@ -4,7 +4,7 @@
 
 <div align="center">
 
-<img src="./banner.png" alt="Holo" width="600">
+<img src="./banner.png" alt="Holo" width="100%">
 
 *Every fragment holds the whole picture.*
 
