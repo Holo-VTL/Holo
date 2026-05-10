@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crate::media::mount_bridge;
@@ -31,9 +33,33 @@ struct ReadPrefetchJob {
     handle: JoinHandle<Result<Option<crate::storage::LogicalReadResult>, StorageError>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadPrefetchDegradation {
+    invalidation_failures: u64,
+    bypass_reads: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReadPrefetchDegradationStatus {
+    pub invalidation_failures: u64,
+    pub bypass_reads: bool,
+}
+
 fn read_prefetch_jobs() -> &'static Mutex<HashMap<PathBuf, VecDeque<ReadPrefetchJob>>> {
     static JOBS: OnceLock<Mutex<HashMap<PathBuf, VecDeque<ReadPrefetchJob>>>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_prefetch_degradation() -> &'static Mutex<HashMap<PathBuf, ReadPrefetchDegradation>> {
+    static STATE: OnceLock<Mutex<HashMap<PathBuf, ReadPrefetchDegradation>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn fail_next_read_prefetch_invalidation_flag() -> &'static AtomicBool {
+    static FAIL_NEXT: AtomicBool = AtomicBool::new(false);
+    &FAIL_NEXT
 }
 
 fn lock_read_prefetch_jobs(
@@ -41,6 +67,13 @@ fn lock_read_prefetch_jobs(
     read_prefetch_jobs()
         .lock()
         .map_err(|_| StorageError::Conflict("read prefetch cache poisoned".to_string()))
+}
+
+fn lock_read_prefetch_degradation(
+) -> Result<MutexGuard<'static, HashMap<PathBuf, ReadPrefetchDegradation>>, StorageError> {
+    read_prefetch_degradation()
+        .lock()
+        .map_err(|_| StorageError::Conflict("read prefetch degradation state poisoned".to_string()))
 }
 
 fn read_prefetch_enabled() -> bool {
@@ -103,11 +136,102 @@ fn discard_read_prefetch_job(job: ReadPrefetchJob) {
     let _ = job.handle.join();
 }
 
-fn invalidate_read_prefetch(layout_root: &Path) {
+fn discard_read_prefetch_jobs_for_key(layout_root: &Path) {
     let jobs = match lock_read_prefetch_jobs() {
         Ok(mut guard) => guard.remove(layout_root),
         Err(err) => {
-            eprintln!("[prefetch] failed to invalidate read prefetch cache: {err}");
+            eprintln!("[prefetch] failed to discard read prefetch cache: {err}");
+            None
+        }
+    };
+    if let Some(jobs) = jobs {
+        for job in jobs {
+            discard_read_prefetch_job(job);
+        }
+    }
+}
+
+fn record_read_prefetch_invalidation_failure(layout_root: &Path, err: StorageError) {
+    let count = match lock_read_prefetch_degradation() {
+        Ok(mut guard) => {
+            let state = guard
+                .entry(layout_root.to_path_buf())
+                .or_insert(ReadPrefetchDegradation {
+                    invalidation_failures: 0,
+                    bypass_reads: true,
+                });
+            state.invalidation_failures = state.invalidation_failures.saturating_add(1);
+            state.bypass_reads = true;
+            state.invalidation_failures
+        }
+        Err(lock_err) => {
+            eprintln!("[prefetch] failed to record read prefetch degradation: {lock_err}");
+            0
+        }
+    };
+    eprintln!(
+        "[prefetch] read prefetch invalidation degraded layout={} failures={} error={err}",
+        layout_root.display(),
+        count
+    );
+}
+
+fn read_prefetch_bypassed(layout_root: &Path) -> bool {
+    match lock_read_prefetch_degradation() {
+        Ok(guard) => guard
+            .get(layout_root)
+            .map(|state| state.bypass_reads)
+            .unwrap_or(false),
+        Err(err) => {
+            eprintln!("[prefetch] failed to read prefetch degradation state: {err}");
+            true
+        }
+    }
+}
+
+fn clear_read_prefetch_degradation(layout_root: &Path) {
+    if let Ok(mut guard) = lock_read_prefetch_degradation() {
+        guard.remove(layout_root);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_read_prefetch_invalidation_for_test() {
+    fail_next_read_prefetch_invalidation_flag().store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn read_prefetch_degradation_status_for_test(
+    layout_root: &Path,
+) -> Option<ReadPrefetchDegradationStatus> {
+    lock_read_prefetch_degradation()
+        .ok()
+        .and_then(|guard| guard.get(layout_root).copied())
+        .map(|state| ReadPrefetchDegradationStatus {
+            invalidation_failures: state.invalidation_failures,
+            bypass_reads: state.bypass_reads,
+        })
+}
+
+#[cfg(test)]
+pub(super) fn clear_read_prefetch_degradation_for_test(layout_root: &Path) {
+    clear_read_prefetch_degradation(layout_root);
+}
+
+fn invalidate_read_prefetch(layout_root: &Path) {
+    #[cfg(test)]
+    if fail_next_read_prefetch_invalidation_flag().swap(false, Ordering::SeqCst) {
+        record_read_prefetch_invalidation_failure(
+            layout_root,
+            StorageError::Conflict("injected read prefetch invalidation failure".to_string()),
+        );
+        return;
+    }
+
+    let jobs = match lock_read_prefetch_jobs() {
+        Ok(mut guard) => guard.remove(layout_root),
+        Err(err) => {
+            record_read_prefetch_invalidation_failure(layout_root, err);
             None
         }
     };
@@ -152,6 +276,10 @@ fn take_read_prefetch(
     }
 
     let key = prefetch_key(layout);
+    if read_prefetch_bypassed(&key) {
+        discard_read_prefetch_jobs_for_key(&key);
+        return Ok(None);
+    }
     let mut stale_jobs = Vec::new();
     let job = {
         let mut guard = lock_read_prefetch_jobs()?;
@@ -209,6 +337,12 @@ fn schedule_read_prefetch(
         return;
     }
 
+    let key = prefetch_key(layout);
+    if read_prefetch_bypassed(&key) {
+        discard_read_prefetch_jobs_for_key(&key);
+        return;
+    }
+
     let depth = read_prefetch_depth();
     let mut wanted = Vec::with_capacity(depth);
     let mut next_position = position;
@@ -223,7 +357,6 @@ fn schedule_read_prefetch(
         return;
     }
 
-    let key = prefetch_key(layout);
     let mut stale_jobs = Vec::new();
     let mut guard = match lock_read_prefetch_jobs() {
         Ok(guard) => guard,
@@ -315,6 +448,7 @@ pub fn unload_media(state: &mut TapeState) -> Result<(), TapeError> {
     state.unmount();
     if let Some(layout) = active_layout.as_ref() {
         discard_layout_caches(layout);
+        clear_read_prefetch_degradation(&layout.root);
     }
     Ok(())
 }

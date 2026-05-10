@@ -1,5 +1,7 @@
 use super::command_chain::{
-    read_fixed_blocks, rewind_media, validate_payload_len, write_fixed_blocks, EraseMode,
+    clear_read_prefetch_degradation_for_test, fail_next_read_prefetch_invalidation_for_test,
+    read_fixed_blocks, read_prefetch_degradation_status_for_test, rewind_media,
+    validate_payload_len, write_fixed_blocks, EraseMode,
 };
 use super::commands_core::{execute, execute_with_sense, CoreCommand, CoreResponse};
 use super::error::TapeError;
@@ -124,6 +126,79 @@ fn fixed_block_read_prefetch_preserves_sequential_payloads() {
     assert_eq!(second, b"bbbb");
     assert_eq!(third, b"cccc");
 
+    std::env::remove_var("HOLO_READ_PREFETCH");
+    std::env::remove_var("HOLO_READ_PREFETCH_DEPTH");
+    cleanup(&state);
+}
+
+#[test]
+fn fixed_block_write_succeeds_when_prefetch_invalidation_degrades() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    std::env::set_var("HOLO_READ_PREFETCH", "1");
+    std::env::set_var("HOLO_READ_PREFETCH_DEPTH", "2");
+
+    let mut state = new_state("prefetch-invalidation-success");
+    execute(
+        &mut state,
+        CoreCommand::Load {
+            cartridge_id: "cart-prefetch-invalidation-success".to_string(),
+        },
+    )
+    .expect("load should pass");
+    execute(&mut state, CoreCommand::SetBlockModeFixed { block_size: 4 }).expect("fixed mode");
+
+    write_fixed_blocks(&mut state, b"aaaabbbb", 4, None).expect("initial write fixed blocks");
+    rewind_media(&mut state).expect("rewind should pass");
+    let first = read_fixed_blocks(&mut state, 4, 1).expect("read first block");
+    assert_eq!(first, b"aaaa");
+
+    let layout = state.active_layout.clone().expect("layout should be active");
+    fail_next_read_prefetch_invalidation_for_test();
+    write_fixed_blocks(&mut state, b"ZZZZ", 4, None)
+        .expect("committed write should not fail on prefetch invalidation");
+
+    let status = read_prefetch_degradation_status_for_test(&layout.root)
+        .expect("prefetch degradation should be recorded");
+    assert_eq!(status.invalidation_failures, 1);
+    assert!(status.bypass_reads);
+
+    clear_read_prefetch_degradation_for_test(&layout.root);
+    std::env::remove_var("HOLO_READ_PREFETCH");
+    std::env::remove_var("HOLO_READ_PREFETCH_DEPTH");
+    cleanup(&state);
+}
+
+#[test]
+fn prefetch_degradation_bypasses_stale_cached_read() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    std::env::set_var("HOLO_READ_PREFETCH", "1");
+    std::env::set_var("HOLO_READ_PREFETCH_DEPTH", "2");
+
+    let mut state = new_state("prefetch-bypass-stale");
+    execute(
+        &mut state,
+        CoreCommand::Load {
+            cartridge_id: "cart-prefetch-bypass-stale".to_string(),
+        },
+    )
+    .expect("load should pass");
+    execute(&mut state, CoreCommand::SetBlockModeFixed { block_size: 4 }).expect("fixed mode");
+
+    write_fixed_blocks(&mut state, b"aaaabbbb", 4, None).expect("initial write fixed blocks");
+    rewind_media(&mut state).expect("rewind should pass");
+    let first = read_fixed_blocks(&mut state, 4, 1).expect("read first block");
+    assert_eq!(first, b"aaaa");
+
+    let layout = state.active_layout.clone().expect("layout should be active");
+    fail_next_read_prefetch_invalidation_for_test();
+    write_fixed_blocks(&mut state, b"ZZZZ", 4, None).expect("overwrite second block");
+
+    state.current_position = 4;
+    let read_back = read_fixed_blocks(&mut state, 4, 1)
+        .expect("degraded prefetch should bypass stale queued read");
+    assert_eq!(read_back, b"ZZZZ");
+
+    clear_read_prefetch_degradation_for_test(&layout.root);
     std::env::remove_var("HOLO_READ_PREFETCH");
     std::env::remove_var("HOLO_READ_PREFETCH_DEPTH");
     cleanup(&state);
