@@ -18,6 +18,7 @@ func TestMetricsHandler_ResponseFormat(t *testing.T) {
 	atomic.AddInt64(&registry.ScsiSenseErrors, 42)
 	registry.RecordCompressionRatio(2.35)
 	registry.RecordAPIRequestDuration(7 * time.Millisecond)
+	registry.RecordAuditJournalStats(128, time.Now().UTC().Add(-30*time.Second))
 
 	handler := NewMetricsHandler(registry)
 	req := httptest.NewRequest("GET", "/metrics", nil)
@@ -44,6 +45,12 @@ func TestMetricsHandler_ResponseFormat(t *testing.T) {
 	}
 	if !strings.Contains(out, "holo_audit_journal_parse_errors_total 0") {
 		t.Errorf("Missing holo_audit_journal_parse_errors_total %s", out)
+	}
+	if !strings.Contains(out, "holo_audit_journal_size_bytes 128") {
+		t.Errorf("Missing holo_audit_journal_size_bytes %s", out)
+	}
+	if !strings.Contains(out, "holo_audit_journal_lag_seconds") {
+		t.Errorf("Missing holo_audit_journal_lag_seconds %s", out)
 	}
 	if !strings.Contains(out, "holo_api_request_duration_seconds_bucket") {
 		t.Errorf("Missing holo_api_request_duration_seconds histogram %s", out)

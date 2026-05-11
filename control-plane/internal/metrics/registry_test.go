@@ -72,6 +72,20 @@ func TestMetricsRegistry_AuditJournalParseFailures(t *testing.T) {
 	}
 }
 
+func TestMetricsRegistry_AuditJournalStats(t *testing.T) {
+	r := NewMetricsRegistry()
+	occurredAt := time.Unix(100, 0).UTC()
+
+	r.RecordAuditJournalStats(4096, occurredAt)
+
+	if got := atomic.LoadInt64(&r.AuditJournalSizeBytes); got != 4096 {
+		t.Fatalf("AuditJournalSizeBytes = %v, want 4096", got)
+	}
+	if got := atomic.LoadInt64(&r.AuditJournalLastWriteUnix); got != 100 {
+		t.Fatalf("AuditJournalLastWriteUnix = %v, want 100", got)
+	}
+}
+
 func TestMetricsRegistry_APIRequestDurationHistogram(t *testing.T) {
 	r := NewMetricsRegistry()
 

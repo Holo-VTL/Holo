@@ -29,6 +29,10 @@ type journalAppender interface {
 	Append(Event) error
 }
 
+type journalSizer interface {
+	SizeBytes() int64
+}
+
 type MemoryWriter struct {
 	mu     sync.RWMutex
 	events []Event
@@ -94,6 +98,9 @@ func (w *PersistentWriter) Write(ctx context.Context, evt Event) error {
 		}
 		if w.Metrics != nil {
 			w.Metrics.RecordAuditJournalSuccess()
+			if sizer, ok := w.Journal.(journalSizer); ok {
+				w.Metrics.RecordAuditJournalStats(sizer.SizeBytes(), evt.OccurredAt)
+			}
 		}
 	}
 

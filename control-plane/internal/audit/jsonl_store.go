@@ -124,6 +124,24 @@ func (s *JournalStore) ParseErrors() int64 {
 	return atomic.LoadInt64(&s.parseErrors)
 }
 
+func (s *JournalStore) SizeBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file != nil {
+		if stat, err := s.file.Stat(); err == nil {
+			return stat.Size()
+		}
+	}
+	stat, err := os.Stat(s.path)
+	if err != nil {
+		return 0
+	}
+	return stat.Size()
+}
+
 func (s *JournalStore) rotateIfNeeded(nextWriteBytes int64) error {
 	if s.maxBytes <= 0 {
 		return nil
