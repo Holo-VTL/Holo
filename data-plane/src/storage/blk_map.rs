@@ -5,7 +5,9 @@ use std::sync::{Mutex, OnceLock};
 
 use super::compression::CompressionCodec;
 use super::layout::SegmentKind;
-use super::metadata::{lock_storage_mutex, modified_nanos_from_result, StorageError};
+use super::metadata::{
+    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+};
 use super::segment::{
     append_segment_payload, read_segment_file, sync_segment_file, write_segment_file,
 };
@@ -470,17 +472,22 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageErr
         ));
     }
 
-    let count = u64::from_le_bytes(
+    let raw_count = u64::from_le_bytes(
         payload[0..8]
             .try_into()
             .map_err(|_| StorageError::Corrupt("blk map count parse failed".to_string()))?,
-    ) as usize;
+    );
+    let count = checked_usize_from_u64(raw_count, "blk map count")?;
     let mut offset = 8;
-    let mut records = Vec::with_capacity(count);
     if count == 0 {
-        return Ok(records);
+        return Ok(Vec::new());
     }
     let remaining = payload.len() - offset;
+    if remaining < count {
+        return Err(StorageError::Corrupt(
+            "blk map payload truncated".to_string(),
+        ));
+    }
     if !remaining.is_multiple_of(count) {
         return Err(StorageError::Corrupt(
             "blk map record size mismatch".to_string(),
@@ -492,6 +499,7 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageErr
             "unsupported blk map record size".to_string(),
         ));
     }
+    let mut records = Vec::with_capacity(count);
     for _ in 0..count {
         if payload.len() < offset + record_size {
             return Err(StorageError::Corrupt(

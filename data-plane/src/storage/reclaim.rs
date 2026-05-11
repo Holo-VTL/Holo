@@ -3,7 +3,7 @@ use std::path::Path;
 use super::blk_map::mark_blk_map_stale;
 use super::layout::SegmentKind;
 use super::map_lookup::load_lookup_records;
-use super::metadata::StorageError;
+use super::metadata::{checked_usize_from_u64, StorageError};
 use super::segment::{read_segment_file, write_segment_file};
 
 const RECLAIM_RECORD_SIZE: usize = 25;
@@ -80,11 +80,17 @@ pub fn load_reclaim_candidates(path: &Path) -> Result<Vec<ReclaimCandidate>, Sto
         ));
     }
 
-    let count = u64::from_le_bytes(
+    let raw_count = u64::from_le_bytes(
         payload[0..8]
             .try_into()
             .map_err(|_| StorageError::Corrupt("reclaim count parse failed".to_string()))?,
-    ) as usize;
+    );
+    let count = checked_usize_from_u64(raw_count, "reclaim count")?;
+    if payload.len().saturating_sub(8) / RECLAIM_RECORD_SIZE < count {
+        return Err(StorageError::Corrupt(
+            "reclaim payload truncated".to_string(),
+        ));
+    }
     let mut offset = 8;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {

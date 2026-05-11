@@ -63,6 +63,11 @@ pub(crate) fn modified_nanos_from_result(
         .as_nanos())
 }
 
+pub(crate) fn checked_usize_from_u64(value: u64, field: &str) -> Result<usize, StorageError> {
+    usize::try_from(value)
+        .map_err(|_| StorageError::Corrupt(format!("{field} exceeds platform usize")))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CheckpointFlags {

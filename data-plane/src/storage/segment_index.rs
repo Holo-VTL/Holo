@@ -6,7 +6,9 @@ use std::sync::{Mutex, OnceLock};
 
 use super::compression::CompressionCodec;
 use super::layout::{checksum32, LayoutPaths, SegmentKind};
-use super::metadata::{lock_storage_mutex, modified_nanos_from_result, StorageError};
+use super::metadata::{
+    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+};
 use super::segment::{read_segment_file, validate_segment_shape, write_segment_file};
 
 pub const DEFAULT_MAX_DATA_SEGMENT_SIZE: u32 = 256 * 1024 * 1024;
@@ -462,17 +464,22 @@ fn decode_segment_index(payload: &[u8]) -> Result<SegmentIndex, StorageError> {
             .try_into()
             .map_err(|_| StorageError::Corrupt("segment index active parse failed".to_string()))?,
     );
-    let total_segment_count = u32::from_le_bytes(
+    let raw_total_segment_count = u32::from_le_bytes(
         payload[12..16]
             .try_into()
             .map_err(|_| StorageError::Corrupt("segment index total parse failed".to_string()))?,
-    ) as usize;
+    );
+    let total_segment_count =
+        checked_usize_from_u64(u64::from(raw_total_segment_count), "segment index total")?;
     let next_segment_seq = u64::from_le_bytes(
         payload[16..24]
             .try_into()
             .map_err(|_| StorageError::Corrupt("segment index next parse failed".to_string()))?,
     );
-    let expected_len = 24 + total_segment_count * SEGMENT_DESCRIPTOR_SIZE;
+    let expected_len = total_segment_count
+        .checked_mul(SEGMENT_DESCRIPTOR_SIZE)
+        .and_then(|n| n.checked_add(24))
+        .ok_or_else(|| StorageError::Corrupt("segment index length overflow".to_string()))?;
     if payload.len() != expected_len {
         return Err(StorageError::Corrupt(
             "segment index descriptor length mismatch".to_string(),
