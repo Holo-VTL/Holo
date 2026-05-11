@@ -16,10 +16,11 @@ use signal_hook::consts::signal::SIGTERM;
 use signal_hook::flag;
 use socket2::SockRef;
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -282,29 +283,74 @@ struct TimingStats {
     max_total_us: u64,
 }
 
+#[derive(Clone, Copy)]
+struct TimingSample {
+    data_out_len: usize,
+    data_in_len: usize,
+    sense_len: usize,
+    read_frame: u64,
+    dispatch: u64,
+    encode_flush: u64,
+    total: u64,
+}
+
+impl TimingStats {
+    fn record(&mut self, sample: TimingSample) {
+        self.commands = self.commands.saturating_add(1);
+        self.data_out_bytes = self
+            .data_out_bytes
+            .saturating_add(sample.data_out_len as u64);
+        self.data_in_bytes = self.data_in_bytes.saturating_add(sample.data_in_len as u64);
+        self.sense_bytes = self.sense_bytes.saturating_add(sample.sense_len as u64);
+        self.read_frame_us = self.read_frame_us.saturating_add(sample.read_frame);
+        self.dispatch_us = self.dispatch_us.saturating_add(sample.dispatch);
+        self.encode_flush_us = self.encode_flush_us.saturating_add(sample.encode_flush);
+        self.total_us = self.total_us.saturating_add(sample.total);
+        self.max_total_us = self.max_total_us.max(sample.total);
+    }
+}
+
 struct TimingProbe {
     socket_path: String,
+    metrics_path: Option<PathBuf>,
     every: u64,
     since_log: u64,
     read: TimingStats,
     write: TimingStats,
     other: TimingStats,
+    total_read: TimingStats,
+    total_write: TimingStats,
+    total_other: TimingStats,
 }
 
 impl TimingProbe {
     fn from_env(socket_path: &str) -> Self {
-        let every = env::var("HOLO_CDB_TIMING_EVERY")
+        let metrics_path = env::var("HOLO_CDB_TIMING_METRICS_FILE")
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .map(PathBuf::from);
+        let configured_every = env::var("HOLO_CDB_TIMING_EVERY")
             .ok()
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .filter(|value| (1..=1_000_000).contains(value))
             .unwrap_or(0);
+        let every = if configured_every == 0 && metrics_path.is_some() {
+            64
+        } else {
+            configured_every
+        };
         Self {
             socket_path: socket_path.to_string(),
+            metrics_path,
             every,
             since_log: 0,
             read: TimingStats::default(),
             write: TimingStats::default(),
             other: TimingStats::default(),
+            total_read: TimingStats::default(),
+            total_write: TimingStats::default(),
+            total_other: TimingStats::default(),
         }
     }
 
@@ -341,21 +387,30 @@ impl TimingProbe {
         let dispatch = duration_micros(after_dispatch.duration_since(after_read));
         let encode_flush = duration_micros(after_flush.duration_since(after_dispatch));
         let total = duration_micros(after_flush.duration_since(start));
-
-        let stats = match timing_bucket_for_opcode(opcode) {
-            TimingBucket::Read => &mut self.read,
-            TimingBucket::Write => &mut self.write,
-            TimingBucket::Other => &mut self.other,
+        let sample = TimingSample {
+            data_out_len,
+            data_in_len,
+            sense_len,
+            read_frame,
+            dispatch,
+            encode_flush,
+            total,
         };
-        stats.commands = stats.commands.saturating_add(1);
-        stats.data_out_bytes = stats.data_out_bytes.saturating_add(data_out_len as u64);
-        stats.data_in_bytes = stats.data_in_bytes.saturating_add(data_in_len as u64);
-        stats.sense_bytes = stats.sense_bytes.saturating_add(sense_len as u64);
-        stats.read_frame_us = stats.read_frame_us.saturating_add(read_frame);
-        stats.dispatch_us = stats.dispatch_us.saturating_add(dispatch);
-        stats.encode_flush_us = stats.encode_flush_us.saturating_add(encode_flush);
-        stats.total_us = stats.total_us.saturating_add(total);
-        stats.max_total_us = stats.max_total_us.max(total);
+
+        match timing_bucket_for_opcode(opcode) {
+            TimingBucket::Read => {
+                self.read.record(sample);
+                self.total_read.record(sample);
+            }
+            TimingBucket::Write => {
+                self.write.record(sample);
+                self.total_write.record(sample);
+            }
+            TimingBucket::Other => {
+                self.other.record(sample);
+                self.total_other.record(sample);
+            }
+        };
 
         self.since_log = self.since_log.saturating_add(1);
         if self.since_log >= self.every {
@@ -367,6 +422,7 @@ impl TimingProbe {
         self.log_bucket("read", self.read);
         self.log_bucket("write", self.write);
         self.log_bucket("other", self.other);
+        self.write_metrics_file();
         self.read = TimingStats::default();
         self.write = TimingStats::default();
         self.other = TimingStats::default();
@@ -392,6 +448,20 @@ impl TimingProbe {
             stats.max_total_us,
         );
     }
+
+    fn write_metrics_file(&self) {
+        let Some(path) = &self.metrics_path else {
+            return;
+        };
+        if let Err(err) =
+            write_timing_metrics_file(path, self.total_read, self.total_write, self.total_other)
+        {
+            eprintln!(
+                "[tcmu_handler][timing] failed to write metrics file {}: {err}",
+                path.display()
+            );
+        }
+    }
 }
 
 impl Drop for TimingProbe {
@@ -416,6 +486,55 @@ fn duration_micros(duration: Duration) -> u64 {
 
 fn avg_us(total: u64, count: u64) -> u64 {
     total.checked_div(count).unwrap_or(0)
+}
+
+fn write_timing_metrics_file(
+    path: &Path,
+    read: TimingStats,
+    write: TimingStats,
+    other: TimingStats,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, render_timing_metrics(read, write, other))?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn render_timing_metrics(read: TimingStats, write: TimingStats, other: TimingStats) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP holo_scsi_commands_total Total SCSI commands handled by the data-plane process\n",
+    );
+    out.push_str("# TYPE holo_scsi_commands_total counter\n");
+    out.push_str("# HELP holo_scsi_command_latency_microseconds_sum Total SCSI command latency in microseconds\n");
+    out.push_str("# TYPE holo_scsi_command_latency_microseconds_sum counter\n");
+    out.push_str("# HELP holo_scsi_command_latency_microseconds_max Maximum observed SCSI command latency in microseconds\n");
+    out.push_str("# TYPE holo_scsi_command_latency_microseconds_max gauge\n");
+    append_timing_bucket_metrics(&mut out, "read", read);
+    append_timing_bucket_metrics(&mut out, "write", write);
+    append_timing_bucket_metrics(&mut out, "other", other);
+    out
+}
+
+fn append_timing_bucket_metrics(out: &mut String, bucket: &str, stats: TimingStats) {
+    let _ = writeln!(
+        out,
+        "holo_scsi_commands_total{{bucket=\"{bucket}\"}} {}",
+        stats.commands
+    );
+    let _ = writeln!(
+        out,
+        "holo_scsi_command_latency_microseconds_sum{{bucket=\"{bucket}\"}} {}",
+        stats.total_us
+    );
+    let _ = writeln!(
+        out,
+        "holo_scsi_command_latency_microseconds_max{{bucket=\"{bucket}\"}} {}",
+        stats.max_total_us
+    );
 }
 
 #[cfg(test)]
@@ -459,5 +578,39 @@ mod tests {
         std::env::set_var("HOLO_TCMU_MAX_FRAME_BYTES", (MAX_DATA_LEN + 1).to_string());
         assert_eq!(tcmu_max_frame_bytes(), MAX_DATA_LEN);
         std::env::remove_var("HOLO_TCMU_MAX_FRAME_BYTES");
+    }
+
+    #[test]
+    fn timing_probe_writes_prometheus_metrics_file() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        let path =
+            std::env::temp_dir().join(format!("holo-cdb-timing-{}.prom", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var("HOLO_CDB_TIMING_METRICS_FILE", &path);
+        std::env::set_var("HOLO_CDB_TIMING_EVERY", "1");
+
+        let mut probe = TimingProbe::from_env("/tmp/holo.sock");
+        let start = Instant::now();
+        let after_read = start + Duration::from_micros(10);
+        let after_dispatch = after_read + Duration::from_micros(20);
+        let after_flush = after_dispatch + Duration::from_micros(30);
+        probe.record(
+            0x08,
+            0,
+            512,
+            0,
+            Some(start),
+            Some(after_read),
+            Some(after_dispatch),
+            Some(after_flush),
+        );
+
+        let raw = std::fs::read_to_string(&path).expect("read timing metrics");
+        assert!(raw.contains("holo_scsi_commands_total{bucket=\"read\"} 1"));
+        assert!(raw.contains("holo_scsi_command_latency_microseconds_sum{bucket=\"read\"} 60"));
+
+        std::env::remove_var("HOLO_CDB_TIMING_METRICS_FILE");
+        std::env::remove_var("HOLO_CDB_TIMING_EVERY");
+        let _ = std::fs::remove_file(path);
     }
 }

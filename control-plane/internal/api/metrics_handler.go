@@ -13,6 +13,7 @@ import (
 type MetricsHandler struct {
 	registry        *metrics.MetricsRegistry
 	storageRootBase string
+	cdbMetricsDir   string
 }
 
 func NewMetricsHandler(registry *metrics.MetricsRegistry, storageRootBase ...string) *MetricsHandler {
@@ -20,7 +21,11 @@ func NewMetricsHandler(registry *metrics.MetricsRegistry, storageRootBase ...str
 	if len(storageRootBase) > 0 {
 		rootBase = storageRootBase[0]
 	}
-	return &MetricsHandler{registry: registry, storageRootBase: rootBase}
+	return &MetricsHandler{
+		registry:        registry,
+		storageRootBase: rootBase,
+		cdbMetricsDir:   defaultCDBMetricsDir(),
+	}
 }
 
 func (h *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -29,7 +34,7 @@ func (h *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	_, _ = w.Write([]byte(PrometheusText(h.registry) + StorageLayoutPrometheusText(h.storageRootBase)))
+	_, _ = w.Write([]byte(PrometheusText(h.registry) + StorageLayoutPrometheusText(h.storageRootBase) + SCSITimingPrometheusText(h.cdbMetricsDir)))
 }
 
 func PrometheusText(registry *metrics.MetricsRegistry) string {

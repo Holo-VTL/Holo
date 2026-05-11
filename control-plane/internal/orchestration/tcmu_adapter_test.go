@@ -328,6 +328,17 @@ func TestTcmuHandlerEnvIncludesRuntimeTraceConfig(t *testing.T) {
 	}
 }
 
+func TestTcmuHandlerEnvIncludesTimingMetricsFile(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("HOLO_RUN_DIR", runDir)
+
+	env := tcmuHandlerEnv(tcmuTestPublication())
+	want := "HOLO_CDB_TIMING_METRICS_FILE=" + filepath.Join(runDir, "cdb-metrics", "pub-tcmu-001.prom")
+	if !envContains(env, want) {
+		t.Fatalf("expected timing metrics file in env, want %q got %v", want, env)
+	}
+}
+
 func TestTcmuHandlerEnvIncludesTapePolicy(t *testing.T) {
 	pub := tcmuTestPublication()
 	pub.CompressionEnabled = false

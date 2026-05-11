@@ -61,6 +61,9 @@ func TestMetricsHandler_ResponseFormat(t *testing.T) {
 	if !strings.Contains(out, "holo_storage_segment_files 0") {
 		t.Errorf("Missing holo_storage_segment_files %s", out)
 	}
+	if !strings.Contains(out, `holo_scsi_commands_total{bucket="read"} 0`) {
+		t.Errorf("Missing holo_scsi_commands_total %s", out)
+	}
 }
 
 func TestMetricsHandler_RejectsUnsupportedMethod(t *testing.T) {
