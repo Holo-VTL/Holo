@@ -11,11 +11,16 @@ import (
 )
 
 type MetricsHandler struct {
-	registry *metrics.MetricsRegistry
+	registry        *metrics.MetricsRegistry
+	storageRootBase string
 }
 
-func NewMetricsHandler(registry *metrics.MetricsRegistry) *MetricsHandler {
-	return &MetricsHandler{registry: registry}
+func NewMetricsHandler(registry *metrics.MetricsRegistry, storageRootBase ...string) *MetricsHandler {
+	rootBase := ""
+	if len(storageRootBase) > 0 {
+		rootBase = storageRootBase[0]
+	}
+	return &MetricsHandler{registry: registry, storageRootBase: rootBase}
 }
 
 func (h *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -24,7 +29,7 @@ func (h *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	_, _ = w.Write([]byte(PrometheusText(h.registry)))
+	_, _ = w.Write([]byte(PrometheusText(h.registry) + StorageLayoutPrometheusText(h.storageRootBase)))
 }
 
 func PrometheusText(registry *metrics.MetricsRegistry) string {

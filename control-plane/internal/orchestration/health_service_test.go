@@ -1,6 +1,7 @@
 package orchestration
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -50,6 +51,9 @@ func TestDataPlaneComponentUsesConfiguredRunDir(t *testing.T) {
 	t.Setenv("HOLO_RUN_DIR", runDir)
 	listener, err := net.Listen("unix", filepath.Join(runDir, "cdb.sock"))
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("unix sockets are not permitted in this sandbox: %v", err)
+		}
 		t.Fatalf("listen on cdb socket: %v", err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })

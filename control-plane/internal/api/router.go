@@ -19,6 +19,7 @@ import (
 	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
 	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 	sqliterepo "github.com/Holo-VTL/Holo/control-plane/internal/repo/sqlite"
+	"github.com/Holo-VTL/Holo/control-plane/internal/storageutil"
 	"github.com/Holo-VTL/Holo/control-plane/internal/tracing"
 )
 
@@ -144,7 +145,7 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		access:     accessHandler,
 		discovery:  discoveryHandler,
 		targets:    NewTargetHandler(targetRuntime, accessHandler),
-		metricsHD:  NewMetricsHandler(registry),
+		metricsHD:  NewMetricsHandler(registry, storageutil.ResolvePoolStorageBaseDir()),
 		auditHD:    NewAuditHandler(query, auditWriter),
 		runtime:    targetRuntime,
 		apiKey:     strings.TrimSpace(cfg.APIKey),

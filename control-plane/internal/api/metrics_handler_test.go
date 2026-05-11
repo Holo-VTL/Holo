@@ -58,6 +58,9 @@ func TestMetricsHandler_ResponseFormat(t *testing.T) {
 	if !strings.Contains(out, "holo_api_request_duration_seconds_count 1") {
 		t.Errorf("Missing holo_api_request_duration_seconds_count %s", out)
 	}
+	if !strings.Contains(out, "holo_storage_segment_files 0") {
+		t.Errorf("Missing holo_storage_segment_files %s", out)
+	}
 }
 
 func TestMetricsHandler_RejectsUnsupportedMethod(t *testing.T) {
