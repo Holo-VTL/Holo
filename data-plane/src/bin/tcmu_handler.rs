@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_TCMU_IO_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_SLOW_CDB_LOG_MS: u64 = 1_000;
+const SLOW_CDB_WARN_US: u64 = 5_000_000;
+const SLOW_CDB_CRITICAL_US: u64 = 30_000_000;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -144,6 +147,7 @@ fn main() {
                             let timing_after_dispatch = timing_probe.mark();
                             let reply_len = response.reply.len();
                             let sense_len = response.sense.len();
+                            let status = response.status;
                             if let Err(e) = response.encode(&mut writer) {
                                 eprintln!("[tcmu_handler] write error: {e}");
                                 break;
@@ -155,6 +159,10 @@ fn main() {
                             let timing_after_flush = timing_probe.mark();
                             timing_probe.record(
                                 opcode,
+                                &header.cdb,
+                                header.initiator.as_deref(),
+                                &tape_state,
+                                status,
                                 header.data_len,
                                 reply_len,
                                 sense_len,
@@ -314,6 +322,7 @@ struct TimingProbe {
     socket_path: String,
     metrics_path: Option<PathBuf>,
     every: u64,
+    slow_log_us: u64,
     since_log: u64,
     read: TimingStats,
     write: TimingStats,
@@ -340,10 +349,16 @@ impl TimingProbe {
         } else {
             configured_every
         };
+        let slow_log_us = env::var("HOLO_CDB_SLOW_LOG_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map(|millis| millis.saturating_mul(1_000))
+            .unwrap_or(DEFAULT_SLOW_CDB_LOG_MS * 1_000);
         Self {
             socket_path: socket_path.to_string(),
             metrics_path,
             every,
+            slow_log_us,
             since_log: 0,
             read: TimingStats::default(),
             write: TimingStats::default(),
@@ -355,7 +370,7 @@ impl TimingProbe {
     }
 
     fn mark(&self) -> Option<Instant> {
-        if self.every == 0 {
+        if self.every == 0 && self.slow_log_us == 0 {
             None
         } else {
             Some(Instant::now())
@@ -366,6 +381,10 @@ impl TimingProbe {
     fn record(
         &mut self,
         opcode: u8,
+        cdb: &[u8],
+        initiator: Option<&str>,
+        state: &TapeState,
+        status: u8,
         data_out_len: usize,
         data_in_len: usize,
         sense_len: usize,
@@ -374,9 +393,6 @@ impl TimingProbe {
         after_dispatch: Option<Instant>,
         after_flush: Option<Instant>,
     ) {
-        if self.every == 0 {
-            return;
-        }
         let (Some(start), Some(after_read), Some(after_dispatch), Some(after_flush)) =
             (start, after_read, after_dispatch, after_flush)
         else {
@@ -387,6 +403,26 @@ impl TimingProbe {
         let dispatch = duration_micros(after_dispatch.duration_since(after_read));
         let encode_flush = duration_micros(after_flush.duration_since(after_dispatch));
         let total = duration_micros(after_flush.duration_since(start));
+
+        self.log_slow_cdb(SlowCdbLog {
+            opcode,
+            cdb,
+            initiator,
+            state,
+            status,
+            data_out_len,
+            data_in_len,
+            sense_len,
+            read_frame_us: read_frame,
+            dispatch_us: dispatch,
+            encode_flush_us: encode_flush,
+            total_us: total,
+        });
+
+        if self.every == 0 {
+            return;
+        }
+
         let sample = TimingSample {
             data_out_len,
             data_in_len,
@@ -462,6 +498,62 @@ impl TimingProbe {
             );
         }
     }
+
+    fn log_slow_cdb(&self, event: SlowCdbLog<'_>) {
+        if self.slow_log_us == 0 || event.total_us < self.slow_log_us {
+            return;
+        }
+        let severity = if event.total_us >= SLOW_CDB_CRITICAL_US {
+            "critical"
+        } else if event.total_us >= SLOW_CDB_WARN_US {
+            "warn"
+        } else {
+            "notice"
+        };
+        let cartridge = event.state.cartridge_id.as_deref().unwrap_or("-");
+        let layout_root = event
+            .state
+            .active_layout
+            .as_ref()
+            .map(|layout| layout.root.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[tcmu_handler][slow_cdb] severity={} socket={} opcode=0x{:02X} cdb={} status=0x{:02X} initiator={} drive_id={} cartridge_id={} position={} eod={} data_out={} data_in={} sense={} total_us={} read_frame_us={} dispatch_us={} encode_flush_us={} layout_root={}",
+            severity,
+            self.socket_path,
+            event.opcode,
+            hex_bytes(event.cdb),
+            event.status,
+            event.initiator.unwrap_or("-"),
+            event.state.drive_id,
+            cartridge,
+            event.state.current_position,
+            event.state.eod_position,
+            event.data_out_len,
+            event.data_in_len,
+            event.sense_len,
+            event.total_us,
+            event.read_frame_us,
+            event.dispatch_us,
+            event.encode_flush_us,
+            layout_root,
+        );
+    }
+}
+
+struct SlowCdbLog<'a> {
+    opcode: u8,
+    cdb: &'a [u8],
+    initiator: Option<&'a str>,
+    state: &'a TapeState,
+    status: u8,
+    data_out_len: usize,
+    data_in_len: usize,
+    sense_len: usize,
+    read_frame_us: u64,
+    dispatch_us: u64,
+    encode_flush_us: u64,
+    total_us: u64,
 }
 
 impl Drop for TimingProbe {
@@ -537,6 +629,16 @@ fn append_timing_bucket_metrics(out: &mut String, bucket: &str, stats: TimingSta
     );
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,8 +696,13 @@ mod tests {
         let after_read = start + Duration::from_micros(10);
         let after_dispatch = after_read + Duration::from_micros(20);
         let after_flush = after_dispatch + Duration::from_micros(30);
+        let state = TapeState::new("drive-metrics");
         probe.record(
             0x08,
+            &[0x08, 0, 0, 0, 1, 0],
+            Some("iqn.test"),
+            &state,
+            0,
             0,
             512,
             0,
@@ -612,5 +719,18 @@ mod tests {
         std::env::remove_var("HOLO_CDB_TIMING_METRICS_FILE");
         std::env::remove_var("HOLO_CDB_TIMING_EVERY");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn timing_probe_slow_log_threshold_defaults_to_one_second() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        std::env::remove_var("HOLO_CDB_SLOW_LOG_MS");
+        let probe = TimingProbe::from_env("/tmp/holo.sock");
+        assert_eq!(probe.slow_log_us, 1_000_000);
+    }
+
+    #[test]
+    fn hex_bytes_uses_uppercase_scsi_cdb_format() {
+        assert_eq!(hex_bytes(&[0x0A, 0x01, 0x00, 0xFF]), "0A0100FF");
     }
 }
