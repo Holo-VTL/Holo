@@ -2,12 +2,14 @@ package orchestration
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
@@ -530,4 +532,20 @@ func TestTcmuRegistryConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestWaitForHandlerSocketStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := waitForHandlerSocket(ctx, 1234, filepath.Join(t.TempDir(), "missing.sock"), time.Hour, time.Hour, func(int) bool {
+		return true
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("expected immediate cancellation, elapsed=%s", elapsed)
+	}
 }

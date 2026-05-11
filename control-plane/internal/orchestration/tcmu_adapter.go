@@ -346,21 +346,38 @@ func (a *TcmuAdapter) spawnHandler(ctx context.Context, publication *domain.Targ
 		_ = cmd.Wait()
 	}()
 
-	// Give the handler a moment to create the socket.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(socketPath); err == nil {
-			return pid, nil
-		}
-		if !processAlive(pid) {
-			return 0, fmt.Errorf("tcmu_handler exited before creating socket %s", socketPath)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if err := waitForHandlerSocket(ctx, pid, socketPath, 5*time.Second, 100*time.Millisecond, processAlive); err != nil {
+		a.killHandler(pid)
+		return 0, err
 	}
+	return pid, nil
+}
 
-	// Socket not ready in time; kill the process and report error.
-	a.killHandler(pid)
-	return 0, fmt.Errorf("tcmu_handler did not create socket %s within 5s", socketPath)
+func waitForHandlerSocket(ctx context.Context, pid int, socketPath string, timeout, interval time.Duration, alive func(int) bool) error {
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		if _, err := os.Stat(socketPath); err == nil {
+			return nil
+		}
+		if !alive(pid) {
+			return fmt.Errorf("tcmu_handler exited before creating socket %s", socketPath)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for tcmu_handler socket %s: %w", socketPath, ctx.Err())
+		case <-timer.C:
+			return fmt.Errorf("tcmu_handler did not create socket %s within %s", socketPath, timeout)
+		case <-ticker.C:
+		}
+	}
 }
 
 func tcmuHandlerEnv(publication *domain.TargetPublication) []string {
