@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 	"github.com/Holo-VTL/Holo/control-plane/internal/storageutil"
@@ -39,6 +40,58 @@ func TestResourcesCompensationFailuresAreLogged(t *testing.T) {
 	}
 	if !strings.Contains(got, "rollback drive") || !strings.Contains(got, "drive-a") {
 		t.Fatalf("expected operation context in compensation log, got %q", got)
+	}
+}
+
+func TestStoragePoolCapacityReconcilesFromCartridgeMetadata(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	createPoolReq := newAuthedRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-cap","name":"Pool Capacity"}`))
+	createPoolResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createPoolResp, createPoolReq)
+	if createPoolResp.Code != http.StatusCreated {
+		t.Fatalf("expected create pool 201, got %d body=%s", createPoolResp.Code, createPoolResp.Body.String())
+	}
+	if _, err := srv.metadataDB.Exec(
+		`INSERT INTO storage_pool_disks(device_path, pool_id, size_bytes, attached_at) VALUES (?, ?, ?, ?)`,
+		"/dev/sdb",
+		"pool-cap",
+		int64(10*1024*1024),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("seed storage pool disk: %v", err)
+	}
+
+	createLibReq := newAuthedRequest(http.MethodPost, "/v1/libraries", bytes.NewBufferString(`{"libraryId":"lib-cap","name":"Library Capacity"}`))
+	createLibResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createLibResp, createLibReq)
+	if createLibResp.Code != http.StatusCreated {
+		t.Fatalf("expected create library 201, got %d body=%s", createLibResp.Code, createLibResp.Body.String())
+	}
+	createCartReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-cap","libraryId":"lib-cap","cartridgeId":"VTA555L06","barcode":"VTA555L06","capacityBytes":5242880}`))
+	createCartResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createCartResp, createCartReq)
+	if createCartResp.Code != http.StatusCreated {
+		t.Fatalf("expected create cartridge 201, got %d body=%s", createCartResp.Code, createCartResp.Body.String())
+	}
+	if err := writeAtomicText(cartridgeMetadataPath("VTA555L06"), "cartridge_id=VTA555L06\ncapacity_bytes=5242880\nused_bytes=1048576\n"); err != nil {
+		t.Fatalf("write shared cartridge metadata: %v", err)
+	}
+
+	getPoolReq := newAuthedRequest(http.MethodGet, "/v1/storage/pools/pool-cap", nil)
+	getPoolResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getPoolResp, getPoolReq)
+	if getPoolResp.Code != http.StatusOK {
+		t.Fatalf("expected get pool 200, got %d body=%s", getPoolResp.Code, getPoolResp.Body.String())
+	}
+	var pool domain.StoragePoolRuntime
+	if err := json.Unmarshal(getPoolResp.Body.Bytes(), &pool); err != nil {
+		t.Fatalf("decode pool: %v", err)
+	}
+	if pool.Capacity.UsedBytes != 1048576 || pool.Capacity.FreeBytes != 9437184 || pool.Capacity.UsedPercent != 10 {
+		t.Fatalf("expected pool capacity to reconcile from cartridge usage, got %+v", pool.Capacity)
 	}
 }
 

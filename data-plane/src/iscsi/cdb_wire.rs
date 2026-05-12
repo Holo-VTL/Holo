@@ -14,7 +14,6 @@ use std::io::{self, Read, Write};
 ///   [u32 reply_len]  big-endian, number of data-in bytes (0 if none)
 ///   [R   reply    ]  data-in payload (R = reply_len)
 ///   [u8  status   ]  SCSI status: 0x00 GOOD, 0x02 CHECK CONDITION, 0x08 BUSY
-
 pub const SCSI_STATUS_GOOD: u8 = 0x00;
 pub const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
 pub const SCSI_STATUS_BUSY: u8 = 0x08;

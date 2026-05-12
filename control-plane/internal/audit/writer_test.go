@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,5 +77,36 @@ func TestPersistentWriterDoesNotWriteMemoryWhenJournalAppendFails(t *testing.T) 
 	}
 	if got := atomic.LoadInt64(&registry.AuditWriteFailures); got != 1 {
 		t.Fatalf("expected one audit write failure metric, got %d", got)
+	}
+}
+
+func TestPersistentWriterRecordsJournalSizeAndLagStats(t *testing.T) {
+	journal, err := NewJournalStore(filepath.Join(t.TempDir(), "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("create journal: %v", err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	registry := metrics.NewMetricsRegistry()
+	writer := NewPersistentWriter(NewMemoryWriter(), journal, registry)
+
+	occurredAt := time.Unix(100, 0).UTC()
+	err = writer.Write(context.Background(), Event{
+		EventID:    "event",
+		Actor:      "test",
+		Action:     "write",
+		ObjectType: "unit",
+		ObjectID:   "id",
+		Result:     "success",
+		OccurredAt: occurredAt,
+	})
+	if err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+
+	if got := atomic.LoadInt64(&registry.AuditJournalSizeBytes); got <= 0 {
+		t.Fatalf("expected positive journal size, got %d", got)
+	}
+	if got := atomic.LoadInt64(&registry.AuditJournalLastWriteUnix); got != occurredAt.Unix() {
+		t.Fatalf("expected last write unix %d, got %d", occurredAt.Unix(), got)
 	}
 }

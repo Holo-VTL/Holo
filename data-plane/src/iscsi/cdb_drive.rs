@@ -86,10 +86,7 @@ pub(crate) fn load_unload_drive(state: &mut TapeState, cdb: &[u8]) -> CdbRespons
         }
 
         let media_state_key = media_state_key_for_state(state);
-        let desired = match read_shared_loaded_cartridge(&media_state_key) {
-            Ok(v) => v,
-            Err(_) => None,
-        };
+        let desired = read_shared_loaded_cartridge(&media_state_key).unwrap_or_default();
         let Some(cartridge) = desired else {
             return CdbResponse::check_condition(build_sense_fixed(0x02, 0x3A, 0x00));
         };
@@ -290,9 +287,9 @@ pub(crate) fn parse_partition_sizes(
         return Err(());
     }
     let mut sizes = [0u16; 4];
-    for idx in 0..count {
+    for (idx, size) in sizes.iter_mut().enumerate().take(count) {
         let offset = 8 + (idx * 2);
-        sizes[idx] = u16::from_be_bytes([page[offset], page[offset + 1]]);
+        *size = u16::from_be_bytes([page[offset], page[offset + 1]]);
     }
     Ok(sizes)
 }
@@ -479,9 +476,9 @@ pub(crate) fn apply_format_medium_layout(
     let count = usize::from(addl_partitions_defined)
         .saturating_add(1)
         .min(4);
-    for idx in 0..count {
+    for (idx, size_bytes) in partition_sizes_bytes.iter().enumerate().take(count) {
         state.partition_runtime.partition_size_units[idx] =
-            partition_size_to_units(partition_sizes_bytes[idx], units);
+            partition_size_to_units(*size_bytes, units);
     }
     Ok(())
 }
@@ -709,7 +706,7 @@ pub(crate) fn verify_6_drive(state: &mut TapeState, cdb: &[u8], data_out: &[u8])
         };
     }
 
-    let block_count = if fixed { transfer_len as usize } else { 1 };
+    let block_count = if fixed { transfer_len } else { 1 };
     match verify_blocks_at_position(state, block_count, data_out, byte_compare) {
         Ok(()) => CdbResponse::good(vec![]),
         Err(response) => response,
@@ -868,22 +865,20 @@ pub(crate) fn read_buffer_drive(cdb: &[u8], profile: &DeviceIdentityProfile) -> 
             out[2] = ((capacity >> 8) & 0xFF) as u8;
             out[3] = (capacity & 0xFF) as u8;
         }
-        0x00 | 0x02 => {
+        0x00 | 0x02 if buffer_id == 0x03 => {
             // Header+data or data mode.
-            if buffer_id == 0x03 {
-                let serial = profile
-                    .serial_for_vpd_seed("holo")
-                    .unwrap_or_else(|_| "HOLO00000000".to_string());
-                let mut payload = vec![b' '; 4 + serial.len()];
-                let serial_bytes = serial.as_bytes();
-                let copy_len = usize::min(serial_bytes.len(), payload.len().saturating_sub(4));
-                if copy_len > 0 {
-                    payload[4..4 + copy_len].copy_from_slice(&serial_bytes[..copy_len]);
-                }
-                let cap = payload.len().saturating_sub(1) as u32;
-                out[0..4].copy_from_slice(&cap.to_be_bytes());
-                out.extend_from_slice(&payload);
+            let serial = profile
+                .serial_for_vpd_seed("holo")
+                .unwrap_or_else(|_| "HOLO00000000".to_string());
+            let mut payload = vec![b' '; 4 + serial.len()];
+            let serial_bytes = serial.as_bytes();
+            let copy_len = usize::min(serial_bytes.len(), payload.len().saturating_sub(4));
+            if copy_len > 0 {
+                payload[4..4 + copy_len].copy_from_slice(&serial_bytes[..copy_len]);
             }
+            let cap = payload.len().saturating_sub(1) as u32;
+            out[0..4].copy_from_slice(&cap.to_be_bytes());
+            out.extend_from_slice(&payload);
         }
         _ => {}
     }
@@ -1834,7 +1829,6 @@ pub(crate) fn report_density_support_drive(
     cdb: &[u8],
     profile: &DeviceIdentityProfile,
 ) -> CdbResponse {
-    let media = (cdb.get(1).copied().unwrap_or(0) & 0x01) != 0;
     let medium_type = (cdb.get(1).copied().unwrap_or(0) & 0x02) != 0;
     let Some(allocation_length) = try_read_be16(cdb, 7) else {
         return invalid_field_in_cdb_response();
@@ -1848,11 +1842,7 @@ pub(crate) fn report_density_support_drive(
     } else {
         drive_density_descriptor(profile, medium_capacity_bytes_for_state(state, profile)).to_vec()
     };
-    let descriptor_len = if media {
-        descriptor.len()
-    } else {
-        descriptor.len()
-    };
+    let descriptor_len = descriptor.len();
     let avail_len = if descriptor_len > 0 {
         (descriptor_len + 2) as u16
     } else {
@@ -1971,7 +1961,7 @@ pub(crate) fn encode_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn decode_hex(raw: &str) -> Option<Vec<u8>> {
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(raw.len() / 2);
@@ -2165,22 +2155,22 @@ pub(crate) fn drive_mam_attributes(
         ReadAttributeEntry {
             id: 0x020A,
             format: 0x01,
-            value: fixed_ascii_value(&host_signature, 40),
+            value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
             id: 0x020B,
             format: 0x01,
-            value: fixed_ascii_value(&host_signature, 40),
+            value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
             id: 0x020C,
             format: 0x01,
-            value: fixed_ascii_value(&host_signature, 40),
+            value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
             id: 0x020D,
             format: 0x01,
-            value: fixed_ascii_value(&host_signature, 40),
+            value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
             id: 0x0220,

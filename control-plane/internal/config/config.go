@@ -70,7 +70,7 @@ func getenvInt(k string, fallback int, strict bool) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		err = fmt.Errorf("invalid integer environment value for %s", k)
+		err = fmt.Errorf("invalid integer environment value for %s=%q", k, v)
 		if strict {
 			return fallback, err
 		}
@@ -87,7 +87,7 @@ func getenvBool(k string, fallback bool, strict bool) (bool, error) {
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		err = fmt.Errorf("invalid boolean environment value for %s", k)
+		err = fmt.Errorf("invalid boolean environment value for %s=%q", k, v)
 		if strict {
 			return fallback, err
 		}

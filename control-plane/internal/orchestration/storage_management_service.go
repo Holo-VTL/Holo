@@ -64,6 +64,7 @@ type storagePoolRepo interface {
 	DetachDisk(ctx context.Context, poolID, devicePath string) (*domain.StoragePoolRuntime, error)
 	ReserveWrite(ctx context.Context, poolID string, bytes int64) (*domain.StoragePoolRuntime, bool, error)
 	RollbackReservedWrite(ctx context.Context, poolID string, bytes int64) (*domain.StoragePoolRuntime, error)
+	SetUsedBytes(ctx context.Context, poolID string, usedBytes int64) (*domain.StoragePoolRuntime, error)
 	RecordDiscovery(ctx context.Context, disks []domain.StorageManagedDisk)
 	LatestDiscovery(ctx context.Context) (domain.DiskDiscoveryRecord, bool)
 }
@@ -412,6 +413,11 @@ func (s *StorageManagementService) RollbackReservedWrite(ctx context.Context, po
 		"bytes": bytes,
 	})
 	return nil
+}
+
+func (s *StorageManagementService) ReconcilePoolUsedBytes(ctx context.Context, poolID string, usedBytes int64) error {
+	_, err := s.repo.SetUsedBytes(ctx, poolID, usedBytes)
+	return err
 }
 
 func (s *StorageManagementService) ensureDiskAttachable(ctx context.Context, devicePath string) (bool, string, int64, error) {

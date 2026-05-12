@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/config"
@@ -149,6 +150,23 @@ func TestUIRouteExemptionRejectsEncodedTraversal(t *testing.T) {
 
 	if resp.Code == http.StatusOK {
 		t.Fatalf("encoded traversal must not be served as UI content")
+	}
+}
+
+func TestRouterRecordsRequestDurationMetrics(t *testing.T) {
+	srv := newTestServer(t)
+
+	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(healthResp, healthReq)
+
+	metricsReq := newAuthedRequest(http.MethodGet, "/metrics", nil)
+	metricsResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(metricsResp, metricsReq)
+
+	body := metricsResp.Body.String()
+	if !strings.Contains(body, "holo_api_request_duration_seconds_count 1") {
+		t.Fatalf("expected one recorded request before scrape, got %s", body)
 	}
 }
 

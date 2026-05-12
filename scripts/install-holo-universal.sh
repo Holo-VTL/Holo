@@ -1742,6 +1742,9 @@ install_or_upgrade_holo() {
   load_kernel_modules
   ensure_user_and_dirs
   stop_control_plane_for_upgrade
+  if [[ "${ACTION}" == "upgrade" ]]; then
+    cleanup_runtime_targets
+  fi
   install_artifacts
   write_storage_helper
   write_targetcli_helper

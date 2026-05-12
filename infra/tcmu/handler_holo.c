@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,7 @@
 #define HOLO_EXTENDED_REQUEST_MARKER 0xFF
 #define HOLO_EXTENDED_REQUEST_VERSION 0x01
 #define HOLO_MAX_INITIATOR_LEN 255
+#define HOLO_WATCHDOG_THRESHOLDS 4
 
 enum holo_timing_bucket {
 	HOLO_TIMING_READ = 0,
@@ -60,6 +62,26 @@ struct holo_state {
 	int fd;
 	char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	struct holo_timing_state timing;
+	pthread_mutex_t watchdog_lock;
+	pthread_t watchdog_thread;
+	bool watchdog_running;
+	bool watchdog_stop;
+	bool active;
+	uint64_t active_seq;
+	uint64_t active_start_us;
+	uint32_t active_data_out_len;
+	uint8_t active_opcode;
+	uint8_t active_cdb[16];
+	uint8_t active_cdb_len;
+	size_t active_threshold_idx;
+	char active_phase[32];
+};
+
+static const uint64_t watchdog_threshold_us[HOLO_WATCHDOG_THRESHOLDS] = {
+	1000000ULL,
+	5000000ULL,
+	15000000ULL,
+	25000000ULL,
 };
 
 static uint64_t monotonic_us(void)
@@ -87,6 +109,117 @@ static uint64_t timing_every_commands(void)
 		return 0;
 	}
 	return (uint64_t)every;
+}
+
+static void format_cdb_hex(const uint8_t *cdb, uint8_t cdb_len, char *out, size_t out_len)
+{
+	size_t pos = 0;
+	uint8_t i;
+
+	if (!out || out_len == 0) {
+		return;
+	}
+	out[0] = '\0';
+	for (i = 0; i < cdb_len && i < 16; i++) {
+		int n = snprintf(out + pos, out_len - pos, "%s%02X", i == 0 ? "" : " ", cdb[i]);
+		if (n < 0 || (size_t)n >= out_len - pos) {
+			out[out_len - 1] = '\0';
+			return;
+		}
+		pos += (size_t)n;
+	}
+}
+
+static void holo_watchdog_set_phase(struct holo_state *state, const char *phase)
+{
+	if (!state || !phase) {
+		return;
+	}
+	pthread_mutex_lock(&state->watchdog_lock);
+	if (state->active) {
+		snprintf(state->active_phase, sizeof(state->active_phase), "%s", phase);
+	}
+	pthread_mutex_unlock(&state->watchdog_lock);
+}
+
+static void holo_watchdog_begin(
+	struct holo_state *state,
+	uint8_t opcode,
+	const uint8_t *cdb,
+	uint8_t cdb_len,
+	uint32_t data_out_len)
+{
+	if (!state) {
+		return;
+	}
+	pthread_mutex_lock(&state->watchdog_lock);
+	state->active = true;
+	state->active_seq++;
+	state->active_start_us = monotonic_us();
+	state->active_opcode = opcode;
+	state->active_cdb_len = cdb_len > sizeof(state->active_cdb) ? sizeof(state->active_cdb) : cdb_len;
+	if (cdb && state->active_cdb_len > 0) {
+		memcpy(state->active_cdb, cdb, state->active_cdb_len);
+	}
+	state->active_data_out_len = data_out_len;
+	state->active_threshold_idx = 0;
+	snprintf(state->active_phase, sizeof(state->active_phase), "%s", "connect");
+	pthread_mutex_unlock(&state->watchdog_lock);
+}
+
+static void holo_watchdog_finish(struct holo_state *state)
+{
+	if (!state) {
+		return;
+	}
+	pthread_mutex_lock(&state->watchdog_lock);
+	state->active = false;
+	pthread_mutex_unlock(&state->watchdog_lock);
+}
+
+static void *holo_watchdog_loop(void *arg)
+{
+	struct holo_state *state = arg;
+
+	for (;;) {
+		uint64_t now;
+		bool should_log = false;
+		uint64_t elapsed_us = 0;
+		uint64_t seq = 0;
+		uint8_t opcode = 0;
+		uint32_t data_out_len = 0;
+		char phase[sizeof(state->active_phase)];
+		char cdb_hex[64];
+
+		usleep(250000);
+		pthread_mutex_lock(&state->watchdog_lock);
+		if (state->watchdog_stop) {
+			pthread_mutex_unlock(&state->watchdog_lock);
+			return NULL;
+		}
+		if (state->active && state->active_threshold_idx < HOLO_WATCHDOG_THRESHOLDS) {
+			now = monotonic_us();
+			elapsed_us = now - state->active_start_us;
+			if (elapsed_us >= watchdog_threshold_us[state->active_threshold_idx]) {
+				should_log = true;
+				seq = state->active_seq;
+				opcode = state->active_opcode;
+				data_out_len = state->active_data_out_len;
+				snprintf(phase, sizeof(phase), "%s", state->active_phase);
+				format_cdb_hex(state->active_cdb, state->active_cdb_len, cdb_hex, sizeof(cdb_hex));
+				state->active_threshold_idx++;
+			}
+		}
+		pthread_mutex_unlock(&state->watchdog_lock);
+
+		if (should_log) {
+			tcmu_warn("holo slow_cdb_inflight socket=%s seq=%" PRIu64
+				  " opcode=0x%02X phase=%s elapsed_us=%" PRIu64
+				  " data_out=%" PRIu32 " cdb=[%s]\n",
+				  state->socket_path[0] ? state->socket_path : "(unknown)",
+				  seq, opcode, phase, elapsed_us, data_out_len, cdb_hex);
+		}
+	}
 }
 
 static enum holo_timing_bucket timing_bucket_for_opcode(uint8_t opcode)
@@ -753,18 +886,29 @@ static int holo_open(struct tcmu_device *dev, bool reopen)
 	}
 	state->fd = -1;
 	state->timing.every = timing_every_commands();
+	if (pthread_mutex_init(&state->watchdog_lock, NULL) != 0) {
+		free(state);
+		return -ENOMEM;
+	}
 
 	sock = cfg_socket_path(tcmu_dev_get_cfgstring(dev));
 	if (!sock || sock[0] == '\0') {
 		tcmu_err("holo: invalid cfgstring '%s'\n", tcmu_dev_get_cfgstring(dev));
+		pthread_mutex_destroy(&state->watchdog_lock);
 		free(state);
 		return -EINVAL;
 	}
 	if (snprintf(state->socket_path, sizeof(state->socket_path), "%s", sock) >=
 	    (int)sizeof(state->socket_path)) {
 		tcmu_err("holo: socket path too long: %s\n", sock);
+		pthread_mutex_destroy(&state->watchdog_lock);
 		free(state);
 		return -ENAMETOOLONG;
+	}
+	if (pthread_create(&state->watchdog_thread, NULL, holo_watchdog_loop, state) == 0) {
+		state->watchdog_running = true;
+	} else {
+		tcmu_warn("holo: slow CDB watchdog disabled for %s\n", state->socket_path);
 	}
 
 	/*
@@ -788,7 +932,14 @@ static void holo_close(struct tcmu_device *dev)
 		return;
 	}
 	holo_timing_flush(&state->timing, state->socket_path);
+	pthread_mutex_lock(&state->watchdog_lock);
+	state->watchdog_stop = true;
+	pthread_mutex_unlock(&state->watchdog_lock);
+	if (state->watchdog_running) {
+		pthread_join(state->watchdog_thread, NULL);
+	}
 	holo_disconnect(state);
+	pthread_mutex_destroy(&state->watchdog_lock);
 	free(state);
 	tcmur_dev_set_private(dev, NULL);
 }
@@ -863,6 +1014,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 			tcmu_memcpy_from_iovec(data_out, data_out_len, cmd->iovec, cmd->iov_cnt);
 		}
 	}
+	holo_watchdog_begin(state, opcode, cdb, cdb_len_u8, data_out_len);
 
 	if (state->timing.every > 0) {
 		timing_connect_start = monotonic_us();
@@ -873,9 +1025,11 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 	}
 	if (ret < 0) {
 		free(data_out);
+		holo_watchdog_finish(state);
 		return TCMU_STS_BUSY;
 	}
 
+	holo_watchdog_set_phase(state, "send_request");
 	if (state->timing.every > 0) {
 		timing_request_start = monotonic_us();
 	}
@@ -918,15 +1072,18 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 	free(data_out);
 	if (ret < 0) {
 		holo_disconnect(state);
+		holo_watchdog_finish(state);
 		return TCMU_STS_BUSY;
 	}
 
+	holo_watchdog_set_phase(state, "read_response");
 	if (state->timing.every > 0) {
 		timing_response_start = monotonic_us();
 	}
 	ret = read_full(state->fd, &sense_len, sizeof(sense_len));
 	if (ret < 0) {
 		holo_disconnect(state);
+		holo_watchdog_finish(state);
 		return TCMU_STS_BUSY;
 	}
 	if (sense_len > 0) {
@@ -937,6 +1094,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 		ret = read_full(state->fd, cmd->sense_buf, copy_len);
 		if (ret < 0) {
 			holo_disconnect(state);
+			holo_watchdog_finish(state);
 			return TCMU_STS_BUSY;
 		}
 		if (sense_len > copy_len) {
@@ -947,6 +1105,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 				ret = read_full(state->fd, discard, chunk);
 				if (ret < 0) {
 					holo_disconnect(state);
+					holo_watchdog_finish(state);
 					return TCMU_STS_BUSY;
 				}
 				left -= chunk;
@@ -957,11 +1116,13 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 	ret = read_full(state->fd, &reply_len_be, sizeof(reply_len_be));
 	if (ret < 0) {
 		holo_disconnect(state);
+		holo_watchdog_finish(state);
 		return TCMU_STS_BUSY;
 	}
 	reply_len = ntohl(reply_len_be);
 	if (reply_len > HOLO_MAX_REPLY) {
 		holo_disconnect(state);
+		holo_watchdog_finish(state);
 		return TCMU_STS_RD_ERR;
 	}
 	if (reply_len > 0) {
@@ -979,6 +1140,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 						     copy_len);
 			if (ret < 0) {
 				holo_disconnect(state);
+				holo_watchdog_finish(state);
 				return TCMU_STS_BUSY;
 			}
 		}
@@ -986,6 +1148,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 			ret = discard_full(state->fd, reply_len - copy_len);
 			if (ret < 0) {
 				holo_disconnect(state);
+				holo_watchdog_finish(state);
 				return TCMU_STS_BUSY;
 			}
 		}
@@ -994,6 +1157,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 	ret = read_full(state->fd, &status, sizeof(status));
 	if (ret < 0) {
 		holo_disconnect(state);
+		holo_watchdog_finish(state);
 		return TCMU_STS_BUSY;
 	}
 	if (state->timing.every > 0) {
@@ -1006,12 +1170,16 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 
 	switch (status) {
 	case 0x00: /* GOOD */
+		holo_watchdog_finish(state);
 		return TCMU_STS_OK;
 	case 0x02: /* CHECK CONDITION */
+		holo_watchdog_finish(state);
 		return TCMU_STS_PASSTHROUGH_ERR;
 	case 0x08: /* BUSY */
+		holo_watchdog_finish(state);
 		return TCMU_STS_BUSY;
 	default:
+		holo_watchdog_finish(state);
 		return TCMU_STS_HW_ERR;
 	}
 }

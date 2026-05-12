@@ -5,7 +5,9 @@ use std::sync::{Mutex, OnceLock};
 
 use super::blk_map::{load_blk_map_records, BlkMapState};
 use super::layout::SegmentKind;
-use super::metadata::{lock_storage_mutex, modified_nanos_from_result, StorageError};
+use super::metadata::{
+    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+};
 use super::segment::{
     append_segment_payload, read_segment_file, sync_segment_file, write_segment_file,
 };
@@ -304,11 +306,17 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<MapLookupRecord>, Storage
         ));
     }
 
-    let count = u64::from_le_bytes(
+    let raw_count = u64::from_le_bytes(
         payload[0..8]
             .try_into()
             .map_err(|_| StorageError::Corrupt("lookup count parse failed".to_string()))?,
-    ) as usize;
+    );
+    let count = checked_usize_from_u64(raw_count, "lookup count")?;
+    if payload.len().saturating_sub(8) / RECORD_SIZE < count {
+        return Err(StorageError::Corrupt(
+            "lookup payload truncated".to_string(),
+        ));
+    }
     let mut offset = 8;
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {

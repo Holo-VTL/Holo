@@ -11,7 +11,8 @@ import (
 )
 
 type StorageHandler struct {
-	svc storageManagementService
+	svc        storageManagementService
+	reconciler storageMediaStateReconciler
 }
 
 type storageManagementService interface {
@@ -25,8 +26,16 @@ type storageManagementService interface {
 	GetCapacity(ctx context.Context, poolID string) (*domain.StoragePoolCapacitySnapshot, error)
 }
 
-func NewStorageHandler(svc storageManagementService) *StorageHandler {
-	return &StorageHandler{svc: svc}
+type storageMediaStateReconciler interface {
+	ReconcileMediaState(ctx context.Context) error
+}
+
+func NewStorageHandler(svc storageManagementService, reconcilers ...storageMediaStateReconciler) *StorageHandler {
+	h := &StorageHandler{svc: svc}
+	if len(reconcilers) > 0 {
+		h.reconciler = reconcilers[0]
+	}
+	return h
 }
 
 type createStoragePoolRequest struct {
@@ -57,6 +66,9 @@ func (h *StorageHandler) handleDisksDiscovery(w http.ResponseWriter, r *http.Req
 func (h *StorageHandler) handlePools(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		if !h.reconcileStorageView(w, r) {
+			return
+		}
 		respondJSON(w, http.StatusOK, h.svc.ListPools(r.Context()))
 	case http.MethodPost:
 		var req createStoragePoolRequest
@@ -112,6 +124,9 @@ func (h *StorageHandler) handlePoolDeleteAction(w http.ResponseWriter, r *http.R
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
+	if !h.reconcileStorageView(w, r) {
+		return
+	}
 	actor := strings.TrimSpace(r.URL.Query().Get("actor"))
 	if err := h.svc.DeletePool(r.Context(), poolID, actor); err != nil {
 		respondStorageError(w, err)
@@ -123,6 +138,9 @@ func (h *StorageHandler) handlePoolDeleteAction(w http.ResponseWriter, r *http.R
 func (h *StorageHandler) handlePoolByID(w http.ResponseWriter, r *http.Request, poolID string) {
 	switch r.Method {
 	case http.MethodGet:
+		if !h.reconcileStorageView(w, r) {
+			return
+		}
 		pool, err := h.svc.GetPool(r.Context(), poolID)
 		if err != nil {
 			respondStorageError(w, err)
@@ -130,6 +148,9 @@ func (h *StorageHandler) handlePoolByID(w http.ResponseWriter, r *http.Request, 
 		}
 		respondJSON(w, http.StatusOK, pool)
 	case http.MethodDelete:
+		if !h.reconcileStorageView(w, r) {
+			return
+		}
 		actor := strings.TrimSpace(r.URL.Query().Get("actor"))
 		if err := h.svc.DeletePool(r.Context(), poolID, actor); err != nil {
 			respondStorageError(w, err)
@@ -144,6 +165,9 @@ func (h *StorageHandler) handlePoolByID(w http.ResponseWriter, r *http.Request, 
 func (h *StorageHandler) handlePoolCapacity(w http.ResponseWriter, r *http.Request, poolID string) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	if !h.reconcileStorageView(w, r) {
 		return
 	}
 	snapshot, err := h.svc.GetCapacity(r.Context(), poolID)
@@ -173,6 +197,9 @@ func (h *StorageHandler) handlePoolDiskManagement(w http.ResponseWriter, r *http
 		pool *domain.StoragePoolRuntime
 		err  error
 	)
+	if action == "detach" && !h.reconcileStorageView(w, r) {
+		return
+	}
 	if action == "attach" {
 		pool, err = h.svc.AttachDisk(r.Context(), poolID, req.DevicePath, req.Actor)
 	} else {
@@ -183,6 +210,17 @@ func (h *StorageHandler) handlePoolDiskManagement(w http.ResponseWriter, r *http
 		return
 	}
 	respondJSON(w, http.StatusOK, pool)
+}
+
+func (h *StorageHandler) reconcileStorageView(w http.ResponseWriter, r *http.Request) bool {
+	if h.reconciler == nil {
+		return true
+	}
+	if err := h.reconciler.ReconcileMediaState(r.Context()); err != nil {
+		respondStorageError(w, err)
+		return false
+	}
+	return true
 }
 
 func respondStorageError(w http.ResponseWriter, err error) {
@@ -206,5 +244,5 @@ func respondStorageError(w http.ResponseWriter, err error) {
 		respondError(w, status, message, err)
 		return
 	}
-	respondError(w, status, message, nil)
+	respondError(w, status, message, err)
 }

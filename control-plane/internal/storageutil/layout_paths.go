@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 )
 
 type RootKind string
@@ -51,6 +52,9 @@ func PoolStorageRoot(poolID string) string {
 	return filepath.Join(ResolvePoolStorageBaseDir(), SanitizeLayoutID(poolID))
 }
 
+// SafeJoin joins a relative child path under root and rejects escapes.
+// An empty child returns the cleaned root so callers can normalize a root-only
+// path without special casing it.
 func SafeJoin(root, child string) (string, error) {
 	root = strings.TrimSpace(root)
 	child = strings.TrimSpace(child)
@@ -124,7 +128,7 @@ func isRootOrChild(path, root string) bool {
 }
 
 func isGoTestTempRoot(path string) bool {
-	if !strings.HasSuffix(os.Args[0], ".test") {
+	if !testing.Testing() {
 		return false
 	}
 	// Unit tests use t.TempDir-backed roots to avoid writing under /var/lib/holo.

@@ -188,38 +188,18 @@ pub struct MamAttributeOverride {
     pub value: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionPolicy {
     pub is_worm_media: bool,
     pub retention_locked: bool,
 }
 
-impl Default for RetentionPolicy {
-    fn default() -> Self {
-        Self {
-            is_worm_media: false,
-            retention_locked: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReservationState {
     pub generation: u32,
     pub registrations: BTreeMap<String, u64>,
     pub active_owner: Option<String>,
     pub active_key: Option<u64>,
-}
-
-impl Default for ReservationState {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            registrations: BTreeMap::new(),
-            active_owner: None,
-            active_key: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

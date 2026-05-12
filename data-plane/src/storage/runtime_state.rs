@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::layout::checksum32;
-use super::metadata::StorageError;
+use super::metadata::{checked_usize_from_u64, StorageError};
 
 const FILEMARKS_STATE_FILE: &str = "filemarks.state";
 const RETENTION_STATE_FILE: &str = "retention.state";
@@ -48,11 +48,12 @@ pub fn load_filemarks(root: &Path) -> Result<Vec<u64>, StorageError> {
             "filemarks state too short".to_string(),
         ));
     }
-    let count = u64::from_le_bytes(
+    let raw_count = u64::from_le_bytes(
         bytes[0..8]
             .try_into()
             .map_err(|_| StorageError::Corrupt("filemarks count parse failed".to_string()))?,
-    ) as usize;
+    );
+    let count = checked_usize_from_u64(raw_count, "filemarks count")?;
     if count > MAX_FILEMARKS {
         return Err(StorageError::Corrupt(
             "filemarks count exceeds maximum supported entries".to_string(),
@@ -175,6 +176,7 @@ mod tests {
         let path = root.join(FILEMARKS_STATE_FILE);
         let file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&path)
             .expect("create oversized file");

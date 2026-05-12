@@ -77,8 +77,10 @@ func TestLoad_InvalidNumericAndBoolEnvLogAndFallback(t *testing.T) {
 	if !strings.Contains(got, "HOLO_TARGET_PORTAL_PORT") || !strings.Contains(got, "HOLO_TARGET_RUNTIME_USE_SUDO") {
 		t.Fatalf("expected parse failure logs for invalid env vars, got %q", got)
 	}
-	if strings.Contains(got, "secret") {
-		t.Fatalf("parse failure log should not include raw env values, got %q", got)
+	for _, raw := range []string{`"bad-port\nsecret"`, `"not-bool\nsecret"`} {
+		if !strings.Contains(got, raw) {
+			t.Fatalf("expected parse failure log to include quoted raw value %s, got %q", raw, got)
+		}
 	}
 }
 
@@ -100,8 +102,10 @@ func TestLoadE_InvalidNumericAndBoolEnvReturnsError(t *testing.T) {
 			t.Fatalf("expected error to include %s, got %q", envName, got)
 		}
 	}
-	if strings.Contains(got, "secret") {
-		t.Fatalf("parse failure error should not include raw env values, got %q", got)
+	for _, raw := range []string{`"bad-port\nsecret"`, `"not-a-size\nsecret"`, `"not-bool\nsecret"`} {
+		if !strings.Contains(got, raw) {
+			t.Fatalf("expected parse failure error to include quoted raw value %s, got %q", raw, got)
+		}
 	}
 }
 

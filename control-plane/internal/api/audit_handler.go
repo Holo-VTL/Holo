@@ -35,7 +35,7 @@ func (h *AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a := q.Get("after"); a != "" {
 		t, err := time.Parse(time.RFC3339, a)
 		if err != nil {
-			respondError(w, http.StatusBadRequest, "invalid after timestamp", nil)
+			respondError(w, http.StatusBadRequest, "invalid after timestamp", err)
 			return
 		}
 		params.After = t
@@ -43,7 +43,7 @@ func (h *AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if b := q.Get("before"); b != "" {
 		t, err := time.Parse(time.RFC3339, b)
 		if err != nil {
-			respondError(w, http.StatusBadRequest, "invalid before timestamp", nil)
+			respondError(w, http.StatusBadRequest, "invalid before timestamp", err)
 			return
 		}
 		params.Before = t
@@ -66,8 +66,12 @@ func (h *AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if limitStr := q.Get("limit"); limitStr != "" {
 		l, err := strconv.Atoi(limitStr)
-		if err != nil || l <= 0 || l > maxAuditQueryLimit {
-			respondError(w, http.StatusBadRequest, "invalid limit", nil)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "invalid limit", err)
+			return
+		}
+		if l <= 0 || l > maxAuditQueryLimit {
+			respondError(w, http.StatusBadRequest, "invalid limit", errors.New("audit limit out of range"))
 			return
 		}
 		params.Limit = l
@@ -76,7 +80,7 @@ func (h *AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	res, err := h.querySvc.Query(r.Context(), params)
 	if err != nil {
 		if errors.Is(err, audit.ErrInvalidCursor) {
-			respondError(w, http.StatusBadRequest, "invalid cursor", nil)
+			respondError(w, http.StatusBadRequest, "invalid cursor", err)
 			return
 		}
 		respondError(w, http.StatusInternalServerError, "internal server error", err)

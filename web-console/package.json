@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "HOLO_DEV_BACKEND=http://127.0.0.1 vite --host 0.0.0.0 --port 5173",
-    "dev:local": "HOLO_DEV_BACKEND=http://127.0.0.1 vite --host 0.0.0.0 --port 5173",
-    "dev:184": "HOLO_DEV_BACKEND=http://10.10.1.184 vite --host 0.0.0.0 --port 5173",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "dev:local": "vite --host 127.0.0.1 --port 5173",
+    "dev:backend": "vite --host 127.0.0.1 --port 5173",
+    "build": "tsc -b && vite build && node scripts/harden-dist.mjs",
+    "harden:dist": "node scripts/harden-dist.mjs",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -3,6 +3,7 @@ package metrics
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestMetricsRegistry_Increment(t *testing.T) {
@@ -68,5 +69,39 @@ func TestMetricsRegistry_AuditJournalParseFailures(t *testing.T) {
 
 	if val := atomic.LoadInt64(&r.AuditParseFailures); val != 2 {
 		t.Fatalf("AuditParseFailures = %v, want 2", val)
+	}
+}
+
+func TestMetricsRegistry_AuditJournalStats(t *testing.T) {
+	r := NewMetricsRegistry()
+	occurredAt := time.Unix(100, 0).UTC()
+
+	r.RecordAuditJournalStats(4096, occurredAt)
+
+	if got := atomic.LoadInt64(&r.AuditJournalSizeBytes); got != 4096 {
+		t.Fatalf("AuditJournalSizeBytes = %v, want 4096", got)
+	}
+	if got := atomic.LoadInt64(&r.AuditJournalLastWriteUnix); got != 100 {
+		t.Fatalf("AuditJournalLastWriteUnix = %v, want 100", got)
+	}
+}
+
+func TestMetricsRegistry_APIRequestDurationHistogram(t *testing.T) {
+	r := NewMetricsRegistry()
+
+	r.RecordAPIRequestDuration(7 * time.Millisecond)
+	r.RecordAPIRequestDuration(150 * time.Millisecond)
+
+	if got := atomic.LoadUint64(&r.APIRequestDurationCount); got != 2 {
+		t.Fatalf("APIRequestDurationCount = %v, want 2", got)
+	}
+	if got := atomic.LoadUint64(&r.APIRequestDurationSumUsec); got != 157_000 {
+		t.Fatalf("APIRequestDurationSumUsec = %v, want 157000", got)
+	}
+	if got := atomic.LoadUint64(&r.APIRequestDurationBuckets[1]); got != 1 {
+		t.Fatalf("10ms bucket = %v, want 1", got)
+	}
+	if got := atomic.LoadUint64(&r.APIRequestDurationBuckets[5]); got != 1 {
+		t.Fatalf("250ms bucket = %v, want 1", got)
 	}
 }

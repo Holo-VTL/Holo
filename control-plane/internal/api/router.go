@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
 	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 	sqliterepo "github.com/Holo-VTL/Holo/control-plane/internal/repo/sqlite"
+	"github.com/Holo-VTL/Holo/control-plane/internal/storageutil"
 	"github.com/Holo-VTL/Holo/control-plane/internal/tracing"
 )
 
@@ -138,13 +140,13 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		mux:        http.NewServeMux(),
 		uiDistDir:  strings.TrimSpace(cfg.WebUIDistDir),
 		resources:  resourcesHandler,
-		storage:    NewStorageHandler(storageSvc),
+		storage:    NewStorageHandler(storageSvc, resourcesHandler),
 		policy:     NewPolicyHandler(accessPolicyRepo, retentionPolicyRepo),
 		ops:        NewOpsHandler(health, query, cfg.TargetPortalPort, registry),
 		access:     accessHandler,
 		discovery:  discoveryHandler,
 		targets:    NewTargetHandler(targetRuntime, accessHandler),
-		metricsHD:  NewMetricsHandler(registry),
+		metricsHD:  NewMetricsHandler(registry, storageutil.ResolvePoolStorageBaseDir()),
 		auditHD:    NewAuditHandler(query, auditWriter),
 		runtime:    targetRuntime,
 		apiKey:     strings.TrimSpace(cfg.APIKey),
@@ -171,7 +173,19 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 }
 
 func (s *Server) Router() http.Handler {
-	return tracing.TraceMiddleware(s.securityHeadersMiddleware(s.rateLimitMiddleware(s.authMiddleware(s.mux))))
+	return tracing.TraceMiddleware(s.metricsMiddleware(s.securityHeadersMiddleware(s.rateLimitMiddleware(s.authMiddleware(s.mux)))))
+}
+
+func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.metricsHD == nil || s.metricsHD.registry == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		s.metricsHD.registry.RecordAPIRequestDuration(time.Since(start))
+	})
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -280,7 +294,7 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'")
 		if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
@@ -328,7 +342,10 @@ func (s *Server) handleUIAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	distInfo, err := os.Stat(distDir)
 	if err != nil || !distInfo.IsDir() {
-		respondError(w, http.StatusServiceUnavailable, "ui dist directory is unavailable", nil)
+		if err == nil {
+			err = errors.New("ui dist path is not a directory")
+		}
+		respondError(w, http.StatusServiceUnavailable, "ui dist directory is unavailable", err)
 		return
 	}
 

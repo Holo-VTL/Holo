@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -168,10 +169,20 @@ func (s *HealthService) dataPlaneComponent() ComponentHealth {
 		}
 		return ComponentHealth{Name: "dataPlane", Status: "unknown", Message: err.Error()}
 	}
+	var socketErr error
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".sock") {
-			return ComponentHealth{Name: "dataPlane", Status: "ok"}
+			socketPath := filepath.Join(runDir, e.Name())
+			conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				return ComponentHealth{Name: "dataPlane", Status: "ok", Message: socketPath}
+			}
+			socketErr = err
 		}
+	}
+	if socketErr != nil {
+		return ComponentHealth{Name: "dataPlane", Status: "down", Message: "cdb socket unreachable: " + socketErr.Error()}
 	}
 	if s.targetProvider != nil && s.targetProvider.HealthSnapshot().TotalPublications == 0 {
 		return ComponentHealth{Name: "dataPlane", Status: "unknown", Message: "no active publications"}

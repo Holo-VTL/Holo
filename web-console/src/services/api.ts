@@ -24,8 +24,65 @@ type RequestOptions = {
 
 export const HOLO_API_KEY_SESSION_KEY = "holo.apiKey";
 
+type RuntimeConfig = {
+  apiBaseUrl: string;
+};
+
+const defaultRuntimeConfig: RuntimeConfig = {
+  apiBaseUrl: "",
+};
+
+let runtimeConfigPromise: Promise<RuntimeConfig> | undefined;
+
 function isApiError(value: unknown): value is ApiError {
   return typeof value === "object" && value !== null && "status" in value;
+}
+
+function configPath(): string {
+  const base = import.meta.env.BASE_URL || "/";
+  const normalized = base.endsWith("/") ? base : `${base}/`;
+  return `${normalized}config.json`;
+}
+
+function normalizeApiBaseUrl(raw: unknown): string {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  return raw.trim().replace(/\/+$/, "");
+}
+
+async function loadRuntimeConfig(): Promise<RuntimeConfig> {
+  if (!runtimeConfigPromise) {
+    runtimeConfigPromise = fetch(configPath(), {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          return defaultRuntimeConfig;
+        }
+        const payload = (await response.json()) as Partial<RuntimeConfig>;
+        return {
+          apiBaseUrl: normalizeApiBaseUrl(payload.apiBaseUrl),
+        };
+      })
+      .catch(() => defaultRuntimeConfig);
+  }
+  return runtimeConfigPromise;
+}
+
+async function apiURL(path: string): Promise<string> {
+  const cfg = await loadRuntimeConfig();
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  if (cfg.apiBaseUrl === "") {
+    return normalizedPath;
+  }
+  return `${cfg.apiBaseUrl}${normalizedPath}`;
+}
+
+export function resetRuntimeConfigForTest() {
+  runtimeConfigPromise = undefined;
 }
 
 function getStoredAPIKey(): string {
@@ -73,7 +130,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
   applyAuthHeaders(headers);
 
-  const response = await fetch(path, {
+  const response = await fetch(await apiURL(path), {
     method: options.method || "GET",
     headers,
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
@@ -113,7 +170,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 async function download(path: string): Promise<{ blob: Blob; filename: string }> {
   const headers: Record<string, string> = {};
   applyAuthHeaders(headers);
-  const response = await fetch(path, {
+  const response = await fetch(await apiURL(path), {
     method: "GET",
     headers,
   });
@@ -135,7 +192,7 @@ async function download(path: string): Promise<{ blob: Blob; filename: string }>
 export const api = {
   ops: {
     health: async () => {
-      const response = await fetch("/healthz", {
+      const response = await fetch(await apiURL("/healthz"), {
         method: "GET",
         headers: { Accept: "application/json" },
       });

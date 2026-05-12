@@ -45,13 +45,8 @@ func (h *TargetHandler) handlePublications(w http.ResponseWriter, r *http.Reques
 			respondError(w, http.StatusBadRequest, "invalid request body", err)
 			return
 		}
-		if (strings.TrimSpace(req.TargetIQN) != "" && domain.ValidateTargetIQN(req.TargetIQN) != nil) ||
-			validateManagementID(req.LibraryID) != nil ||
-			validateManagementID(req.DriveID) != nil ||
-			validateManagementID(req.CartridgeID) != nil ||
-			validateProfileToken(req.DeviceProfile) != nil ||
-			validateProfileToken(req.DriveProfile) != nil {
-			respondError(w, http.StatusBadRequest, "invalid request", nil)
+		if err := validatePublishTargetRequest(req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request", err)
 			return
 		}
 		publication, err := h.service.Publish(r.Context(), orchestration.PublishRequest{
@@ -97,6 +92,25 @@ func (h *TargetHandler) handlePublications(w http.ResponseWriter, r *http.Reques
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 	}
+}
+
+func validatePublishTargetRequest(req publishTargetRequest) error {
+	if strings.TrimSpace(req.TargetIQN) != "" {
+		if err := domain.ValidateTargetIQN(req.TargetIQN); err != nil {
+			return err
+		}
+	}
+	for _, value := range []string{req.LibraryID, req.DriveID, req.CartridgeID} {
+		if err := validateManagementID(value); err != nil {
+			return err
+		}
+	}
+	for _, value := range []string{req.DeviceProfile, req.DriveProfile} {
+		if err := validateProfileToken(value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func latestPublicationsByIQN(publications []*domain.TargetPublication) []*domain.TargetPublication {

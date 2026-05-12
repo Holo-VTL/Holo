@@ -73,8 +73,7 @@ func (h *OpsHandler) handleSupportBundle(w http.ResponseWriter, r *http.Request)
 
 	bundle, filename, err := h.buildSupportBundle(r.Context())
 	if err != nil {
-		log.Printf("support bundle generation failed: %v", err)
-		respondError(w, http.StatusInternalServerError, "support bundle unavailable", nil)
+		respondError(w, http.StatusInternalServerError, "support bundle unavailable", err)
 		return
 	}
 

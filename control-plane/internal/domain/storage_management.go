@@ -164,6 +164,16 @@ func (p *StoragePoolRuntime) ReserveWrite(bytes int64) (bool, error) {
 	return !prevWarning && p.Capacity.Warning, nil
 }
 
+func (p *StoragePoolRuntime) SetUsedBytes(bytes int64) error {
+	if bytes < 0 {
+		return ErrInvalidInput
+	}
+	p.Capacity.UsedBytes = bytes
+	p.UpdatedAt = time.Now().UTC()
+	p.refreshCapacitySnapshot()
+	return nil
+}
+
 func (p *StoragePoolRuntime) RollbackReservedWrite(bytes int64) error {
 	if bytes <= 0 {
 		return ErrInvalidInput

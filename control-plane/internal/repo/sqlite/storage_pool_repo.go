@@ -250,6 +250,30 @@ func (r *StoragePoolRepo) RollbackReservedWrite(ctx context.Context, poolID stri
 	return cloneStoragePool(pool), nil
 }
 
+func (r *StoragePoolRepo) SetUsedBytes(ctx context.Context, poolID string, usedBytes int64) (*domain.StoragePoolRuntime, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := r.loadPoolWithDisks(ctx, tx, strings.TrimSpace(poolID))
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	if err := pool.SetUsedBytes(usedBytes); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	if err := savePoolTx(ctx, tx, pool); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return cloneStoragePool(pool), nil
+}
+
 func (r *StoragePoolRepo) RecordDiscovery(_ context.Context, disks []domain.StorageManagedDisk) {
 	r.discoveryMu.Lock()
 	defer r.discoveryMu.Unlock()

@@ -278,6 +278,7 @@ sudo docker run --rm \
   gcc -std=gnu11 -O2 -fPIC -shared -Wall -Wextra \
     -I/tmp/tcmu-runner -I/tmp/tcmu-runner/ccan -I/tmp/tcmu-runner/ccan/ccan \
     /src/infra/tcmu/handler_holo.c \
+    -pthread \
     -o /out/handler_holo.so
 sudo chown \$(whoami):\$(whoami) "\${OUTPUT_DIR}/handler_holo.so" 2>/dev/null || true
 

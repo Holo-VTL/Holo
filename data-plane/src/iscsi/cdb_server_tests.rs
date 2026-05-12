@@ -3279,7 +3279,7 @@ mod tests {
 
         let rezero = dispatch_changer_cdb(&mut state, &[0x01, 0, 0, 0, 0, 0], &[], profile.clone());
         assert_eq!(rezero.status, SCSI_STATUS_GOOD);
-        assert!(state.changer_slots.get(&0x0400).is_some());
+        assert!(state.changer_slots.contains_key(&0x0400));
         assert_eq!(
             state.changer_slots.get(&0x0401),
             Some(&Some("CUSTOM01".to_string()))

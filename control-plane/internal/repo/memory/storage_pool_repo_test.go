@@ -97,6 +97,27 @@ func TestStoragePoolRepo_ReserveAndRollback(t *testing.T) {
 	}
 }
 
+func TestStoragePoolRepo_SetUsedBytesReconcilesSnapshot(t *testing.T) {
+	repo := NewStoragePoolRepo()
+	ctx := context.Background()
+
+	pool, _ := domain.NewStoragePoolRuntime("pool-a", "Pool A", 80)
+	if err := repo.CreatePool(ctx, pool); err != nil {
+		t.Fatalf("create pool failed: %v", err)
+	}
+	if _, err := repo.AttachDisk(ctx, "pool-a", domain.StoragePoolDisk{DevicePath: "/dev/sdb", SizeBytes: 100}); err != nil {
+		t.Fatalf("attach disk failed: %v", err)
+	}
+
+	updated, err := repo.SetUsedBytes(ctx, "pool-a", 25)
+	if err != nil {
+		t.Fatalf("set used bytes failed: %v", err)
+	}
+	if updated.Capacity.UsedBytes != 25 || updated.Capacity.FreeBytes != 75 || updated.Capacity.UsedPercent != 25 {
+		t.Fatalf("unexpected reconciled capacity: %+v", updated.Capacity)
+	}
+}
+
 func TestStoragePoolRepo_DiscoveryHistoryCap(t *testing.T) {
 	repo := NewStoragePoolRepo()
 	ctx := context.Background()

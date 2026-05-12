@@ -93,6 +93,34 @@ func TestStoragePoolRepoAttachConflictAndRollback(t *testing.T) {
 	}
 }
 
+func TestStoragePoolRepoSetUsedBytesPersists(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "metadata.db")
+	repo := openStorageRepo(t, dbPath)
+	pool, err := domain.NewStoragePoolRuntime("pool-a", "Pool A", 80)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	if err := repo.CreatePool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	if _, err := repo.AttachDisk(ctx, "pool-a", domain.StoragePoolDisk{DevicePath: "/dev/sdb", SizeBytes: 100}); err != nil {
+		t.Fatalf("attach disk: %v", err)
+	}
+	if _, err := repo.SetUsedBytes(ctx, "pool-a", 25); err != nil {
+		t.Fatalf("set used bytes: %v", err)
+	}
+
+	reopened := openStorageRepo(t, dbPath)
+	reloaded, err := reopened.FindPool(ctx, "pool-a")
+	if err != nil {
+		t.Fatalf("find reopened pool: %v", err)
+	}
+	if reloaded.Capacity.UsedBytes != 25 || reloaded.Capacity.FreeBytes != 75 || reloaded.Capacity.UsedPercent != 25 {
+		t.Fatalf("unexpected reopened capacity: %+v", reloaded.Capacity)
+	}
+}
+
 func TestStoragePoolRepoPreservesPersistedPoolStatus(t *testing.T) {
 	ctx := context.Background()
 	repo := openStorageRepo(t, filepath.Join(t.TempDir(), "metadata.db"))

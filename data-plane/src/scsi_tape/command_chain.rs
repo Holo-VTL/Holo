@@ -789,7 +789,7 @@ pub fn write_fixed_blocks(
 ) -> Result<(), TapeError> {
     ensure_loaded(state)?;
     invalidate_state_read_prefetch(state);
-    if payload.is_empty() || block_size == 0 || payload.len() % block_size != 0 {
+    if payload.is_empty() || block_size == 0 || !payload.len().is_multiple_of(block_size) {
         return Err(TapeError::InvalidArgument(
             "fixed-block write payload must contain complete blocks".to_string(),
         ));
@@ -1306,7 +1306,7 @@ fn is_addressable_position(state: &TapeState, target_position: u64) -> bool {
 
     if state.block_mode.fixed_block_size > 0 {
         let block = state.block_mode.fixed_block_size as u64;
-        return target_position % block == 0;
+        return target_position.is_multiple_of(block);
     }
     false
 }

@@ -50,6 +50,7 @@ type coreResourcesRepo interface {
 type resourceStoragePoolService interface {
 	CreatePool(ctx context.Context, req orchestration.CreateStoragePoolRequest) (*domain.StoragePoolRuntime, error)
 	GetPool(ctx context.Context, poolID string) (*domain.StoragePoolRuntime, error)
+	ReconcilePoolUsedBytes(ctx context.Context, poolID string, usedBytes int64) error
 }
 
 type resourceTargetService interface {
@@ -471,6 +472,12 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 			respondResourceError(w, err)
 			return
 		}
+		if err := h.syncPoolUsage(r.Context(), cartridge.PoolID); err != nil {
+			h.logCompensationError(r.Context(), "delete cartridge after pool usage sync failure", h.repo.DeleteCartridge(r.Context(), cartridge.CartridgeID), "poolId", cartridge.PoolID, "cartridgeId", cartridge.CartridgeID)
+			h.logCompensationError(r.Context(), "resync library slots after pool usage sync failure", h.syncLibrarySlotsToSharedState(r.Context(), cartridge.LibraryID), "libraryId", cartridge.LibraryID)
+			respondResourceError(w, err)
+			return
+		}
 		if err := h.ensureLibraryAutoPublications(r.Context(), cartridge.LibraryID); err != nil {
 			h.logCompensationError(r.Context(), "delete cartridge after publication failure", h.repo.DeleteCartridge(r.Context(), cartridge.CartridgeID), "cartridgeId", cartridge.CartridgeID, "libraryId", cartridge.LibraryID)
 			h.logCompensationError(r.Context(), "resync library slots after publication failure", h.syncLibrarySlotsToSharedState(r.Context(), cartridge.LibraryID), "libraryId", cartridge.LibraryID)
@@ -532,6 +539,10 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 		}
 		if err := h.repo.DestroyCartridge(r.Context(), cartridge.CartridgeID, cartridge.Barcode, nonEmpty(actor, "web-console")); err != nil {
 			h.emitCartridgeAudit(r.Context(), nonEmpty(actor, "web-console"), "cartridge_destroy", cartridge, "failure", map[string]any{"reason": "destroy_record"})
+			respondResourceError(w, err)
+			return
+		}
+		if err := h.syncPoolUsage(r.Context(), cartridge.PoolID); err != nil {
 			respondResourceError(w, err)
 			return
 		}
@@ -795,6 +806,10 @@ func (h *ResourcesHandler) eraseCartridge(ctx context.Context, cartridgeID strin
 		h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "failure", map[string]any{"mode": mode, "reason": "save_cartridge"})
 		return nil, err
 	}
+	if err := h.syncPoolUsage(ctx, cartridge.PoolID); err != nil {
+		h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "failure", map[string]any{"mode": mode, "reason": "sync_pool_usage"})
+		return nil, err
+	}
 	h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "success", map[string]any{"mode": mode})
 	return cartridge, nil
 }
@@ -842,7 +857,7 @@ func respondResourceError(w http.ResponseWriter, err error) {
 		respondError(w, status, message, err)
 		return
 	}
-	respondError(w, status, message, nil)
+	respondError(w, status, message, err)
 }
 
 func nonEmpty(value, fallback string) string {
@@ -1248,6 +1263,52 @@ func (h *ResourcesHandler) reconcileMediaState(ctx context.Context) error {
 			cartridge.UpdatedAt = time.Now().UTC()
 		}
 		if err := h.repo.SaveCartridge(ctx, cartridge); err != nil {
+			return err
+		}
+	}
+	return h.syncPoolUsageForCartridges(ctx, h.repo.ListCartridges(ctx))
+}
+
+func (h *ResourcesHandler) ReconcileMediaState(ctx context.Context) error {
+	return h.reconcileMediaState(ctx)
+}
+
+func (h *ResourcesHandler) syncPoolUsage(ctx context.Context, poolIDs ...string) error {
+	return h.syncPoolUsageForCartridges(ctx, h.repo.ListCartridges(ctx), poolIDs...)
+}
+
+func (h *ResourcesHandler) syncPoolUsageForCartridges(ctx context.Context, cartridges []*domain.VirtualCartridge, poolIDs ...string) error {
+	if h.storage == nil {
+		return nil
+	}
+	usedByPool := make(map[string]int64)
+	targetPools := make(map[string]struct{})
+	for _, raw := range poolIDs {
+		poolID := strings.TrimSpace(raw)
+		if poolID != "" {
+			targetPools[poolID] = struct{}{}
+		}
+	}
+	for _, cartridge := range cartridges {
+		if cartridge == nil || cartridge.LifecycleState == domain.CartridgeRetired {
+			continue
+		}
+		poolID := strings.TrimSpace(cartridge.PoolID)
+		if poolID == "" {
+			continue
+		}
+		if cartridge.UsedBytes > 0 {
+			const maxInt64 = int64(1<<63 - 1)
+			if usedByPool[poolID] > maxInt64-cartridge.UsedBytes {
+				usedByPool[poolID] = maxInt64
+			} else {
+				usedByPool[poolID] += cartridge.UsedBytes
+			}
+		}
+		targetPools[poolID] = struct{}{}
+	}
+	for poolID := range targetPools {
+		if err := h.storage.ReconcilePoolUsedBytes(ctx, poolID, usedByPool[poolID]); err != nil {
 			return err
 		}
 	}

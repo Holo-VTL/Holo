@@ -6,6 +6,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::blk_map::{
     append_blk_map_record, load_blk_map_records, locate_active_record, mark_blk_map_stale_batch,
@@ -23,8 +24,9 @@ use super::map_lookup::{
     rebuild_lookup_from_blk_map, sync_lookup, MapLookupRecord,
 };
 use super::metadata::{
-    load_checkpoint_page, lock_storage_mutex, modified_nanos_from_result, persist_checkpoint_page,
-    quarantine_invalid_metadata, CheckpointFlags, MetadataCheckpoint, StorageError,
+    checked_usize_from_u64, load_checkpoint_page, lock_storage_mutex, modified_nanos_from_result,
+    persist_checkpoint_page, quarantine_invalid_metadata, CheckpointFlags, MetadataCheckpoint,
+    StorageError,
 };
 use super::reclaim::{refresh_reclaim_safety, upsert_reclaim_candidates, ReclaimReason};
 use super::segment::{
@@ -42,6 +44,7 @@ use super::segment_index::{
 const DATA_BLOB_HEADER_SIZE: usize = 24;
 const DATA_LOG_PREFIX: &[u8; 4] = b"DTV2";
 const DEFAULT_SYNC_EVERY_WRITES: u32 = 64;
+const DEFAULT_SLOW_WRITE_STAGE_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOptions {
@@ -177,6 +180,72 @@ fn trust_hot_cache() -> bool {
 fn pending_sync_writes() -> &'static Mutex<HashMap<PathBuf, u32>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, u32>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn slow_write_stage_threshold() -> Duration {
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let millis = std::env::var("HOLO_STORAGE_SLOW_WRITE_STAGE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_SLOW_WRITE_STAGE_MS);
+        Duration::from_millis(millis)
+    })
+}
+
+struct StorageWriteTrace<'a> {
+    root: &'a Path,
+    logical_start: u64,
+    payload_len: usize,
+    started_at: Instant,
+    last_at: Instant,
+    threshold: Duration,
+}
+
+impl<'a> StorageWriteTrace<'a> {
+    fn new(paths: &'a LayoutPaths, logical_start: u64, payload_len: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            root: &paths.root,
+            logical_start,
+            payload_len,
+            started_at: now,
+            last_at: now,
+            threshold: slow_write_stage_threshold(),
+        }
+    }
+
+    fn mark(&mut self, stage: &str) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_at);
+        if elapsed >= self.threshold {
+            eprintln!(
+                "[storage_write_slow_stage] stage={stage} elapsed_ms={} logical_start={} payload_len={} root={}",
+                elapsed.as_millis(),
+                self.logical_start,
+                self.payload_len,
+                self.root.display()
+            );
+        }
+        self.last_at = now;
+    }
+
+    fn finish(&self, record_id: u64, dedup_hit: bool, should_flush: bool) {
+        let elapsed = self.started_at.elapsed();
+        if elapsed >= self.threshold {
+            eprintln!(
+                "[storage_write_slow_total] elapsed_ms={} logical_start={} payload_len={} record_id={} dedup_hit={} flushed={} root={}",
+                elapsed.as_millis(),
+                self.logical_start,
+                self.payload_len,
+                record_id,
+                dedup_hit,
+                should_flush,
+                self.root.display()
+            );
+        }
+    }
 }
 
 fn checkpoint_cache() -> &'static Mutex<HashMap<PathBuf, MetadataCheckpoint>> {
@@ -371,13 +440,16 @@ pub fn write_logical_block(
         ));
     }
 
+    let mut trace = StorageWriteTrace::new(paths, logical_start, payload.len());
     let mut checkpoint = load_checkpoint_cached(&paths.metadata_file)?;
+    trace.mark("load_checkpoint");
     let checkpoint_was_clean = checkpoint.flags == CheckpointFlags::Clean;
     if checkpoint_was_clean {
         checkpoint.epoch = checkpoint.epoch.saturating_add(1);
         checkpoint.flags = CheckpointFlags::Dirty;
         persist_checkpoint_cached(&paths.metadata_file, &checkpoint)?;
     }
+    trace.mark("dirty_checkpoint");
 
     if failpoint == Some(IngestFailpoint::AfterDirtyCheckpoint) {
         return Err(StorageError::Conflict(
@@ -391,6 +463,7 @@ pub fn write_logical_block(
     } else {
         0
     };
+    trace.mark("prepare_payload_metadata");
 
     let mut dedup_hit = false;
     let mut collision_detected = false;
@@ -547,6 +620,7 @@ pub fn write_logical_block(
         )?;
         (0, blob_id, selected_codec, stored_len, physical_segment_id)
     };
+    trace.mark("dedup_and_blob_append");
 
     if failpoint == Some(IngestFailpoint::AfterBlobPersist) {
         return Err(StorageError::Conflict(
@@ -570,6 +644,7 @@ pub fn write_logical_block(
             payload_checksum,
         },
     )?;
+    trace.mark("append_blk_map");
 
     if failpoint == Some(IngestFailpoint::AfterBlkMapAppend) {
         return Err(StorageError::Conflict(
@@ -587,6 +662,7 @@ pub fn write_logical_block(
             blk_map_ref_end: appended.record_id,
         },
     )?;
+    trace.mark("append_lookup");
 
     if failpoint == Some(IngestFailpoint::AfterLookupAppend) {
         return Err(StorageError::Conflict(
@@ -595,15 +671,19 @@ pub fn write_logical_block(
     }
 
     let pending_writes = record_pending_write(&paths.metadata_file)?;
+    trace.mark("record_pending_write");
     let should_flush =
         options.force_sync || pending_writes >= sync_every_writes() || failpoint.is_some();
     if should_flush {
         sync_layout_segments(paths)?;
+        trace.mark("sync_layout_segments");
         checkpoint.flags = CheckpointFlags::Clean;
         checkpoint.epoch = checkpoint.epoch.saturating_add(1);
         persist_checkpoint_cached(&paths.metadata_file, &checkpoint)?;
         clear_pending_writes(&paths.metadata_file)?;
+        trace.mark("clean_checkpoint");
     }
+    trace.finish(appended.record_id, dedup_hit, should_flush);
 
     Ok(WriteReport {
         record_id: appended.record_id,
@@ -704,9 +784,7 @@ fn is_indexed_data_segment_name(name: &OsStr) -> bool {
 }
 
 fn indexed_data_segment_seq(name: &OsStr) -> Option<u32> {
-    let Some(name) = name.to_str() else {
-        return None;
-    };
+    let name = name.to_str()?;
     const PREFIX: &str = "data_";
     const SUFFIX: &str = ".seg";
     if !name.starts_with(PREFIX) || !name.ends_with(SUFFIX) {
@@ -739,15 +817,17 @@ pub fn read_logical_block(
     };
 
     let blob = load_blob_by_location(paths, record.physical_segment_id, record.physical_offset)?;
+    let logical_len =
+        checked_usize_from_u64(u64::from(record.logical_len), "logical payload length")?;
     let payload = if record.compression == CompressionCodec::None {
-        if blob.bytes.len() != record.logical_len as usize {
+        if blob.bytes.len() != logical_len {
             return Err(StorageError::Corrupt(
                 "raw payload length mismatch".to_string(),
             ));
         }
         blob.bytes
     } else {
-        decompress_payload(record.compression, &blob.bytes, record.logical_len as usize)?
+        decompress_payload(record.compression, &blob.bytes, logical_len)?
     };
 
     if record.payload_checksum != 0 && checksum32(&payload) != record.payload_checksum {
@@ -1091,7 +1171,8 @@ fn dedup_entry_matches_payload(
     entry: &DedupIndexEntry,
     payload: &[u8],
 ) -> Result<bool, StorageError> {
-    if entry.logical_len as usize != payload.len() {
+    let logical_len = checked_usize_from_u64(u64::from(entry.logical_len), "dedup logical length")?;
+    if logical_len != payload.len() {
         return Ok(false);
     }
     let physical_segment_id = locate_blob_segment_id(paths, entry.stored_blob_id)?;
@@ -1102,7 +1183,9 @@ fn dedup_entry_matches_payload(
     let candidate = if blob.codec == CompressionCodec::None {
         blob.bytes
     } else {
-        decompress_payload(blob.codec, &blob.bytes, blob.logical_len as usize)?
+        let blob_logical_len =
+            checked_usize_from_u64(u64::from(blob.logical_len), "data blob logical length")?;
+        decompress_payload(blob.codec, &blob.bytes, blob_logical_len)?
     };
     Ok(candidate == payload)
 }
@@ -1113,7 +1196,12 @@ fn should_verify_dedup_hit(entry: &DedupIndexEntry) -> bool {
     }
     std::env::var("HOLO_TAPE_DEDUP_VERIFY_HITS")
         .ok()
-        .map(|raw| !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .map(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -1142,22 +1230,17 @@ fn load_blob_by_id(path: &Path, blob_id: u64) -> Result<DataBlob, StorageError> 
             .cloned()
             .ok_or_else(|| StorageError::NotFound("data reader not initialized".to_string()))?
     };
-    let bytes =
-        match read_blob_payload(file.as_ref(), meta.payload_offset, meta.stored_len as usize) {
-            Ok(bytes) => bytes,
-            Err(StorageError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
-                let reopened = Arc::new(File::open(path)?);
-                let bytes = read_blob_payload(
-                    reopened.as_ref(),
-                    meta.payload_offset,
-                    meta.stored_len as usize,
-                )?;
-                lock_storage_mutex(data_readers(), "data reader")?
-                    .insert(path.to_path_buf(), reopened);
-                bytes
-            }
-            Err(err) => return Err(err),
-        };
+    let stored_len = checked_usize_from_u64(u64::from(meta.stored_len), "data blob stored length")?;
+    let bytes = match read_blob_payload(file.as_ref(), meta.payload_offset, stored_len) {
+        Ok(bytes) => bytes,
+        Err(StorageError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+            let reopened = Arc::new(File::open(path)?);
+            let bytes = read_blob_payload(reopened.as_ref(), meta.payload_offset, stored_len)?;
+            lock_storage_mutex(data_readers(), "data reader")?.insert(path.to_path_buf(), reopened);
+            bytes
+        }
+        Err(err) => return Err(err),
+    };
     if meta.v2_integrity
         && meta.payload_checksum != blob_integrity_checksum(meta.blob_id, meta.logical_len, &bytes)
     {
@@ -1453,7 +1536,9 @@ fn persist_data_blobs_as_log(path: &Path, blobs: &[DataBlobMeta]) -> Result<(), 
     payload.extend_from_slice(DATA_LOG_PREFIX);
     let mut file = File::open(path)?;
     for blob in blobs {
-        let mut bytes = vec![0u8; blob.stored_len as usize];
+        let stored_len =
+            checked_usize_from_u64(u64::from(blob.stored_len), "data blob stored length")?;
+        let mut bytes = vec![0u8; stored_len];
         file.seek(SeekFrom::Start(blob.payload_offset))?;
         file.read_exact(&mut bytes)?;
         let payload_checksum = blob_integrity_checksum(blob.blob_id, blob.logical_len, &bytes);

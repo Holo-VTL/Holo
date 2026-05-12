@@ -3,13 +3,15 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::blk_map::BlkMapRecord;
 use super::layout::{checksum32, SegmentKind};
 use super::map_lookup::MapLookupRecord;
 use super::segment::{read_segment_file, write_segment_file};
+
+const DEFAULT_SLOW_LOCK_WAIT_MS: u64 = 1000;
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -48,9 +50,30 @@ pub(crate) fn lock_storage_mutex<'a, T>(
     mutex: &'a Mutex<T>,
     name: &str,
 ) -> Result<MutexGuard<'a, T>, StorageError> {
-    mutex
+    let started_at = Instant::now();
+    let guard = mutex
         .lock()
-        .map_err(|_| StorageError::Internal(format!("{name} cache poisoned")))
+        .map_err(|_| StorageError::Internal(format!("{name} cache poisoned")))?;
+    let elapsed = started_at.elapsed();
+    if elapsed >= slow_lock_wait_threshold() {
+        eprintln!(
+            "[storage_lock_slow_wait] name={name} elapsed_ms={}",
+            elapsed.as_millis()
+        );
+    }
+    Ok(guard)
+}
+
+fn slow_lock_wait_threshold() -> Duration {
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let millis = env::var("HOLO_STORAGE_SLOW_LOCK_WAIT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_SLOW_LOCK_WAIT_MS);
+        Duration::from_millis(millis)
+    })
 }
 
 pub(crate) fn modified_nanos_from_result(
@@ -61,6 +84,11 @@ pub(crate) fn modified_nanos_from_result(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos())
+}
+
+pub(crate) fn checked_usize_from_u64(value: u64, field: &str) -> Result<usize, StorageError> {
+    usize::try_from(value)
+        .map_err(|_| StorageError::Corrupt(format!("{field} exceeds platform usize")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +236,7 @@ pub struct FlushReport {
     pub steps: Vec<FlushStep>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn flush_chain(
     data_path: &Path,
     blk_map_path: &Path,

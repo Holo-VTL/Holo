@@ -9,7 +9,7 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 2
 fi
 
-BASELINE_PRODUCTION=248
+BASELINE_PRODUCTION=233
 PATTERN=' as u(8|16|32|64|size)\b'
 
 count_matches() {

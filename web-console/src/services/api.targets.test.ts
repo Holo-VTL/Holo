@@ -1,18 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { api } from "./api";
+import { api, resetRuntimeConfigForTest } from "./api";
 
 describe("api.targets", () => {
   beforeEach(() => {
     sessionStorage.clear();
+    resetRuntimeConfigForTest();
+    vi.unstubAllGlobals();
   });
 
   it("creates publication payload without poolId", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ publicationId: "p-1" }), {
-        status: 202,
-        headers: { "content-type": "application/json" },
-      })
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ apiBaseUrl: "" }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ publicationId: "p-1" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        })
+      );
     vi.stubGlobal("fetch", fetchMock);
 
     await api.targets.createPublication({
@@ -23,7 +28,7 @@ describe("api.targets", () => {
       actor: "tester",
     });
 
-    const [_url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [_url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     const payload = JSON.parse(String(init.body));
     expect(payload.poolId).toBeUndefined();
     expect(payload.libraryId).toBe("lib-1");

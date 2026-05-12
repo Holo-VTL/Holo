@@ -1,4 +1,4 @@
-use super::metadata::StorageError;
+use super::metadata::{checked_usize_from_u64, StorageError};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -188,7 +188,12 @@ fn lz4_prepended_len(payload: &[u8]) -> Result<usize, StorageError> {
     let header = payload
         .get(..4)
         .ok_or_else(|| StorageError::Corrupt("lz4 payload missing size header".to_string()))?;
-    let declared = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let declared = checked_usize_from_u64(
+        u64::from(u32::from_le_bytes([
+            header[0], header[1], header[2], header[3],
+        ])),
+        "lz4 decompressed length",
+    )?;
     ensure_decompressed_len_within_limit(declared)?;
     Ok(declared)
 }
@@ -215,7 +220,7 @@ fn rle_encode(payload: &[u8]) -> Vec<u8> {
 }
 
 fn rle_decode(payload: &[u8]) -> Result<Vec<u8>, StorageError> {
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return Err(StorageError::Corrupt("rle payload malformed".to_string()));
     }
 
