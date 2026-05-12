@@ -76,7 +76,7 @@ func TestLocalMountSyncLogsInDesiredTargetsAndCleansStaleHoloNodes(t *testing.T)
 		t.Fatalf("unexpected desired iqns: %+v", status.DesiredIQNs)
 	}
 	for _, want := range []string{
-		"sudo -n /opt/holo/bin/holo-iscsi-helper discover 127.0.0.1:3260",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper ensure-node iqn.2026-04.cloud.backupnext.holo:drive-a 127.0.0.1:3260",
 		"sudo -n /opt/holo/bin/holo-iscsi-helper login iqn.2026-04.cloud.backupnext.holo:drive-a 127.0.0.1:3260",
 		"sudo -n /opt/holo/bin/holo-iscsi-helper logout iqn.2026-04.cloud.backupnext.holo:stale 127.0.0.1:3260",
 		"sudo -n /opt/holo/bin/holo-iscsi-helper delete iqn.2026-04.cloud.backupnext.holo:stale 127.0.0.1:3260",

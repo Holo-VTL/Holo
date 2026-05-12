@@ -1221,9 +1221,9 @@ shift
 bin="$(iscsiadm_bin)"
 
 case "${sub}" in
-  discover)
-    [[ $# -eq 1 ]] && valid_portal "$1" || die "discover requires <portal>"
-    exec "${bin}" -m discovery -t sendtargets -p "$1"
+  ensure-node)
+    [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "ensure-node requires <iqn> <portal>"
+    exec "${bin}" -m node -T "$1" -p "$2" -o new
     ;;
   set-startup)
     [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "set-startup requires <iqn> <portal>"

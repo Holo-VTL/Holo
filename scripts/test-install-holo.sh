@@ -106,6 +106,7 @@ test_ubuntu_plan() {
   assert_not_contains "${out}" "[dry-run][unit] LockPersonality=yes"
   assert_contains "${out}" "[dry-run][helper] STORAGE_POOL_ROOT_BASE=\"/var/lib/holo/storage-pools\""
   assert_contains "${out}" "[dry-run][targetcli-helper] valid_iqn()"
+  assert_contains "${out}" "[dry-run][iscsi-helper]   ensure-node)"
   assert_contains "${out}" "[dry-run][iscsi-helper]   login)"
   assert_contains "${out}" "[dry-run][support-helper]   export TARGETCLI_HOME=\"\${home}\""
   assert_contains "${out}" "[dry-run][support-helper]   find-config)"

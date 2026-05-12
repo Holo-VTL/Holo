@@ -200,8 +200,8 @@ func (s *LocalMountService) loginNode(ctx context.Context, node iscsiNode) error
 	if node.IQN == "" || node.Portal == "" {
 		return domain.ErrInvalidInput
 	}
-	if _, err := s.runISCSI(ctx, "discover", node.Portal); err != nil {
-		return fmt.Errorf("discover local target %s: %w", node.IQN, err)
+	if _, err := s.runISCSI(ctx, "ensure-node", node.IQN, node.Portal); err != nil && !isIgnorableISCSIADMError(err) {
+		return fmt.Errorf("ensure local target node %s: %w", node.IQN, err)
 	}
 	if _, err := s.runISCSI(ctx, "set-startup", node.IQN, node.Portal); err != nil {
 		return fmt.Errorf("enable automatic local login %s: %w", node.IQN, err)
@@ -380,11 +380,11 @@ func iscsiadmArgs(args ...string) ([]string, error) {
 		return nil, domain.ErrInvalidInput
 	}
 	switch args[0] {
-	case "discover":
-		if len(args) != 2 {
+	case "ensure-node":
+		if len(args) != 3 {
 			return nil, domain.ErrInvalidInput
 		}
-		return []string{"-m", "discovery", "-t", "sendtargets", "-p", args[1]}, nil
+		return []string{"-m", "node", "-T", args[1], "-p", args[2], "-o", "new"}, nil
 	case "set-startup":
 		if len(args) != 3 {
 			return nil, domain.ErrInvalidInput
