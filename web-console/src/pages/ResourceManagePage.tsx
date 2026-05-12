@@ -5,6 +5,7 @@ import { Archive, ChevronLeft, Eraser, HardDrive, Info, Plus, RefreshCw, Trash2,
 import { api } from "../services/api";
 import { useToast } from "../components/Toast";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { SelectInput } from "../components/SelectInput";
 import { formatBytes } from "../utils/format";
 import type { ApiError, StoragePoolRuntime, VirtualCartridge, VirtualDrive, VirtualLibrary } from "../services/types";
 import { MAX_LIBRARY_DRIVES, nextDriveSuffix, resolveTapeProfileFromDriveType } from "./resourceOptions";
@@ -920,19 +921,16 @@ export function ResourceManagePage() {
                     {!selectedCartridgeInVault ? (
                       <div className="form-row inspector-load-target-row">
                         <label>{t("resources.targetDrive")}</label>
-                        <select
-                          className="input"
+                        <SelectInput
                           value={loadTargetDriveId}
-                          onChange={(event) => setLoadTargetDriveId(event.target.value)}
+                          onChange={setLoadTargetDriveId}
+                          options={[
+                            { value: "", label: t("common.noSelection") },
+                            ...loadableDrives.map((drive) => ({ value: drive.driveId, label: drive.driveId })),
+                          ]}
+                          ariaLabel={t("resources.targetDrive")}
                           disabled={loadableDrives.length === 0 || selectedCartridge.lifecycleState !== "available" || Boolean(busyResourceAction)}
-                        >
-                          <option value="">{t("common.noSelection")}</option>
-                          {loadableDrives.map((drive) => (
-                            <option key={drive.driveId} value={drive.driveId}>
-                              {drive.driveId}
-                            </option>
-                          ))}
-                        </select>
+                        />
                         {loadableDrives.length === 0 ? <small>{t("resources.noEmptyDrive")}</small> : null}
                       </div>
                     ) : null}
@@ -1056,19 +1054,16 @@ export function ResourceManagePage() {
             <form className="form-grid" onSubmit={createCartridge}>
               <div className="form-row">
                 <label>{t("resources.poolName")}</label>
-                <select
-                  className="input"
+                <SelectInput
                   value={cartridgeForm.poolId}
-                  onChange={(event) => setCartridgeForm((prev) => ({ ...prev, poolId: event.target.value }))}
+                  onChange={(value) => setCartridgeForm((prev) => ({ ...prev, poolId: value }))}
+                  options={[
+                    { value: "", label: t("common.noSelection") },
+                    ...usablePools.map((pool) => ({ value: pool.poolId, label: `${pool.name} (${pool.poolId})` })),
+                  ]}
+                  ariaLabel={t("resources.poolName")}
                   required
-                >
-                  <option value="">{t("common.noSelection")}</option>
-                  {usablePools.map((pool) => (
-                    <option key={pool.poolId} value={pool.poolId}>
-                      {pool.name} ({pool.poolId})
-                    </option>
-                  ))}
-                </select>
+                />
               </div>
               <div className="form-row">
                 <label>{t("resources.cartridgePrefix")}</label>
@@ -1128,21 +1123,21 @@ export function ResourceManagePage() {
                           setCartridgeForm((prev) => ({ ...prev, customCapacityValue: event.target.value }))
                         }
                       />
-                      <select
-                        className="input"
+                      <SelectInput
                         value={cartridgeForm.customCapacityUnit}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           setCartridgeForm((prev) => ({
                             ...prev,
-                            customCapacityUnit: event.target.value as CapacityUnit,
+                            customCapacityUnit: value as CapacityUnit,
                           }))
                         }
-                        aria-label={t("resources.capacityUnit")}
-                      >
-                        <option value="TB">TB</option>
-                        <option value="GB">GB</option>
-                        <option value="MB">MB</option>
-                      </select>
+                        options={[
+                          { value: "TB", label: "TB" },
+                          { value: "GB", label: "GB" },
+                          { value: "MB", label: "MB" },
+                        ]}
+                        ariaLabel={t("resources.capacityUnit")}
+                      />
                     </div>
                   </div>
                 </div>

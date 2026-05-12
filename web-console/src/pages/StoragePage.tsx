@@ -4,6 +4,7 @@ import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "../services/api";
 import { useToast } from "../components/Toast";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { SelectInput } from "../components/SelectInput";
 import { formatBytes } from "../utils/format";
 import type { StorageManagedDisk, StoragePoolRuntime } from "../services/types";
 
@@ -269,19 +270,19 @@ export function StoragePage() {
               </div>
               <div className="form-row">
                 <label>{t("storage.selectDisk")}</label>
-                <select
-                  className="input"
+                <SelectInput
                   value={poolForm.devicePath}
-                  onChange={(e) => setPoolForm((prev) => ({ ...prev, devicePath: e.target.value }))}
+                  onChange={(value) => setPoolForm((prev) => ({ ...prev, devicePath: value }))}
+                  options={[
+                    { value: "", label: t("common.noSelection") },
+                    ...availableDisks.map((disk) => ({
+                      value: disk.devicePath,
+                      label: `${disk.devicePath} (${formatBytes(disk.sizeBytes)})`,
+                    })),
+                  ]}
+                  ariaLabel={t("storage.selectDisk")}
                   required
-                >
-                  <option value="">{t("common.noSelection")}</option>
-                  {availableDisks.map((disk) => (
-                    <option key={disk.devicePath} value={disk.devicePath}>
-                      {disk.devicePath} ({formatBytes(disk.sizeBytes)})
-                    </option>
-                  ))}
-                </select>
+                />
               </div>
               <div className="inline-actions" style={{ gridColumn: "1 / -1" }}>
                 <button className="btn btn-primary" type="submit" disabled={creating || availableDisks.length === 0}>

@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../services/api";
 import { useToast } from "../components/Toast";
+import { SelectInput } from "../components/SelectInput";
 import { parseRulesJson, toLocalDatetimeValue } from "../utils/format";
 import type { InitiatorRule, TargetPublication, VirtualCartridge } from "../services/types";
 
@@ -169,9 +170,9 @@ export function SecurityPage() {
           <h3>{t("security.createAccessPolicy")}</h3>
           <form className="form-grid" onSubmit={createAccessPolicy}>
             <div className="form-row"><label>{t("security.policyId")}</label><input className="input" value={accessPolicyForm.policyId} onChange={(e) => setAccessPolicyForm((p) => ({ ...p, policyId: e.target.value }))} required /></div>
-            <div className="form-row"><label>{t("security.scope")}</label><select className="input" value={accessPolicyForm.scope} onChange={(e) => setAccessPolicyForm((p) => ({ ...p, scope: e.target.value as "global" | "library" | "drive" }))}><option value="global">global</option><option value="library">library</option><option value="drive">drive</option></select></div>
+            <div className="form-row"><label>{t("security.scope")}</label><SelectInput value={accessPolicyForm.scope} onChange={(value) => setAccessPolicyForm((p) => ({ ...p, scope: value as "global" | "library" | "drive" }))} options={[{ value: "global", label: "global" }, { value: "library", label: "library" }, { value: "drive", label: "drive" }]} ariaLabel={t("security.scope")} /></div>
             <div className="form-row"><label>{t("security.subject")}</label><input className="input" value={accessPolicyForm.subject} onChange={(e) => setAccessPolicyForm((p) => ({ ...p, subject: e.target.value }))} required /></div>
-            <div className="form-row"><label>{t("security.permission")}</label><select className="input" value={accessPolicyForm.permission} onChange={(e) => setAccessPolicyForm((p) => ({ ...p, permission: e.target.value as "allow" | "deny" }))}><option value="allow">allow</option><option value="deny">deny</option></select></div>
+            <div className="form-row"><label>{t("security.permission")}</label><SelectInput value={accessPolicyForm.permission} onChange={(value) => setAccessPolicyForm((p) => ({ ...p, permission: value as "allow" | "deny" }))} options={[{ value: "allow", label: "allow" }, { value: "deny", label: "deny" }]} ariaLabel={t("security.permission")} /></div>
             <div className="form-row"><label>{t("security.effectiveFrom")}</label><input className="input" type="datetime-local" value={toLocalDatetimeValue(new Date(accessPolicyForm.effectiveFrom))} onChange={(e) => setAccessPolicyForm((p) => ({ ...p, effectiveFrom: new Date(e.target.value).toISOString() }))} /></div>
             <div className="form-row"><label>{t("security.effectiveTo")}</label><input className="input" type="datetime-local" value={accessPolicyForm.effectiveTo} onChange={(e) => setAccessPolicyForm((p) => ({ ...p, effectiveTo: e.target.value }))} /></div>
             <div className="inline-actions"><button className="btn btn-primary" type="submit">{t("common.create")}</button></div>
@@ -182,8 +183,8 @@ export function SecurityPage() {
           <h3>{t("security.createRetentionPolicy")}</h3>
           <form className="form-grid" onSubmit={createRetentionPolicy}>
             <div className="form-row"><label>{t("security.retentionId")}</label><input className="input" value={retentionForm.retentionId} onChange={(e) => setRetentionForm((p) => ({ ...p, retentionId: e.target.value }))} required /></div>
-            <div className="form-row"><label>{t("security.cartridgeId")}</label><select className="input" value={retentionForm.cartridgeId} onChange={(e) => setRetentionForm((p) => ({ ...p, cartridgeId: e.target.value }))} required><option value="">{t("common.noSelection")}</option>{cartridges.map((cartridge) => <option key={cartridge.cartridgeId} value={cartridge.cartridgeId}>{cartridge.cartridgeId}</option>)}</select></div>
-            <div className="form-row"><label>{t("security.mode")}</label><select className="input" value={retentionForm.mode} onChange={(e) => setRetentionForm((p) => ({ ...p, mode: e.target.value as "worm" | "governance" }))}><option value="worm">worm</option><option value="governance">governance</option></select></div>
+            <div className="form-row"><label>{t("security.cartridgeId")}</label><SelectInput value={retentionForm.cartridgeId} onChange={(value) => setRetentionForm((p) => ({ ...p, cartridgeId: value }))} options={[{ value: "", label: t("common.noSelection") }, ...cartridges.map((cartridge) => ({ value: cartridge.cartridgeId, label: cartridge.cartridgeId }))]} ariaLabel={t("security.cartridgeId")} required /></div>
+            <div className="form-row"><label>{t("security.mode")}</label><SelectInput value={retentionForm.mode} onChange={(value) => setRetentionForm((p) => ({ ...p, mode: value as "worm" | "governance" }))} options={[{ value: "worm", label: "worm" }, { value: "governance", label: "governance" }]} ariaLabel={t("security.mode")} /></div>
             <div className="form-row"><label>{t("security.lockUntil")}</label><input className="input" type="datetime-local" value={retentionForm.lockUntil} onChange={(e) => setRetentionForm((p) => ({ ...p, lockUntil: e.target.value }))} required /></div>
             <div className="inline-actions"><button className="btn btn-primary" type="submit">{t("common.create")}</button></div>
           </form>
@@ -193,7 +194,7 @@ export function SecurityPage() {
       <div className="panel" style={{ marginTop: 12 }}>
         <h3>{t("security.publicationAccess")}</h3>
         <form className="form-grid" onSubmit={replaceRules}>
-          <div className="form-row"><label>{t("security.publicationId")}</label><select className="input" value={ruleForm.publicationId} onChange={(e) => setRuleForm((p) => ({ ...p, publicationId: e.target.value }))}><option value="">{t("common.noSelection")}</option>{publications.map((item) => <option key={item.publicationId} value={item.publicationId}>{item.publicationId}</option>)}</select></div>
+          <div className="form-row"><label>{t("security.publicationId")}</label><SelectInput value={ruleForm.publicationId} onChange={(value) => setRuleForm((p) => ({ ...p, publicationId: value }))} options={[{ value: "", label: t("common.noSelection") }, ...publications.map((item) => ({ value: item.publicationId, label: item.publicationId }))]} ariaLabel={t("security.publicationId")} /></div>
           <div className="form-row"><label>{t("security.initiator")}</label><input className="input" value={ruleForm.initiator} onChange={(e) => setRuleForm((p) => ({ ...p, initiator: e.target.value }))} /></div>
           <div className="form-row"><label>{t("security.rulesJson")}</label><textarea className="input" value={ruleForm.rulesJson} onChange={(e) => setRuleForm((p) => ({ ...p, rulesJson: e.target.value }))} /></div>
           <div className="inline-actions">

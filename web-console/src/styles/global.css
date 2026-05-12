@@ -433,6 +433,115 @@ select {
   box-shadow: inset 0 1px 0 var(--glass-highlight);
 }
 
+select {
+  color-scheme: light;
+}
+
+select option,
+select optgroup {
+  background: var(--bg-panel-solid);
+  color: var(--text-body);
+}
+
+.select-input {
+  position: relative;
+  width: 100%;
+}
+
+.select-input-trigger {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 38px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.select-input-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.select-input-trigger span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.select-input-trigger svg {
+  flex-shrink: 0;
+}
+
+.select-input-placeholder {
+  color: var(--text-muted);
+}
+
+.select-input-menu {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 6px;
+  background: var(--bg-panel-solid);
+  color: var(--text-body);
+  box-shadow: var(--shadow);
+}
+
+.select-input-option {
+  width: 100%;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--text-body);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.select-input-option:hover,
+.select-input-option:focus-visible {
+  background: var(--bg-chip);
+  color: var(--text-strong);
+  outline: none;
+}
+
+.select-input-option-selected {
+  background: var(--brand);
+  color: var(--brand-strong);
+  font-weight: 760;
+}
+
+.select-input-option-selected:hover,
+.select-input-option-selected:focus-visible {
+  background: color-mix(in srgb, var(--brand) 86%, var(--text-strong));
+  color: var(--brand-strong);
+}
+
+.select-input-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.select-input-check {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+}
+
 .input:focus,
 textarea:focus,
 select:focus {
@@ -2391,6 +2500,27 @@ textarea {
 :root[data-theme="dark"] .version-pill,
 :root[data-theme="dark"] .meta-pill {
   background: var(--bg-chip);
+}
+
+:root[data-theme="dark"] select {
+  color-scheme: dark;
+}
+
+:root[data-theme="dark"] select option,
+:root[data-theme="dark"] select optgroup {
+  background: var(--bg-panel-solid);
+  color: var(--text-body);
+}
+
+:root[data-theme="dark"] .select-input-menu {
+  border-color: var(--border-strong);
+  background: #20201f;
+  color: var(--text-body);
+}
+
+:root[data-theme="dark"] .select-input-option:hover,
+:root[data-theme="dark"] .select-input-option:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
 }
 
 :root[data-theme="dark"] .dashboard-collected,

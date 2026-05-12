@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Plus } from "lucide-react";
 import { api } from "../services/api";
 import { useToast } from "../components/Toast";
+import { SelectInput } from "../components/SelectInput";
 import type { VirtualCartridge, VirtualDrive, VirtualLibrary } from "../services/types";
 import {
   DEFAULT_DRIVE_OPTION,
@@ -268,39 +269,30 @@ export function ResourcesPage() {
               </div>
               <div className="form-row">
                 <label>{t("resources.vendor")}</label>
-                <select
-                  className="input"
+                <SelectInput
                   value={vtlForm.vendor}
-                  onChange={(event) => setVtlForm((prev) => ({ ...prev, vendor: event.target.value }))}
-                >
-                  {availableVendors().map((vendor) => (
-                    <option key={vendor} value={vendor}>{vendor}</option>
-                  ))}
-                </select>
+                  onChange={(value) => setVtlForm((prev) => ({ ...prev, vendor: value }))}
+                  options={availableVendors().map((vendor) => ({ value: vendor, label: vendor }))}
+                  ariaLabel={t("resources.vendor")}
+                />
               </div>
               <div className="form-row">
                 <label>{t("resources.libraryType")}</label>
-                <select
-                  className="input"
+                <SelectInput
                   value={vtlForm.libraryType}
-                  onChange={(event) => setVtlForm((prev) => ({ ...prev, libraryType: event.target.value }))}
-                >
-                  {libraryTypeOptions.map((item) => (
-                    <option key={`${item.vendor}-${item.libraryType}`} value={item.libraryType}>{item.label}</option>
-                  ))}
-                </select>
+                  onChange={(value) => setVtlForm((prev) => ({ ...prev, libraryType: value }))}
+                  options={libraryTypeOptions.map((item) => ({ value: item.libraryType, label: item.label }))}
+                  ariaLabel={t("resources.libraryType")}
+                />
               </div>
-              <div className="form-row">
+              <div className="form-row form-row-wide">
                 <label>{t("resources.vDriveType")}</label>
-                <select
-                  className="input"
+                <SelectInput
                   value={vtlForm.driveType}
-                  onChange={(event) => setVtlForm((prev) => ({ ...prev, driveType: event.target.value }))}
-                >
-                  {driveTypeOptions.map((item) => (
-                    <option key={`${item.vendor}-${item.driveType}`} value={item.driveType}>{item.label}</option>
-                  ))}
-                </select>
+                  onChange={(value) => setVtlForm((prev) => ({ ...prev, driveType: value }))}
+                  options={driveTypeOptions.map((item) => ({ value: item.driveType, label: item.label }))}
+                  ariaLabel={t("resources.vDriveType")}
+                />
               </div>
               <div className="form-row">
                 <label>{t("resources.driveCount")}</label>
