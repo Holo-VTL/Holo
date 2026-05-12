@@ -169,6 +169,38 @@ test_explicit_no_login_public_bind_stays_quiet() {
   assert_contains "${out}" "[dry-run][env] HOLO_HTTP_ADDR=0.0.0.0:80"
 }
 
+test_firewalld_plan() {
+  local bundle="${TMP_ROOT}/bundle-firewalld"
+  local osr="${TMP_ROOT}/firewalld.os-release"
+  local fakebin="${TMP_ROOT}/firewalld-bin"
+  make_bundle "${bundle}"
+  make_os_release "${osr}" rocky 9.4
+  mkdir -p "${fakebin}"
+  printf '#!/bin/sh\nexit 0\n' >"${fakebin}/firewall-cmd"
+  chmod +x "${fakebin}/firewall-cmd"
+  local out
+  out="$(PATH="${fakebin}:${PATH}" run_dry "${osr}" "${bundle}")"
+  assert_contains "${out}" "Firewall: auto-open 80/tcp and 3260/tcp when firewall-cmd or ufw is available"
+  assert_contains "${out}" "[dry-run] firewall-cmd --permanent --add-port=80/tcp"
+  assert_contains "${out}" "[dry-run] firewall-cmd --permanent --add-port=3260/tcp"
+  assert_contains "${out}" "[dry-run] firewall-cmd --reload"
+  assert_contains "${out}" "[dry-run][summary] firewall=firewalld planned: 80/tcp 3260/tcp"
+}
+
+test_no_firewall_plan() {
+  local bundle="${TMP_ROOT}/bundle-no-firewall"
+  local osr="${TMP_ROOT}/no-firewall.os-release"
+  make_bundle "${bundle}"
+  make_os_release "${osr}" ubuntu 22.04
+  local out
+  out="$(run_dry "${osr}" "${bundle}" --no-firewall)"
+  assert_contains "${out}" "Firewall: skipped by --no-firewall"
+  assert_contains "${out}" "Skipping firewall configuration (--no-firewall)"
+  assert_contains "${out}" "[dry-run][summary] firewall=skipped (--no-firewall)"
+  assert_not_contains "${out}" "firewall-cmd --permanent --add-port"
+  assert_not_contains "${out}" "ufw allow"
+}
+
 test_upgrade_plan() {
   local bundle="${TMP_ROOT}/bundle-upgrade"
   local osr="${TMP_ROOT}/upgrade.os-release"
@@ -435,6 +467,10 @@ echo "[test] api key file"
 test_api_key_file_plan
 echo "[test] explicit no-login public bind stays quiet"
 test_explicit_no_login_public_bind_stays_quiet
+echo "[test] firewalld dry-run plan"
+test_firewalld_plan
+echo "[test] no-firewall dry-run plan"
+test_no_firewall_plan
 echo "[test] rocky dry-run plan"
 test_rocky_plan
 echo "[test] rocky bundled tcmu dry-run plan"

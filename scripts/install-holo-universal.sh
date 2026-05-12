@@ -8,6 +8,7 @@ DRY_RUN=0
 WITH_VALIDATION_TOOLS=0
 BUILD_TCMU_PLUGIN=0
 PURGE_DATA=0
+CONFIGURE_FIREWALL=1
 BUNDLE_DIR="${SCRIPT_DIR}"
 DEPS_DIR="${HOLO_INSTALL_DEPS_DIR:-}"
 PREFIX="/opt/holo"
@@ -39,6 +40,7 @@ VALIDATION_PACKAGES=()
 BUILD_PACKAGES=()
 REPO_ACTIONS=()
 WARNINGS=()
+FIREWALL_STATUS="pending"
 
 usage() {
   cat <<'USAGE'
@@ -71,6 +73,7 @@ Options:
   --api-key-file PATH       Read API key from a local file to avoid exposing it in process args
   --portal-host HOST        iSCSI portal host (default: auto-detect)
   --portal-port PORT        iSCSI portal port (default: 3260)
+  --no-firewall             Do not open firewall ports automatically
   --with-validation-tools   Install jq/lsscsi/sg3-utils etc.
   --build-tcmu-plugin       Build handler_holo.so on host
   --plugin-source-dir PATH  tcmu-runner source for --build-tcmu-plugin
@@ -193,6 +196,7 @@ parse_args() {
                                PORTAL_HOST="$2"; shift 2 ;;
       --portal-port)           [[ $# -ge 2 ]] || die_usage "--portal-port requires a port"
                                PORTAL_PORT="$2"; shift 2 ;;
+      --no-firewall)           CONFIGURE_FIREWALL=0; shift ;;
       --with-validation-tools) WITH_VALIDATION_TOOLS=1; shift ;;
       --build-tcmu-plugin)     BUILD_TCMU_PLUGIN=1; shift ;;
       --plugin-source-dir)     [[ $# -ge 2 ]] || die_usage "--plugin-source-dir requires a path"
@@ -637,6 +641,11 @@ print_plan() {
   fi
   log "Runtime invariant: HOLO_TARGET_RUNTIME_MODE=tcmu"
   log "Runtime invariant: HOLO_STRICT_STORAGE_FLOW=1"
+  if [[ "${CONFIGURE_FIREWALL}" == "1" ]]; then
+    log "Firewall: auto-open ${CONTROL_PLANE_PORT}/tcp and ${PORTAL_PORT}/tcp when firewall-cmd or ufw is available"
+  else
+    log "Firewall: skipped by --no-firewall"
+  fi
 }
 
 print_uninstall_plan() {
@@ -1555,6 +1564,69 @@ EOF
   rm -f "${tcmu_tmp}" "${sysctl_tmp}"
 }
 
+# ── Firewall ────────────────────────────────────────────────────────
+
+firewall_ports() {
+  printf '%s/tcp\n' "${CONTROL_PLANE_PORT}"
+  if [[ "${PORTAL_PORT}" != "${CONTROL_PLANE_PORT}" ]]; then
+    printf '%s/tcp\n' "${PORTAL_PORT}"
+  fi
+}
+
+configure_firewall() {
+  if [[ "${CONFIGURE_FIREWALL}" != "1" ]]; then
+    log "Skipping firewall configuration (--no-firewall)"
+    FIREWALL_STATUS="skipped (--no-firewall)"
+    return 0
+  fi
+
+  log "Configuring firewall access"
+  local ports=() port
+  local saw_firewall_cmd=0
+  while IFS= read -r port; do
+    ports+=("${port}")
+  done < <(firewall_ports)
+
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    saw_firewall_cmd=1
+    if [[ "${DRY_RUN}" == "1" ]]; then
+      for port in "${ports[@]}"; do
+        run_cmd firewall-cmd --permanent "--add-port=${port}"
+      done
+      run_cmd firewall-cmd --reload
+      FIREWALL_STATUS="firewalld planned: ${ports[*]}"
+      return 0
+    fi
+
+    if firewall-cmd --state >/dev/null 2>&1; then
+      for port in "${ports[@]}"; do
+        run_cmd firewall-cmd --permanent "--add-port=${port}"
+      done
+      run_cmd firewall-cmd --reload
+      FIREWALL_STATUS="firewalld opened: ${ports[*]}"
+      return 0
+    fi
+
+    warn "firewall-cmd found but firewalld is not running; ensure TCP ports ${CONTROL_PLANE_PORT} and ${PORTAL_PORT} are reachable if another firewall is active"
+    FIREWALL_STATUS="firewalld not running; manual check required"
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    for port in "${ports[@]}"; do
+      run_cmd ufw allow "${port}"
+    done
+    FIREWALL_STATUS="ufw opened: ${ports[*]}"
+    return 0
+  fi
+
+  if [[ "${saw_firewall_cmd}" == "1" ]]; then
+    return 0
+  fi
+
+  warn "No supported firewall tool detected; ensure TCP ports ${CONTROL_PLANE_PORT} and ${PORTAL_PORT} are reachable from initiators and administrators"
+  FIREWALL_STATUS="manual check required: ${ports[*]}"
+}
+
 # ── Service management ──────────────────────────────────────────────
 
 start_services() {
@@ -1619,6 +1691,7 @@ data_dir=${DATA_DIR}
 portal=${PORTAL_HOST}:${PORTAL_PORT}
 runtime_mode=tcmu
 strict_storage_flow=1
+firewall=${FIREWALL_STATUS}
 web_ui=http://${PORTAL_HOST}/ui/
 EOF
 )
@@ -1752,6 +1825,7 @@ install_or_upgrade_holo() {
   write_runtime_config
   write_systemd_units
   write_performance_tuning
+  configure_firewall
   start_services
   verify_install
   write_summary
