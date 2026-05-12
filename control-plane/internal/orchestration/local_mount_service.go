@@ -33,14 +33,18 @@ type iscsiNode struct {
 }
 
 type LocalMountService struct {
-	settings LocalMountSettingsRepository
-	targets  TargetRuntimeRepository
-	runner   commandRunner
-	auditW   audit.Writer
-	cfg      TargetRuntimeConfig
-	syncMu   sync.Mutex
-	lastMu   sync.RWMutex
-	last     LocalMountStatus
+	settings   LocalMountSettingsRepository
+	targets    TargetRuntimeRepository
+	runner     commandRunner
+	auditW     audit.Writer
+	cfg        TargetRuntimeConfig
+	syncMu     sync.Mutex
+	lastMu     sync.RWMutex
+	last       LocalMountStatus
+	asyncMu    sync.Mutex
+	asyncRun   bool
+	asyncNext  bool
+	asyncActor string
 }
 
 func NewLocalMountService(settings LocalMountSettingsRepository, targets TargetRuntimeRepository, auditW audit.Writer, cfg TargetRuntimeConfig) *LocalMountService {
@@ -65,9 +69,7 @@ func (s *LocalMountService) Status(ctx context.Context) (LocalMountStatus, error
 	if err != nil {
 		return LocalMountStatus{}, err
 	}
-	s.lastMu.RLock()
-	status := s.last
-	s.lastMu.RUnlock()
+	status := s.getLast()
 	status.Enabled = enabled
 	status.DesiredIQNs = nodeIQNs(desiredNodes(s.targets.ListPublications(ctx), s.cfg))
 	return status, nil
@@ -104,6 +106,7 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 		s.setLast(status)
 		return status, nil
 	}
+	previous := s.getLast()
 
 	var syncErr error
 	if enabled {
@@ -135,11 +138,15 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 	status.MountedIQNs = mounted
 	if syncErr != nil {
 		status.LastError = syncErr.Error()
-		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_sync", "local", "failure", map[string]any{"error": syncErr.Error(), "enabled": enabled})
+		if localMountStatusChanged(previous, status) {
+			audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_sync", "local", "failure", map[string]any{"error": syncErr.Error(), "enabled": enabled})
+		}
 		s.setLast(status)
 		return status, syncErr
 	}
-	audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_sync", "local", "success", map[string]any{"enabled": enabled, "desired": len(status.DesiredIQNs), "mounted": len(status.MountedIQNs)})
+	if localMountStatusChanged(previous, status) {
+		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_sync", "local", "success", map[string]any{"enabled": enabled, "desired": len(status.DesiredIQNs), "mounted": len(status.MountedIQNs)})
+	}
 	s.setLast(status)
 	return status, nil
 }
@@ -148,9 +155,39 @@ func (s *LocalMountService) SyncAsync(actor string) {
 	if s == nil {
 		return
 	}
-	go func() {
+	s.asyncMu.Lock()
+	if s.asyncRun {
+		s.asyncNext = true
+		s.asyncActor = actor
+		s.asyncMu.Unlock()
+		return
+	}
+	s.asyncRun = true
+	s.asyncActor = actor
+	s.asyncMu.Unlock()
+	go s.runAsyncSync(actor)
+}
+
+func (s *LocalMountService) runAsyncSync(actor string) {
+	for {
 		_, _ = s.Sync(context.Background(), actor)
-	}()
+
+		s.asyncMu.Lock()
+		if !s.asyncNext {
+			s.asyncRun = false
+			s.asyncMu.Unlock()
+			return
+		}
+		actor = s.asyncActor
+		s.asyncNext = false
+		s.asyncMu.Unlock()
+	}
+}
+
+func (s *LocalMountService) getLast() LocalMountStatus {
+	s.lastMu.RLock()
+	defer s.lastMu.RUnlock()
+	return s.last
 }
 
 func (s *LocalMountService) setLast(status LocalMountStatus) {
@@ -257,6 +294,29 @@ func nodeIQNs(nodes []iscsiNode) []string {
 	}
 	sort.Strings(iqns)
 	return iqns
+}
+
+func localMountStatusChanged(previous, current LocalMountStatus) bool {
+	return previous.Enabled != current.Enabled ||
+		previous.LastError != current.LastError ||
+		!sameStringSet(previous.DesiredIQNs, current.DesiredIQNs) ||
+		!sameStringSet(previous.MountedIQNs, current.MountedIQNs)
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftCopy := append([]string(nil), left...)
+	rightCopy := append([]string(nil), right...)
+	sort.Strings(leftCopy)
+	sort.Strings(rightCopy)
+	for i := range leftCopy {
+		if leftCopy[i] != rightCopy[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func parseISCSIADMNodes(raw string) []iscsiNode {

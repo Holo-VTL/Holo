@@ -1203,6 +1203,8 @@ iscsiadm_bin() {
 }
 
 valid_iqn() {
+  # The post-colon IQN opaque component may itself contain ":"; keep the helper
+  # regex aligned with the IQNs Holo mints and validates in the control plane.
   [[ "$1" =~ ^iqn\.[0-9]{4}-[0-9]{2}\.[A-Za-z0-9.-]+:[A-Za-z0-9._:-]+$ ]]
 }
 
@@ -1255,6 +1257,8 @@ EOF
   if [[ "${DRY_RUN}" == "1" ]]; then
     sed 's/^/[dry-run][iscsi-helper] /' "${helper_tmp}"
   else
+    # Root-only execute is intentional: the holo service reaches this helper
+    # exclusively through the narrow sudoers entry below.
     install -m 0750 -o root -g root "${helper_tmp}" "${helper_path}"
   fi
   rm -f "${helper_tmp}"
