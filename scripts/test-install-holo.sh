@@ -205,6 +205,21 @@ test_no_firewall_plan() {
   assert_not_contains "${out}" "ufw allow"
 }
 
+test_no_supported_firewall_tool_is_informational() {
+  local bundle="${TMP_ROOT}/bundle-no-firewall-tool"
+  local osr="${TMP_ROOT}/no-firewall-tool.os-release"
+  local fakebin="${TMP_ROOT}/no-firewall-tool-bin"
+  make_bundle "${bundle}"
+  make_os_release "${osr}" ubuntu 22.04
+  mkdir -p "${fakebin}"
+  local out
+  out="$(PATH="${fakebin}:/usr/bin:/bin" run_dry "${osr}" "${bundle}")"
+  assert_contains "${out}" "No supported firewall tool detected; leaving firewall unchanged"
+  assert_contains "${out}" "[dry-run][summary] firewall=not configured (no supported firewall tool): 80/tcp 3260/tcp"
+  assert_not_contains "${out}" "[holo-install][warn] No supported firewall tool detected"
+  assert_not_contains "${out}" "[holo-install] warnings:"
+}
+
 test_upgrade_plan() {
   local bundle="${TMP_ROOT}/bundle-upgrade"
   local osr="${TMP_ROOT}/upgrade.os-release"
@@ -475,6 +490,8 @@ echo "[test] firewalld dry-run plan"
 test_firewalld_plan
 echo "[test] no-firewall dry-run plan"
 test_no_firewall_plan
+echo "[test] no-supported-firewall-tool dry-run plan"
+test_no_supported_firewall_tool_is_informational
 echo "[test] rocky dry-run plan"
 test_rocky_plan
 echo "[test] rocky bundled tcmu dry-run plan"

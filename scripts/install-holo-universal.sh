@@ -1712,8 +1712,8 @@ configure_firewall() {
     return 0
   fi
 
-  warn "No supported firewall tool detected; ensure TCP ports ${CONTROL_PLANE_PORT} and ${PORTAL_PORT} are reachable from initiators and administrators"
-  FIREWALL_STATUS="manual check required: ${ports[*]}"
+  log "No supported firewall tool detected; leaving firewall unchanged"
+  FIREWALL_STATUS="not configured (no supported firewall tool): ${ports[*]}"
 }
 
 # ── Service management ──────────────────────────────────────────────
