@@ -64,6 +64,11 @@ type TargetRuntimeRepository interface {
 	ListValidationRuns(ctx context.Context, publicationID string) []*domain.ValidationRun
 }
 
+type LocalMountSynchronizer interface {
+	Sync(ctx context.Context, actor string) (LocalMountStatus, error)
+	SyncAsync(actor string)
+}
+
 // DefaultTargetRuntimeConfig returns config driven by environment variables:
 // - HOLO_RUNTIME_MODE: "in-memory", "lio-shell", or "tcmu"
 // - HOLO_PORTAL_HOST: IP address for targets to bind (default 0.0.0.0)
@@ -403,6 +408,7 @@ type TargetRuntimeService struct {
 	metrics     *metrics.MetricsRegistry
 	storageWg   StorageWriteGuard
 	poolReader  StoragePoolReader
+	localMount  LocalMountSynchronizer
 }
 
 func NewTargetRuntimeService(coreRepo CoreResourceReader, runtimeRepo TargetRuntimeRepository, auditW audit.Writer, m *metrics.MetricsRegistry) *TargetRuntimeService {
@@ -453,6 +459,10 @@ func (s *TargetRuntimeService) SetStorageWriteGuard(guard StorageWriteGuard) {
 
 func (s *TargetRuntimeService) SetStoragePoolReader(reader StoragePoolReader) {
 	s.poolReader = reader
+}
+
+func (s *TargetRuntimeService) SetLocalMountSynchronizer(syncer LocalMountSynchronizer) {
+	s.localMount = syncer
 }
 
 func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) (*domain.TargetPublication, error) {
@@ -545,6 +555,7 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 	if s.metrics != nil {
 		s.metrics.RecordPublicationPublish()
 	}
+	s.syncLocalMount(ctx, req.Actor)
 
 	return publication, nil
 }
@@ -574,6 +585,7 @@ func (s *TargetRuntimeService) Unpublish(ctx context.Context, publicationID, act
 	if s.metrics != nil {
 		s.metrics.RecordPublicationUnpublish()
 	}
+	s.syncLocalMount(ctx, actor)
 
 	return publication, nil
 }
@@ -633,6 +645,7 @@ func (s *TargetRuntimeService) RestoreReadyPublications(ctx context.Context) err
 		}
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, "system", "restore", publication.PublicationID, "success", map[string]any{"targetIqn": publication.TargetIQN, "portal": portal, "runtimeMode": s.cfg.Mode})
 	}
+	s.syncLocalMount(ctx, "system")
 	return firstErr
 }
 
@@ -751,6 +764,13 @@ func (s *TargetRuntimeService) StartValidationRunWithRequest(ctx context.Context
 
 func (s *TargetRuntimeService) ListPublications(ctx context.Context) []*domain.TargetPublication {
 	return s.runtimeRepo.ListPublications(ctx)
+}
+
+func (s *TargetRuntimeService) syncLocalMount(ctx context.Context, actor string) {
+	if s.localMount == nil {
+		return
+	}
+	s.localMount.SyncAsync(actor)
 }
 
 func (s *TargetRuntimeService) GetPublication(ctx context.Context, publicationID string) (*domain.TargetPublication, error) {

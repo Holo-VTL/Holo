@@ -290,6 +290,18 @@ body {
   font-weight: 850;
 }
 
+.targets-page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.local-mount-toggle {
+  margin-top: 0;
+  white-space: nowrap;
+}
+
 .panel {
   background: var(--bg-panel);
   border: 1px solid rgba(255, 255, 255, 0.74);

@@ -309,6 +309,7 @@
     "deviceProfile": "设备型号",
     "actor": "操作人",
     "portal": "Portal",
+    "mountLocally": "本地挂载",
     "unpublish": "下线",
     "rollback": "回滚",
     "validationRuns": "验证任务",

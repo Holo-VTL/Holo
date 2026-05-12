@@ -10,6 +10,8 @@ vi.mock("../services/api", () => ({
         { publicationId: "pub-a", targetIqn: "iqn.a", deviceRole: "drive", portal: "10.0.0.1:3260", state: "ready" },
         { publicationId: "pub-b", targetIqn: "iqn.b", deviceRole: "changer", portal: "10.0.0.1:3260", state: "disabled" },
       ]),
+      localMountStatus: vi.fn().mockResolvedValue({ enabled: false, desiredIqns: [], mountedIqns: [] }),
+      setLocalMount: vi.fn(),
       createPublication: vi.fn(),
       unpublish: vi.fn(),
       rollback: vi.fn(),

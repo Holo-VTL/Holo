@@ -77,13 +77,14 @@ test_ubuntu_plan() {
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Action: install"
   assert_contains "${out}" "Detected platform: ubuntu 22.04 x86_64 (apt)"
-  assert_contains "${out}" "Runtime packages: kmod sudo targetcli-fb tcmu-runner xfsprogs"
+  assert_contains "${out}" "Runtime packages: kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi"
   assert_contains "${out}" "Runtime invariant: HOLO_STRICT_STORAGE_FLOW=1"
   assert_contains "${out}" "[dry-run][env] HOLO_HTTP_ADDR=0.0.0.0:80"
   assert_contains "${out}" "[dry-run][env] HOLO_API_KEY="
   assert_contains "${out}" "[dry-run][env] HOLO_TRUSTED_PROXY_CIDRS="
   assert_contains "${out}" "[dry-run][env] HOLO_TARGET_RUNTIME_MODE=tcmu"
   assert_contains "${out}" "[dry-run][env] HOLO_TARGETCLI_PRIVILEGED_HELPER=/opt/holo/bin/holo-targetcli-helper"
+  assert_contains "${out}" "[dry-run][env] HOLO_ISCSI_PRIVILEGED_HELPER=/opt/holo/bin/holo-iscsi-helper"
   assert_contains "${out}" "[dry-run][env] HOLO_STORAGE_PRIVILEGED_HELPER=/opt/holo/bin/holo-storage-helper"
   assert_contains "${out}" "[dry-run][env] HOLO_STRICT_STORAGE_FLOW=1"
   assert_contains "${out}" "[dry-run][env] HOLO_TCMU_SOCKET_BUF_BYTES=67108864"
@@ -105,6 +106,8 @@ test_ubuntu_plan() {
   assert_not_contains "${out}" "[dry-run][unit] LockPersonality=yes"
   assert_contains "${out}" "[dry-run][helper] STORAGE_POOL_ROOT_BASE=\"/var/lib/holo/storage-pools\""
   assert_contains "${out}" "[dry-run][targetcli-helper] valid_iqn()"
+  assert_contains "${out}" "[dry-run][iscsi-helper]   ensure-node)"
+  assert_contains "${out}" "[dry-run][iscsi-helper]   login)"
   assert_contains "${out}" "[dry-run][support-helper]   export TARGETCLI_HOME=\"\${home}\""
   assert_contains "${out}" "[dry-run][support-helper]   find-config)"
   assert_contains "${out}" "[dry-run][support-helper]   sg-map-i)"
@@ -112,6 +115,7 @@ test_ubuntu_plan() {
   assert_contains "${out}" "[dry-run][sudoers] Defaults:holo !pam_session"
   assert_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /opt/holo/bin/holo-storage-helper"
   assert_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /opt/holo/bin/holo-targetcli-helper"
+  assert_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /opt/holo/bin/holo-iscsi-helper"
   assert_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /opt/holo/bin/holo-support-helper"
   assert_not_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /usr/bin/targetcli"
   assert_not_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /usr/bin/mount"
@@ -125,7 +129,7 @@ test_ubuntu_plan() {
   make_os_release "${osr}" ubuntu 25.04
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Detected platform: ubuntu 25.04 x86_64 (apt)"
-  assert_contains "${out}" "Runtime packages: kmod sudo targetcli-fb tcmu-runner xfsprogs"
+  assert_contains "${out}" "Runtime packages: kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi"
 }
 
 test_authenticated_public_bind_plan() {
@@ -265,7 +269,7 @@ test_rocky_plan() {
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Detected platform: rocky 9.4 x86_64 (dnf)"
   assert_not_contains "${out}" "centos-release-gluster9"
-  assert_contains "${out}" "Runtime packages: kmod sudo targetcli tcmu-runner xfsprogs"
+  assert_contains "${out}" "Runtime packages: kmod sudo targetcli tcmu-runner xfsprogs iscsi-initiator-utils"
   assert_contains "${out}" "TCMU plugin dir: /usr/lib64/tcmu-runner"
 }
 
@@ -280,7 +284,7 @@ test_rocky_bundled_tcmu_plan() {
   local out
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Bundled dependency dir: ${bundle}/packages"
-  assert_contains "${out}" "Runtime packages: kmod sudo targetcli xfsprogs"
+  assert_contains "${out}" "Runtime packages: kmod sudo targetcli xfsprogs iscsi-initiator-utils"
   assert_contains "${out}" "dnf install -y ${bundle}/packages/dnf/el9/libtcmu-1.5.4-0.el9.x86_64.rpm ${bundle}/packages/dnf/el9/tcmu-runner-1.5.4-0.el9.x86_64.rpm"
   assert_not_contains "${out}" "centos-release-gluster9"
 }
@@ -314,7 +318,7 @@ test_rhel_bundled_tcmu_plan() {
   local out
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Detected platform: rhel 9.7 x86_64 (dnf)"
-  assert_contains "${out}" "Runtime packages: kmod sudo targetcli xfsprogs"
+  assert_contains "${out}" "Runtime packages: kmod sudo targetcli xfsprogs iscsi-initiator-utils"
   assert_contains "${out}" "[dry-run] bash -c timeout\\ 30s\\ subscription-manager\\ repos\\ --enable\\ rhel-9-for-\\$\\(uname\\ -m\\)-baseos-rpms\\ --enable\\ rhel-9-for-\\$\\(uname\\ -m\\)-appstream-rpms\\ --enable\\ codeready-builder-for-rhel-9-\\$\\(uname\\ -m\\)-rpms\\ \\|\\|\\ true"
   assert_contains "${out}" "dnf install -y ${bundle}/packages/dnf/el9/libtcmu-1.5.4-0.el9.x86_64.rpm ${bundle}/packages/dnf/el9/tcmu-runner-1.5.4-0.el9.x86_64.rpm"
 }
@@ -327,8 +331,8 @@ test_sles_plan() {
   local out
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Detected platform: sles 15.6 x86_64 (zypper)"
-  assert_contains "${out}" "Runtime packages: kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner"
-  assert_contains "${out}" "[dry-run] zypper -n install kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner"
+  assert_contains "${out}" "Runtime packages: kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi"
+  assert_contains "${out}" "[dry-run] zypper -n install kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi"
   assert_contains "${out}" "[dry-run][verify-command] targetcli (package: python3-targetcli-fb)"
 }
 
@@ -340,8 +344,8 @@ test_opensuse_leap_plan() {
   local out
   out="$(run_dry "${osr}" "${bundle}")"
   assert_contains "${out}" "Detected platform: opensuse-leap 15.6 x86_64 (zypper)"
-  assert_contains "${out}" "Runtime packages: kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner"
-  assert_contains "${out}" "[dry-run] zypper -n install kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner"
+  assert_contains "${out}" "Runtime packages: kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi"
+  assert_contains "${out}" "[dry-run] zypper -n install kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi"
   assert_contains "${out}" "[dry-run][verify-command] targetcli (package: python3-targetcli-fb)"
 }
 

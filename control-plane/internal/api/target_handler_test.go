@@ -183,3 +183,35 @@ func TestTargetPublicationListReturnsLatestPerIQNByDefault(t *testing.T) {
 		t.Fatalf("expected full history payload, got %d body=%s", len(historyPayload), historyResp.Body.String())
 	}
 }
+
+func TestTargetLocalMountEndpointsPersistToggle(t *testing.T) {
+	srv := newTestServer(t)
+
+	getReq := newAuthedRequest(http.MethodGet, "/v1/targets/local-mount", nil)
+	getResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getResp, getReq)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("expected local mount status 200, got %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	var initial map[string]any
+	if err := json.Unmarshal(getResp.Body.Bytes(), &initial); err != nil {
+		t.Fatalf("unmarshal initial status: %v", err)
+	}
+	if enabled, _ := initial["enabled"].(bool); enabled {
+		t.Fatalf("expected local mount disabled by default: %s", getResp.Body.String())
+	}
+
+	postReq := newAuthedRequest(http.MethodPost, "/v1/targets/local-mount", bytes.NewBufferString(`{"enabled":true,"actor":"tester"}`))
+	postResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(postResp, postReq)
+	if postResp.Code != http.StatusOK {
+		t.Fatalf("expected local mount enable 200, got %d body=%s", postResp.Code, postResp.Body.String())
+	}
+	var enabledPayload map[string]any
+	if err := json.Unmarshal(postResp.Body.Bytes(), &enabledPayload); err != nil {
+		t.Fatalf("unmarshal enabled status: %v", err)
+	}
+	if enabled, _ := enabledPayload["enabled"].(bool); !enabled {
+		t.Fatalf("expected local mount enabled: %s", postResp.Body.String())
+	}
+}

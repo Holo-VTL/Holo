@@ -512,7 +512,7 @@ build_package_plan() {
   case "${PKG_MANAGER}" in
     apt)
       REPO_ACTIONS=("apt-get update")
-      RUNTIME_PACKAGES=(kmod sudo targetcli-fb tcmu-runner xfsprogs)
+      RUNTIME_PACKAGES=(kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi)
       VALIDATION_PACKAGES=(curl jq lsscsi sg3-utils open-iscsi)
       BUILD_PACKAGES=(gcc make pkg-config dpkg-dev libtcmu-dev)
       ;;
@@ -538,7 +538,7 @@ build_package_plan() {
             REPO_ACTIONS=()
             ;;
         esac
-        RUNTIME_PACKAGES=(kmod sudo targetcli xfsprogs)
+        RUNTIME_PACKAGES=(kmod sudo targetcli xfsprogs iscsi-initiator-utils)
       else
         case "${OS_ID}:${OS_MAJOR}" in
           rhel:8)
@@ -583,7 +583,7 @@ build_package_plan() {
             )
             ;;
         esac
-        RUNTIME_PACKAGES=(kmod sudo targetcli tcmu-runner xfsprogs)
+        RUNTIME_PACKAGES=(kmod sudo targetcli tcmu-runner xfsprogs iscsi-initiator-utils)
       fi
       if [[ "${OS_MAJOR}" == "10" ]]; then
         RUNTIME_PACKAGES=(kmod sudo "kernel-modules-$(uname -r)" "${RUNTIME_PACKAGES[@]:2}")
@@ -593,7 +593,7 @@ build_package_plan() {
       ;;
     zypper)
       REPO_ACTIONS=()
-      RUNTIME_PACKAGES=(kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner)
+      RUNTIME_PACKAGES=(kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi)
       VALIDATION_PACKAGES=(curl jq lsscsi sg3_utils open-iscsi)
       BUILD_PACKAGES=(gcc make pkg-config)
       ;;
@@ -1186,6 +1186,93 @@ EOF
   rm -f "${helper_tmp}"
 }
 
+write_iscsi_helper() {
+  log "Writing iSCSI initiator privilege helper"
+  local helper_tmp helper_path
+  helper_tmp="$(mktemp)"
+  helper_path="${PREFIX}/bin/holo-iscsi-helper"
+  cat >"${helper_tmp}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+  printf 'holo-iscsi-helper: %s\n' "$*" >&2
+  exit 64
+}
+
+iscsiadm_bin() {
+  local candidate
+  for candidate in /usr/bin/iscsiadm /usr/sbin/iscsiadm /sbin/iscsiadm; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  die "iscsiadm not found"
+}
+
+valid_iqn() {
+  # The post-colon IQN opaque component may itself contain ":"; keep the helper
+  # regex aligned with the IQNs Holo mints and validates in the control plane.
+  [[ "$1" =~ ^iqn\.[0-9]{4}-[0-9]{2}\.[A-Za-z0-9.-]+:[A-Za-z0-9._:-]+$ ]]
+}
+
+valid_portal() {
+  local value="$1" port
+  [[ "${value}" =~ ^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):([0-9]{1,5})$ ]] || return 1
+  port="${BASH_REMATCH[2]}"
+  (( port > 0 && port <= 65535 ))
+}
+
+[[ $# -ge 1 ]] || die "missing subcommand"
+sub="$1"
+shift
+bin="$(iscsiadm_bin)"
+
+case "${sub}" in
+  ensure-node)
+    [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "ensure-node requires <iqn> <portal>"
+    exec "${bin}" -m node -T "$1" -p "$2" -o new
+    ;;
+  set-startup)
+    [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "set-startup requires <iqn> <portal>"
+    exec "${bin}" -m node -T "$1" -p "$2" --op update -n node.startup -v automatic
+    ;;
+  login)
+    [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "login requires <iqn> <portal>"
+    exec "${bin}" -m node -T "$1" -p "$2" --login
+    ;;
+  logout)
+    [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "logout requires <iqn> <portal>"
+    exec "${bin}" -m node -T "$1" -p "$2" --logout
+    ;;
+  delete)
+    [[ $# -eq 2 ]] && valid_iqn "$1" && valid_portal "$2" || die "delete requires <iqn> <portal>"
+    exec "${bin}" -m node -o delete -T "$1" -p "$2"
+    ;;
+  nodes)
+    [[ $# -eq 0 ]] || die "nodes takes no arguments"
+    exec "${bin}" -m node
+    ;;
+  sessions)
+    [[ $# -eq 0 ]] || die "sessions takes no arguments"
+    exec "${bin}" -m session
+    ;;
+  *)
+    die "unsupported iSCSI helper subcommand: ${sub}"
+    ;;
+esac
+EOF
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    sed 's/^/[dry-run][iscsi-helper] /' "${helper_tmp}"
+  else
+    # Root-only execute is intentional: the holo service reaches this helper
+    # exclusively through the narrow sudoers entry below.
+    install -m 0750 -o root -g root "${helper_tmp}" "${helper_path}"
+  fi
+  rm -f "${helper_tmp}"
+}
+
 write_support_helper() {
   log "Writing support bundle privilege helper"
   local helper_tmp helper_path
@@ -1443,6 +1530,7 @@ HOLO_TARGET_BACKSTORE_DIR=${DATA_DIR}/targets
 HOLO_TARGET_BACKSTORE_SIZE_MB=128
 HOLO_TARGET_RUNTIME_USE_SUDO=true
 HOLO_TARGETCLI_PRIVILEGED_HELPER=${PREFIX}/bin/holo-targetcli-helper
+HOLO_ISCSI_PRIVILEGED_HELPER=${PREFIX}/bin/holo-iscsi-helper
 HOLO_STORAGE_PRIVILEGED_HELPER=${PREFIX}/bin/holo-storage-helper
 HOLO_SUPPORT_PRIVILEGED_HELPER=${PREFIX}/bin/holo-support-helper
 HOLO_STORAGE_POOL_ROOT_BASE=${DATA_DIR}/storage-pools
@@ -1512,6 +1600,7 @@ Defaults:${SERVICE_USER} !requiretty
 Defaults:${SERVICE_USER} !pam_session
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-storage-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-targetcli-helper
+${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-iscsi-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-support-helper
 EOF
 
@@ -1631,6 +1720,7 @@ configure_firewall() {
 
 start_services() {
   log "Enabling and starting services"
+  run_shell "systemctl enable --now iscsid 2>/dev/null || systemctl enable --now open-iscsi 2>/dev/null || true"
   run_cmd systemctl enable --now tcmu-runner
   run_cmd systemctl restart tcmu-runner
   run_cmd systemctl enable --now holo-control-plane
@@ -1821,6 +1911,7 @@ install_or_upgrade_holo() {
   install_artifacts
   write_storage_helper
   write_targetcli_helper
+  write_iscsi_helper
   write_support_helper
   write_runtime_config
   write_systemd_units
