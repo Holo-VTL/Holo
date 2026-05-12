@@ -6,6 +6,7 @@ import type {
   DiscoverableTarget,
   HealthSummary,
   InitiatorRule,
+  LocalMountStatus,
   StorageManagedDisk,
   StoragePoolCapacitySnapshot,
   StoragePoolRuntime,
@@ -323,6 +324,9 @@ export const api = {
   },
   targets: {
     listPublications: () => request<TargetPublication[]>("/v1/targets/publications"),
+    localMountStatus: () => request<LocalMountStatus>("/v1/targets/local-mount"),
+    setLocalMount: (enabled: boolean, actor = "web-console") =>
+      request<LocalMountStatus>("/v1/targets/local-mount", { method: "POST", body: { enabled, actor } }),
     createPublication: (body: {
       libraryId: string;
       driveId: string;

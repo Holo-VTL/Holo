@@ -107,6 +107,14 @@ export interface TargetPublication {
   updatedAt: string;
 }
 
+export interface LocalMountStatus {
+  enabled: boolean;
+  desiredIqns: string[];
+  mountedIqns: string[];
+  lastSyncAt?: string;
+  lastError?: string;
+}
+
 export interface ValidationRun {
   validationId: string;
   publicationId: string;

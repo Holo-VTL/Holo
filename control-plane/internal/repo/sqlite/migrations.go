@@ -171,6 +171,16 @@ CREATE TABLE IF NOT EXISTS destroyed_cartridge_barcodes (
 );
 `,
 	},
+	{
+		version: 5,
+		sql: `
+CREATE TABLE IF NOT EXISTS local_mount_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+`,
+	},
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {

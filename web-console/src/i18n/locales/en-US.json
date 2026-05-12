@@ -309,6 +309,7 @@
     "deviceProfile": "Device Profile",
     "actor": "Actor",
     "portal": "Portal",
+    "mountLocally": "Mount Locally",
     "unpublish": "Unpublish",
     "rollback": "Rollback",
     "validationRuns": "Validation Runs",

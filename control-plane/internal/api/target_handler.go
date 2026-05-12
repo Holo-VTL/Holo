@@ -11,12 +11,17 @@ import (
 )
 
 type TargetHandler struct {
-	service *orchestration.TargetRuntimeService
-	access  *TargetAccessHandler
+	service    *orchestration.TargetRuntimeService
+	access     *TargetAccessHandler
+	localMount *orchestration.LocalMountService
 }
 
 func NewTargetHandler(service *orchestration.TargetRuntimeService, access *TargetAccessHandler) *TargetHandler {
 	return &TargetHandler{service: service, access: access}
+}
+
+func NewTargetHandlerWithLocalMount(service *orchestration.TargetRuntimeService, access *TargetAccessHandler, localMount *orchestration.LocalMountService) *TargetHandler {
+	return &TargetHandler{service: service, access: access, localMount: localMount}
 }
 
 type publishTargetRequest struct {
@@ -35,6 +40,41 @@ type validationRunRequest struct {
 	Mode    domain.ValidationMode `json:"mode"`
 	Bytes   int64                 `json:"bytes,omitempty"`
 	Pattern string                `json:"pattern,omitempty"`
+}
+
+type localMountRequest struct {
+	Enabled bool   `json:"enabled"`
+	Actor   string `json:"actor,omitempty"`
+}
+
+func (h *TargetHandler) handleLocalMount(w http.ResponseWriter, r *http.Request) {
+	if h.localMount == nil {
+		respondError(w, http.StatusNotFound, "not found", nil)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		status, err := h.localMount.Status(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "internal server error", err)
+			return
+		}
+		respondJSON(w, http.StatusOK, status)
+	case http.MethodPost:
+		var req localMountRequest
+		if err := decodeRequiredJSONBody(r, &req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body", err)
+			return
+		}
+		status, err := h.localMount.SetEnabled(r.Context(), req.Enabled, req.Actor)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "local mount sync failed", err)
+			return
+		}
+		respondJSON(w, http.StatusOK, status)
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+	}
 }
 
 func (h *TargetHandler) handlePublications(w http.ResponseWriter, r *http.Request) {

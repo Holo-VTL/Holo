@@ -66,6 +66,7 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 	coreRepo := sqliterepo.NewCoreResourcesRepo(metadataDB)
 	storageRepo := sqliterepo.NewStoragePoolRepo(metadataDB)
 	targetRepo := sqliterepo.NewTargetRuntimeRepo(metadataDB)
+	localMountRepo := sqliterepo.NewLocalMountRepo(metadataDB)
 	accessRepo := memory.NewTargetAccessRepo()
 	accessPolicyRepo := sqliterepo.NewAccessPolicyRepo(metadataDB)
 	retentionPolicyRepo := sqliterepo.NewRetentionPolicyRepo(metadataDB)
@@ -105,6 +106,13 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		BackstoreSizeMB: cfg.TargetBackstoreSize,
 		UseSudo:         cfg.TargetRuntimeUseSudo,
 	})
+	localMount := orchestration.NewLocalMountService(localMountRepo, targetRepo, auditWriter, orchestration.TargetRuntimeConfig{
+		Mode:       cfg.TargetRuntimeMode,
+		PortalHost: cfg.TargetPortalHost,
+		PortalPort: cfg.TargetPortalPort,
+		UseSudo:    cfg.TargetRuntimeUseSudo,
+	})
+	targetRuntime.SetLocalMountSynchronizer(localMount)
 	if strings.TrimSpace(strings.ToLower(cfg.TargetRuntimeMode)) != "in-memory" {
 		targetRuntime.SetStorageWriteGuard(storageSvc)
 	}
@@ -115,6 +123,9 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		}
 		if err := targetRuntime.RestoreReadyPublications(ctx); err != nil {
 			tracing.LogError(context.Background(), "target-runtime", "restore ready publications failed", err)
+		}
+		if _, err := localMount.Sync(ctx, "system"); err != nil {
+			tracing.LogError(context.Background(), "target-runtime", "restore local mounts failed", err)
 		}
 	}
 	targetAccess := orchestration.NewTargetAccessService(targetRepo, accessRepo, evaluator, auditWriter)
@@ -145,7 +156,7 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		ops:        NewOpsHandler(health, query, cfg.TargetPortalPort, registry),
 		access:     accessHandler,
 		discovery:  discoveryHandler,
-		targets:    NewTargetHandler(targetRuntime, accessHandler),
+		targets:    NewTargetHandlerWithLocalMount(targetRuntime, accessHandler, localMount),
 		metricsHD:  NewMetricsHandler(registry, storageutil.ResolvePoolStorageBaseDir()),
 		auditHD:    NewAuditHandler(query, auditWriter),
 		runtime:    targetRuntime,
@@ -230,6 +241,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/retention-policies", s.policy.handleCreateRetentionPolicy)
 	s.mux.HandleFunc("/v1/targets/publications", s.targets.handlePublications)
 	s.mux.HandleFunc("/v1/targets/publications/", s.targets.handlePublicationSubresource)
+	s.mux.HandleFunc("/v1/targets/local-mount", s.targets.handleLocalMount)
 	s.mux.HandleFunc("/v1/targets/visible", s.access.handleVisible)
 	s.mux.HandleFunc("/v1/targets/discovery", s.discovery.handleDiscovery)
 	s.mux.HandleFunc("/v1/audit/events", s.ops.handleAuditEvents)
