@@ -34,6 +34,11 @@
 
 Holo is an open-source Virtual Tape Library that projects tape drives and changers over iSCSI. Backup software sees real hardware — no agent, no plugin.
 
+User guide:
+
+- [English: Holo VTL Launch Guide](https://blog.backupnext.cloud/en/2026/05/holo-vtl-launch/)
+- [简体中文：Holo VTL 使用指南](https://blog.backupnext.cloud/2026/05/holo-VTL-launch/)
+
 ---
 
 ## Why Holo?
@@ -46,6 +51,7 @@ Holo is an open-source Virtual Tape Library that projects tape drives and change
 | **safe**        | **Crash-Proof Storage** | Atomic writes (tmpfile → fsync → rename → dirsync) — no data loss on power failure                               |
 | **wide**        | **48 Drive Profiles**   | IBM LTO-1 through LTO-9, HP Ultrium, Quantum SuperLoader, Dell TL/ML, STK, Spectra, Overland                     |
 | **easy**        | **One-Click Install**   | Single shell script sets up everything — data-plane binary, control-plane API, web console                       |
+| **local**       | **Mount Locally**       | Let the Holo host log in to its own published VTL targets so Linux backup software can use it as a tape server   |
 | **open**        | **MIT Licensed**        | Fully open source. No vendor lock-in. No hidden telemetry.                                                       |
 
 
@@ -154,6 +160,7 @@ The installer handles everything: runtime dependencies, binary setup, systemd se
 | ---------------------------------- | --------------------------------------------------------- |
 | Linux kernel with LIO/TCMU modules | `target_core_mod`, `target_core_user`, `iscsi_target_mod` |
 | `targetcli`                        | LIO iSCSI configuration                                   |
+| `open-iscsi` / `iscsi-initiator-utils` | Optional local initiator support for Mount Locally     |
 | `tcmu-runner` 1.5+                 | User-space SCSI command processing                        |
 | `xfsprogs`                         | XFS filesystem tools                                      |
 | `kmod`, `sudo`                     | Kernel module loading, privilege escalation               |
@@ -168,7 +175,7 @@ The installer auto-installs runtime packages. The main precondition is that the 
 `targetcli-fb` and `tcmu-runner` are installed from the configured apt repositories.
 
 ```bash
-sudo apt update && sudo apt install targetcli-fb tcmu-runner xfsprogs
+sudo apt update && sudo apt install targetcli-fb tcmu-runner xfsprogs open-iscsi
 ```
 
 
@@ -214,7 +221,7 @@ The offline release package supplies `tcmu-runner` for EL 8/9/10. RHEL repositor
 **openSUSE Leap 15.6** — zypper runtime packages
 
 ```bash
-sudo zypper -n install kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner
+sudo zypper -n install kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi
 ```
 
 Holo requires the full kernel package with LIO/TCMU modules, not a minimal kernel that omits `target_core_user`.
@@ -240,6 +247,12 @@ Storage Management
 VTL Rack View
 
 ![VTL-Rack-view](screenshots/VTL-Rack-view.png)
+
+### Mount Locally
+
+On the **Targets** page, enable **Mount Locally** when you want the Holo appliance itself to log in to the VTL targets it publishes. This is useful for lab validation and for backup applications such as Veeam that can use the Holo Linux host directly as a tape server.
+
+When enabled, Holo creates local iSCSI node records only for the desired published Holo IQNs, sets them to automatic startup, logs in to the tape drive and medium changer targets, and cleans up stale local Holo nodes for the same portal. On Linux, the mounted devices appear as standard tape and changer devices such as `/dev/st0`, `/dev/st1`, and `/dev/sch0`.
 
 ---
 
