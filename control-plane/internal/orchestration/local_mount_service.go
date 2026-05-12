@@ -3,8 +3,11 @@ package orchestration
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
@@ -17,11 +20,11 @@ type LocalMountSettingsRepository interface {
 }
 
 type LocalMountStatus struct {
-	Enabled     bool      `json:"enabled"`
-	DesiredIQNs []string  `json:"desiredIqns"`
-	MountedIQNs []string  `json:"mountedIqns"`
-	LastSyncAt  time.Time `json:"lastSyncAt,omitempty"`
-	LastError   string    `json:"lastError,omitempty"`
+	Enabled     bool       `json:"enabled"`
+	DesiredIQNs []string   `json:"desiredIqns"`
+	MountedIQNs []string   `json:"mountedIqns"`
+	LastSyncAt  *time.Time `json:"lastSyncAt,omitempty"`
+	LastError   string     `json:"lastError,omitempty"`
 }
 
 type iscsiNode struct {
@@ -35,6 +38,8 @@ type LocalMountService struct {
 	runner   commandRunner
 	auditW   audit.Writer
 	cfg      TargetRuntimeConfig
+	syncMu   sync.Mutex
+	lastMu   sync.RWMutex
 	last     LocalMountStatus
 }
 
@@ -60,9 +65,11 @@ func (s *LocalMountService) Status(ctx context.Context) (LocalMountStatus, error
 	if err != nil {
 		return LocalMountStatus{}, err
 	}
+	s.lastMu.RLock()
 	status := s.last
+	s.lastMu.RUnlock()
 	status.Enabled = enabled
-	status.DesiredIQNs = desiredIQNs(s.targets.ListPublications(ctx))
+	status.DesiredIQNs = nodeIQNs(desiredNodes(s.targets.ListPublications(ctx), s.cfg))
 	return status, nil
 }
 
@@ -78,19 +85,23 @@ func (s *LocalMountService) SetEnabled(ctx context.Context, enabled bool, actor 
 }
 
 func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountStatus, error) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
 	enabled, err := s.settings.Enabled(ctx)
 	if err != nil {
 		return LocalMountStatus{}, err
 	}
 	publications := s.targets.ListPublications(ctx)
 	desired := desiredNodes(publications, s.cfg)
+	now := time.Now().UTC()
 	status := LocalMountStatus{
 		Enabled:     enabled,
 		DesiredIQNs: nodeIQNs(desired),
-		LastSyncAt:  time.Now().UTC(),
+		LastSyncAt:  &now,
 	}
 	if strings.EqualFold(s.cfg.Mode, "in-memory") {
-		s.last = status
+		s.setLast(status)
 		return status, nil
 	}
 
@@ -108,10 +119,10 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 	}
 	desiredSet := make(map[string]bool, len(desired))
 	for _, node := range desired {
-		desiredSet[node.IQN] = enabled
+		desiredSet[node.IQN] = enabled && samePortal(node.Portal, localMountPortal(s.cfg))
 	}
 	for _, node := range existing {
-		if isHoloIQN(node.IQN) && !desiredSet[node.IQN] {
+		if samePortal(node.Portal, localMountPortal(s.cfg)) && isHoloIQN(node.IQN) && !desiredSet[node.IQN] {
 			if err := s.deleteNode(ctx, node); err != nil && syncErr == nil {
 				syncErr = err
 			}
@@ -125,49 +136,77 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 	if syncErr != nil {
 		status.LastError = syncErr.Error()
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_sync", "local", "failure", map[string]any{"error": syncErr.Error(), "enabled": enabled})
-		s.last = status
+		s.setLast(status)
 		return status, syncErr
 	}
 	audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_sync", "local", "success", map[string]any{"enabled": enabled, "desired": len(status.DesiredIQNs), "mounted": len(status.MountedIQNs)})
-	s.last = status
+	s.setLast(status)
 	return status, nil
+}
+
+func (s *LocalMountService) SyncAsync(actor string) {
+	if s == nil {
+		return
+	}
+	go func() {
+		_, _ = s.Sync(context.Background(), actor)
+	}()
+}
+
+func (s *LocalMountService) setLast(status LocalMountStatus) {
+	s.lastMu.Lock()
+	defer s.lastMu.Unlock()
+	s.last = status
 }
 
 func (s *LocalMountService) loginNode(ctx context.Context, node iscsiNode) error {
 	if node.IQN == "" || node.Portal == "" {
 		return domain.ErrInvalidInput
 	}
-	if _, err := s.runISCSIADM(ctx, "-m", "discovery", "-t", "sendtargets", "-p", node.Portal); err != nil {
+	if _, err := s.runISCSI(ctx, "discover", node.Portal); err != nil {
 		return fmt.Errorf("discover local target %s: %w", node.IQN, err)
 	}
-	if _, err := s.runISCSIADM(ctx, "-m", "node", "-T", node.IQN, "-p", node.Portal, "--op", "update", "-n", "node.startup", "-v", "automatic"); err != nil {
+	if _, err := s.runISCSI(ctx, "set-startup", node.IQN, node.Portal); err != nil {
 		return fmt.Errorf("enable automatic local login %s: %w", node.IQN, err)
 	}
-	if _, err := s.runISCSIADM(ctx, "-m", "node", "-T", node.IQN, "-p", node.Portal, "--login"); err != nil && !isIgnorableISCSIADMError(err) {
+	if _, err := s.runISCSI(ctx, "login", node.IQN, node.Portal); err != nil && !isIgnorableISCSIADMError(err) {
 		return fmt.Errorf("login local target %s: %w", node.IQN, err)
 	}
 	return nil
 }
 
 func (s *LocalMountService) deleteNode(ctx context.Context, node iscsiNode) error {
-	if _, err := s.runISCSIADM(ctx, "-m", "node", "-T", node.IQN, "-p", node.Portal, "--logout"); err != nil && !isIgnorableISCSIADMError(err) {
+	if _, err := s.runISCSI(ctx, "logout", node.IQN, node.Portal); err != nil && !isIgnorableISCSIADMError(err) {
 		return fmt.Errorf("logout stale local target %s: %w", node.IQN, err)
 	}
-	if _, err := s.runISCSIADM(ctx, "-m", "node", "-o", "delete", "-T", node.IQN, "-p", node.Portal); err != nil && !isIgnorableISCSIADMError(err) {
+	if _, err := s.runISCSI(ctx, "delete", node.IQN, node.Portal); err != nil && !isIgnorableISCSIADMError(err) {
 		return fmt.Errorf("delete stale local target %s: %w", node.IQN, err)
 	}
 	return nil
 }
 
-func (s *LocalMountService) runISCSIADM(ctx context.Context, args ...string) (string, error) {
+func (s *LocalMountService) runISCSI(ctx context.Context, args ...string) (string, error) {
+	cmdCtx, cancel := context.WithTimeout(ctx, localMountCommandTimeout())
+	defer cancel()
 	if s.cfg.UseSudo {
-		return s.runner.Run(ctx, "sudo", append([]string{"-n", "iscsiadm"}, args...)...)
+		helper := strings.TrimSpace(os.Getenv("HOLO_ISCSI_PRIVILEGED_HELPER"))
+		if helper == "" {
+			helper = "holo-iscsi-helper"
+		}
+		return s.runner.Run(cmdCtx, "sudo", append([]string{"-n", helper}, args...)...)
 	}
-	return s.runner.Run(ctx, "iscsiadm", args...)
+	if helper := strings.TrimSpace(os.Getenv("HOLO_ISCSI_PRIVILEGED_HELPER")); helper != "" {
+		return s.runner.Run(cmdCtx, helper, args...)
+	}
+	iscsiArgs, err := iscsiadmArgs(args...)
+	if err != nil {
+		return "", err
+	}
+	return s.runner.Run(cmdCtx, "iscsiadm", iscsiArgs...)
 }
 
 func (s *LocalMountService) listConfiguredNodes(ctx context.Context) ([]iscsiNode, error) {
-	out, err := s.runISCSIADM(ctx, "-m", "node")
+	out, err := s.runISCSI(ctx, "nodes")
 	if err != nil && !isIgnorableISCSIADMError(err) {
 		return nil, err
 	}
@@ -175,13 +214,13 @@ func (s *LocalMountService) listConfiguredNodes(ctx context.Context) ([]iscsiNod
 }
 
 func (s *LocalMountService) listMountedIQNs(ctx context.Context) ([]string, error) {
-	out, err := s.runISCSIADM(ctx, "-m", "session")
+	out, err := s.runISCSI(ctx, "sessions")
 	if err != nil && !isIgnorableISCSIADMError(err) {
 		return nil, err
 	}
 	iqns := make([]string, 0)
 	for _, node := range parseISCSIADMNodes(out) {
-		if isHoloIQN(node.IQN) {
+		if samePortal(node.Portal, localMountPortal(s.cfg)) && isHoloIQN(node.IQN) {
 			iqns = append(iqns, node.IQN)
 		}
 	}
@@ -209,10 +248,6 @@ func desiredNodes(publications []*domain.TargetPublication, cfg TargetRuntimeCon
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].IQN < nodes[j].IQN })
 	return nodes
-}
-
-func desiredIQNs(publications []*domain.TargetPublication) []string {
-	return nodeIQNs(desiredNodes(publications, DefaultTargetRuntimeConfig()))
 }
 
 func nodeIQNs(nodes []iscsiNode) []string {
@@ -244,7 +279,7 @@ func parseISCSIADMNodes(raw string) []iscsiNode {
 
 func isHoloIQN(iqn string) bool {
 	iqn = strings.ToLower(strings.TrimSpace(iqn))
-	return strings.HasPrefix(iqn, "iqn.2026-04.") && strings.Contains(iqn, ".holo:")
+	return strings.HasPrefix(iqn, "iqn.") && strings.Contains(iqn, ".holo:")
 }
 
 func isIgnorableISCSIADMError(err error) bool {
@@ -258,4 +293,69 @@ func isIgnorableISCSIADMError(err error) bool {
 		strings.Contains(msg, "no records found") ||
 		strings.Contains(msg, "no active sessions") ||
 		strings.Contains(msg, "not found")
+}
+
+func localMountPortal(cfg TargetRuntimeConfig) string {
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(cfg.PortalHost), cfg.PortalPort)
+}
+
+func samePortal(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func localMountCommandTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("HOLO_LOCAL_MOUNT_ISCSIADM_TIMEOUT_SEC"))
+	if raw == "" {
+		return 8 * time.Second
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 || seconds > 120 {
+		return 8 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func iscsiadmArgs(args ...string) ([]string, error) {
+	if len(args) == 0 {
+		return nil, domain.ErrInvalidInput
+	}
+	switch args[0] {
+	case "discover":
+		if len(args) != 2 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "discovery", "-t", "sendtargets", "-p", args[1]}, nil
+	case "set-startup":
+		if len(args) != 3 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "node", "-T", args[1], "-p", args[2], "--op", "update", "-n", "node.startup", "-v", "automatic"}, nil
+	case "login":
+		if len(args) != 3 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "node", "-T", args[1], "-p", args[2], "--login"}, nil
+	case "logout":
+		if len(args) != 3 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "node", "-T", args[1], "-p", args[2], "--logout"}, nil
+	case "delete":
+		if len(args) != 3 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "node", "-o", "delete", "-T", args[1], "-p", args[2]}, nil
+	case "nodes":
+		if len(args) != 1 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "node"}, nil
+	case "sessions":
+		if len(args) != 1 {
+			return nil, domain.ErrInvalidInput
+		}
+		return []string{"-m", "session"}, nil
+	default:
+		return nil, domain.ErrInvalidInput
+	}
 }

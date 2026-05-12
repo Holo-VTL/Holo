@@ -66,6 +66,7 @@ type TargetRuntimeRepository interface {
 
 type LocalMountSynchronizer interface {
 	Sync(ctx context.Context, actor string) (LocalMountStatus, error)
+	SyncAsync(actor string)
 }
 
 // DefaultTargetRuntimeConfig returns config driven by environment variables:
@@ -769,9 +770,7 @@ func (s *TargetRuntimeService) syncLocalMount(ctx context.Context, actor string)
 	if s.localMount == nil {
 		return
 	}
-	if _, err := s.localMount.Sync(ctx, actor); err != nil {
-		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_auto_sync", "local", "failure", map[string]any{"error": err.Error()})
-	}
+	s.localMount.SyncAsync(actor)
 }
 
 func (s *TargetRuntimeService) GetPublication(ctx context.Context, publicationID string) (*domain.TargetPublication, error) {

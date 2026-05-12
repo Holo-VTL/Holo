@@ -31,16 +31,15 @@ type recordingRunner struct {
 func (r *recordingRunner) Run(_ context.Context, command string, args ...string) (string, error) {
 	line := command + " " + strings.Join(args, " ")
 	r.commands = append(r.commands, line)
-	for key, out := range r.outputs {
-		if strings.Contains(line, key) {
-			return out, nil
-		}
+	if out, ok := r.outputs[line]; ok {
+		return out, nil
 	}
 	return "", nil
 }
 
 func TestLocalMountSyncLogsInDesiredTargetsAndCleansStaleHoloNodes(t *testing.T) {
 	ctx := context.Background()
+	t.Setenv("HOLO_ISCSI_PRIVILEGED_HELPER", "/opt/holo/bin/holo-iscsi-helper")
 	targetRepo := memory.NewTargetRuntimeRepo()
 	pub, err := domain.NewTargetPublication("pub-a", "pool-a", "lib-a", "drive-a", "cart-a", "iqn.2026-04.cloud.backupnext.holo:drive-a")
 	if err != nil {
@@ -53,10 +52,10 @@ func TestLocalMountSyncLogsInDesiredTargetsAndCleansStaleHoloNodes(t *testing.T)
 		t.Fatalf("save publication: %v", err)
 	}
 	runner := &recordingRunner{outputs: map[string]string{
-		"-m node":    "127.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:stale\n",
-		"-m session": "tcp: [1] 127.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:drive-a\n",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper nodes":    "127.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:stale\n10.0.0.2:3260,1 iqn.2026-04.cloud.backupnext.holo:remote\n",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper sessions": "tcp: [1] 127.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:drive-a\ntcp: [2] 10.0.0.2:3260,1 iqn.2026-04.cloud.backupnext.holo:remote\n",
 	}}
-	service := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260}, runner)
+	service := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260, UseSudo: true}, runner)
 
 	status, err := service.Sync(ctx, "tester")
 	if err != nil {
@@ -65,16 +64,26 @@ func TestLocalMountSyncLogsInDesiredTargetsAndCleansStaleHoloNodes(t *testing.T)
 	if len(status.DesiredIQNs) != 1 || status.DesiredIQNs[0] != pub.TargetIQN {
 		t.Fatalf("unexpected desired iqns: %+v", status.DesiredIQNs)
 	}
-	joined := strings.Join(runner.commands, "\n")
 	for _, want := range []string{
-		"-m discovery -t sendtargets -p 127.0.0.1:3260",
-		"-m node -T iqn.2026-04.cloud.backupnext.holo:drive-a -p 127.0.0.1:3260 --login",
-		"-m node -T iqn.2026-04.cloud.backupnext.holo:stale -p 127.0.0.1:3260 --logout",
-		"-m node -o delete -T iqn.2026-04.cloud.backupnext.holo:stale -p 127.0.0.1:3260",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper discover 127.0.0.1:3260",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper login iqn.2026-04.cloud.backupnext.holo:drive-a 127.0.0.1:3260",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper logout iqn.2026-04.cloud.backupnext.holo:stale 127.0.0.1:3260",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper delete iqn.2026-04.cloud.backupnext.holo:stale 127.0.0.1:3260",
 	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("missing command %q in:\n%s", want, joined)
+		if !hasLocalMountCommand(runner.commands, want) {
+			t.Fatalf("missing command %q in:\n%s", want, strings.Join(runner.commands, "\n"))
 		}
+	}
+	for _, unwanted := range []string{
+		"sudo -n /opt/holo/bin/holo-iscsi-helper logout iqn.2026-04.cloud.backupnext.holo:remote 10.0.0.2:3260",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper delete iqn.2026-04.cloud.backupnext.holo:remote 10.0.0.2:3260",
+	} {
+		if hasLocalMountCommand(runner.commands, unwanted) {
+			t.Fatalf("unexpected cross-portal cleanup command %q in:\n%s", unwanted, strings.Join(runner.commands, "\n"))
+		}
+	}
+	if len(status.MountedIQNs) != 1 || status.MountedIQNs[0] != pub.TargetIQN {
+		t.Fatalf("unexpected mounted iqns: %+v", status.MountedIQNs)
 	}
 }
 
@@ -83,4 +92,19 @@ func TestParseISCSIADMNodes(t *testing.T) {
 	if len(nodes) != 1 || nodes[0].Portal != "10.0.0.1:3260" || nodes[0].IQN != "iqn.2026-04.cloud.backupnext.holo:drive-a" {
 		t.Fatalf("unexpected nodes: %+v", nodes)
 	}
+}
+
+func TestIsHoloIQNAllowsFutureDates(t *testing.T) {
+	if !isHoloIQN("iqn.2027-01.cloud.backupnext.holo:drive-a") {
+		t.Fatal("expected future Holo IQN to be managed")
+	}
+}
+
+func hasLocalMountCommand(commands []string, want string) bool {
+	for _, command := range commands {
+		if command == want {
+			return true
+		}
+	}
+	return false
 }

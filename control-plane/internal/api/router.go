@@ -124,9 +124,6 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		if err := targetRuntime.RestoreReadyPublications(ctx); err != nil {
 			tracing.LogError(context.Background(), "target-runtime", "restore ready publications failed", err)
 		}
-		if _, err := localMount.Sync(ctx, "system"); err != nil {
-			tracing.LogError(context.Background(), "target-runtime", "restore local mounts failed", err)
-		}
 	}
 	targetAccess := orchestration.NewTargetAccessService(targetRepo, accessRepo, evaluator, auditWriter)
 	accessHandler := NewTargetAccessHandler(targetAccess)
