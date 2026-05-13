@@ -133,10 +133,22 @@ bash install.sh --offline
 - `upgrade`: 升级二进制文件和 Web 控制台，同时保留所有数据和配置。
 - `uninstall`: 移除服务和应用程序文件。
 
-示例：
+在线升级：
 
 ```bash
-sudo bash install.sh upgrade
+curl -fsSL https://raw.githubusercontent.com/Holo-VTL/Holo/main/scripts/install.sh | bash -s -- upgrade
+```
+
+在线卸载：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Holo-VTL/Holo/main/scripts/install.sh | bash -s -- uninstall
+```
+
+离线升级示例：
+
+```bash
+sudo bash install.sh --offline upgrade
 ```
 
 ### 支持平台

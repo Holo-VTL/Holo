@@ -133,10 +133,22 @@ The installer supports several commands:
 - `upgrade`: Upgrades binaries and web console while preserving all data and configuration.
 - `uninstall`: Removes services and application files.
 
-Example:
+Online upgrade:
 
 ```bash
-sudo bash install.sh upgrade
+curl -fsSL https://raw.githubusercontent.com/Holo-VTL/Holo/main/scripts/install.sh | bash -s -- upgrade
+```
+
+Online uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Holo-VTL/Holo/main/scripts/install.sh | bash -s -- uninstall
+```
+
+Offline upgrade example:
+
+```bash
+sudo bash install.sh --offline upgrade
 ```
 
 ### Supported Platforms
