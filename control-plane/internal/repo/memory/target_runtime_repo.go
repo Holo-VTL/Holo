@@ -197,6 +197,11 @@ func clonePublication(in *domain.TargetPublication) *domain.TargetPublication {
 		return nil
 	}
 	cp := *in
+	if in.ConnectedHosts != nil {
+		hosts := *in.ConnectedHosts
+		hosts.Initiators = append([]string(nil), in.ConnectedHosts.Initiators...)
+		cp.ConnectedHosts = &hosts
+	}
 	return &cp
 }
 

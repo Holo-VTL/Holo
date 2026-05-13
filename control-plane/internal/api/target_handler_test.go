@@ -32,6 +32,28 @@ func TestTargetPublicationEndpoints(t *testing.T) {
 	if listResp.Code != http.StatusOK {
 		t.Fatalf("expected list 200, got %d", listResp.Code)
 	}
+	var publications []struct {
+		TargetIQN      string `json:"targetIqn"`
+		ConnectedHosts struct {
+			Available    bool     `json:"available"`
+			HostCount    int      `json:"hostCount"`
+			SessionCount int      `json:"sessionCount"`
+			Initiators   []string `json:"initiators"`
+		} `json:"connectedHosts"`
+	}
+	if err := json.Unmarshal(listResp.Body.Bytes(), &publications); err != nil {
+		t.Fatalf("unmarshal publications: %v", err)
+	}
+	for _, publication := range publications {
+		if publication.TargetIQN != "iqn.2026-04.ai.holo:test-handler-drive" {
+			continue
+		}
+		if !publication.ConnectedHosts.Available || publication.ConnectedHosts.HostCount != 0 || publication.ConnectedHosts.SessionCount != 0 || len(publication.ConnectedHosts.Initiators) != 0 {
+			t.Fatalf("expected no active sessions summary, got %+v", publication.ConnectedHosts)
+		}
+		return
+	}
+	t.Fatalf("expected published drive target in response, got %+v", publications)
 }
 
 func TestTargetPublicationRejectsNilBody(t *testing.T) {
@@ -181,6 +203,11 @@ func TestTargetPublicationListReturnsLatestPerIQNByDefault(t *testing.T) {
 	}
 	if len(historyPayload) < 2 {
 		t.Fatalf("expected full history payload, got %d body=%s", len(historyPayload), historyResp.Body.String())
+	}
+	for _, row := range historyPayload {
+		if _, ok := row["connectedHosts"]; ok {
+			t.Fatalf("expected history list to skip session discovery, got connectedHosts in body=%s", historyResp.Body.String())
+		}
 	}
 }
 

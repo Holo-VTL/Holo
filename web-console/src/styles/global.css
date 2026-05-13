@@ -655,11 +655,42 @@ textarea {
   font-weight: 750;
 }
 
+.muted-text {
+  color: var(--text-muted);
+}
+
+.connected-hosts-cell {
+  display: inline-flex;
+  align-items: center;
+  width: 128px;
+}
+
+.connected-hosts-column {
+  width: 148px;
+  min-width: 148px;
+}
+
+.connected-hosts-value {
+  display: inline-flex;
+  align-items: center;
+  width: 128px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: inherit;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.connected-hosts-value-muted {
+  color: var(--text-muted);
+  font-weight: inherit;
+}
+
 .table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
-  min-width: 680px;
+  min-width: 820px;
 }
 
 .table-fixed {

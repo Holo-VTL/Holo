@@ -27,6 +27,15 @@ type TargetPublication struct {
 	LastError          string           `json:"lastError,omitempty"`
 	CompressionEnabled bool             `json:"compressionEnabled"`
 	DedupEnabled       bool             `json:"dedupEnabled"`
+	ConnectedHosts     *ConnectedHosts  `json:"connectedHosts,omitempty"`
+}
+
+type ConnectedHosts struct {
+	Available    bool     `json:"available"`
+	HostCount    int      `json:"hostCount"`
+	SessionCount int      `json:"sessionCount"`
+	Initiators   []string `json:"initiators"`
+	LastError    string   `json:"lastError,omitempty"`
 }
 
 func NewTargetPublication(id, poolID, libraryID, driveID, cartridgeID, targetIQN string) (*TargetPublication, error) {

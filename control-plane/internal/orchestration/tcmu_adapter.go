@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -570,6 +571,26 @@ func (a *TcmuAdapter) runTargetcliOutput(ctx context.Context, args ...string) (s
 		return "", err
 	}
 	return out, nil
+}
+
+func (a *TcmuAdapter) ListSessions(ctx context.Context) ([]TargetSession, error) {
+	sessions, err := listConfigfsTargetSessions(a.cfg.IscsiConfigfsRoot)
+	if err == nil && sessions != nil {
+		return sessions, nil
+	}
+	if err != nil {
+		log.Printf("configfs target session discovery unavailable err=%v", err)
+	}
+
+	out, err := a.runTargetcliOutput(ctx, "sessions", "detail")
+	if err != nil {
+		return fallbackIscsiadmSessions(ctx, a.runner, a.cfg.UseSudo, nil), nil
+	}
+	sessions = parseTargetcliSessions(out)
+	if len(sessions) > 0 {
+		return sessions, nil
+	}
+	return fallbackIscsiadmSessions(ctx, a.runner, a.cfg.UseSudo, sessions), nil
 }
 
 func targetcliTimeout() time.Duration {

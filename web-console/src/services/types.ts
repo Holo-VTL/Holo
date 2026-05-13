@@ -104,8 +104,17 @@ export interface TargetPublication {
   lastError?: string;
   compressionEnabled: boolean;
   dedupEnabled: boolean;
+  connectedHosts?: ConnectedHostsSummary;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ConnectedHostsSummary {
+  available: boolean;
+  hostCount: number;
+  sessionCount: number;
+  initiators: string[];
+  lastError?: string;
 }
 
 export interface LocalMountStatus {

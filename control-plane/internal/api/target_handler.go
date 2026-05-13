@@ -123,11 +123,12 @@ func (h *TargetHandler) handlePublications(w http.ResponseWriter, r *http.Reques
 		}
 		respondJSON(w, http.StatusAccepted, publication)
 	case http.MethodGet:
-		publications := h.service.ListPublications(r.Context())
 		if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("history")), "all") {
+			publications := h.service.ListPublications(r.Context())
 			respondJSON(w, http.StatusOK, publications)
 			return
 		}
+		publications := h.service.ListPublicationsWithConnectedHosts(r.Context())
 		respondJSON(w, http.StatusOK, latestPublicationsByIQN(publications))
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)

@@ -4,7 +4,34 @@ import { RefreshCw } from "lucide-react";
 import { api } from "../services/api";
 import { useToast } from "../components/Toast";
 import { StatusBadge } from "../components/StatusBadge";
-import type { LocalMountStatus, TargetPublication } from "../services/types";
+import type { ConnectedHostsSummary, LocalMountStatus, TargetPublication } from "../services/types";
+
+function connectedHostsTitle(connectedHosts?: ConnectedHostsSummary): string | undefined {
+  if (!connectedHosts?.available || connectedHosts.initiators.length === 0) {
+    return undefined;
+  }
+  return connectedHosts.initiators.join("\n");
+}
+
+interface ConnectedHostsLabels {
+  activeHosts: (count: number) => string;
+  noActiveSessions: string;
+  sessionDataUnavailable: string;
+}
+
+function renderConnectedHosts(connectedHosts: ConnectedHostsSummary | undefined, labels: ConnectedHostsLabels) {
+  if (!connectedHosts || !connectedHosts.available) {
+    return <span className="connected-hosts-value connected-hosts-value-muted">{labels.sessionDataUnavailable}</span>;
+  }
+  if (connectedHosts.hostCount === 0) {
+    return <span className="connected-hosts-value connected-hosts-value-muted">{labels.noActiveSessions}</span>;
+  }
+  return (
+    <div className="connected-hosts-cell" title={connectedHostsTitle(connectedHosts)}>
+      <span className="connected-hosts-value">{labels.activeHosts(connectedHosts.hostCount)}</span>
+    </div>
+  );
+}
 
 export function TargetsPage() {
   const { t } = useTranslation();
@@ -46,6 +73,12 @@ export function TargetsPage() {
   }, []);
   const activePublications = publications.filter((publication) => publication.state === "ready");
 
+  const connectedHostsLabels = {
+    activeHosts: (count: number) => t("targets.activeHosts", { count }),
+    noActiveSessions: t("targets.noActiveSessionsShort"),
+    sessionDataUnavailable: t("targets.sessionDataUnavailableShort"),
+  };
+
   return (
     <section>
       <div className="page-header">
@@ -84,6 +117,7 @@ export function TargetsPage() {
                 <th>{t("targets.targetIqn")}</th>
                 <th>{t("targets.deviceRole")}</th>
                 <th>{t("targets.portal")}</th>
+                <th className="connected-hosts-column">{t("targets.connectedHosts")}</th>
                 <th>{t("common.state")}</th>
               </tr>
             </thead>
@@ -93,12 +127,13 @@ export function TargetsPage() {
                   <td>{publication.targetIqn}</td>
                   <td>{publication.deviceRole}</td>
                   <td>{publication.portal || "-"}</td>
+                  <td className="connected-hosts-column">{renderConnectedHosts(publication.connectedHosts, connectedHostsLabels)}</td>
                   <td><StatusBadge state={publication.state} /></td>
                 </tr>
               ))}
               {activePublications.length === 0 ? (
                 <tr>
-                  <td colSpan={4}>{t("common.empty")}</td>
+                  <td colSpan={5}>{t("common.empty")}</td>
                 </tr>
               ) : null}
             </tbody>
