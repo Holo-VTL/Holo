@@ -10,19 +10,21 @@ import (
 )
 
 type CoreResourcesRepo struct {
-	mu         sync.RWMutex
-	libraries  map[string]*domain.VirtualLibrary
-	drives     map[string]*domain.VirtualDrive
-	cartridges map[string]*domain.VirtualCartridge
-	destroyed  map[string]struct{}
+	mu           sync.RWMutex
+	libraries    map[string]*domain.VirtualLibrary
+	drives       map[string]*domain.VirtualDrive
+	cartridges   map[string]*domain.VirtualCartridge
+	barcodeIndex map[string]string
+	destroyed    map[string]struct{}
 }
 
 func NewCoreResourcesRepo() *CoreResourcesRepo {
 	return &CoreResourcesRepo{
-		libraries:  make(map[string]*domain.VirtualLibrary),
-		drives:     make(map[string]*domain.VirtualDrive),
-		cartridges: make(map[string]*domain.VirtualCartridge),
-		destroyed:  make(map[string]struct{}),
+		libraries:    make(map[string]*domain.VirtualLibrary),
+		drives:       make(map[string]*domain.VirtualDrive),
+		cartridges:   make(map[string]*domain.VirtualCartridge),
+		barcodeIndex: make(map[string]string),
+		destroyed:    make(map[string]struct{}),
 	}
 }
 
@@ -78,12 +80,12 @@ func (r *CoreResourcesRepo) CreateCartridge(_ context.Context, c *domain.Virtual
 	if _, exists := r.cartridges[c.CartridgeID]; exists {
 		return domain.ErrConflict
 	}
-	for _, existing := range r.cartridges {
-		if normalizeBarcodeKey(existing.Barcode) == normalizeBarcodeKey(c.Barcode) {
-			return domain.ErrConflict
-		}
+	barcodeKey := normalizeBarcodeKey(c.Barcode)
+	if _, exists := r.barcodeIndex[barcodeKey]; exists {
+		return domain.ErrConflict
 	}
 	r.cartridges[c.CartridgeID] = cloneCartridge(c)
+	r.barcodeIndex[barcodeKey] = c.CartridgeID
 	return nil
 }
 
@@ -94,15 +96,17 @@ func (r *CoreResourcesRepo) SaveCartridge(_ context.Context, c *domain.VirtualCa
 	if _, ok := r.destroyed[barcodeKey]; ok {
 		return domain.ErrConflict
 	}
-	for existingID, existing := range r.cartridges {
-		if existing == nil || existingID == c.CartridgeID {
-			continue
-		}
-		if normalizeBarcodeKey(existing.Barcode) == barcodeKey {
-			return domain.ErrConflict
+	if existingID, ok := r.barcodeIndex[barcodeKey]; ok && existingID != c.CartridgeID {
+		return domain.ErrConflict
+	}
+	if existing := r.cartridges[c.CartridgeID]; existing != nil {
+		oldKey := normalizeBarcodeKey(existing.Barcode)
+		if oldKey != "" && oldKey != barcodeKey {
+			delete(r.barcodeIndex, oldKey)
 		}
 	}
 	r.cartridges[c.CartridgeID] = cloneCartridge(c)
+	r.barcodeIndex[barcodeKey] = c.CartridgeID
 	return nil
 }
 
@@ -124,7 +128,9 @@ func (r *CoreResourcesRepo) DestroyCartridge(_ context.Context, cartridgeID, bar
 	if barcodeKey == "" || strings.TrimSpace(cartridgeID) == "" {
 		return domain.ErrInvalidInput
 	}
-	if _, ok := r.cartridges[cartridgeID]; !ok {
+	if existing, ok := r.cartridges[cartridgeID]; ok {
+		delete(r.barcodeIndex, normalizeBarcodeKey(existing.Barcode))
+	} else {
 		return domain.ErrNotFound
 	}
 	r.destroyed[barcodeKey] = struct{}{}
@@ -135,9 +141,11 @@ func (r *CoreResourcesRepo) DestroyCartridge(_ context.Context, cartridgeID, bar
 func (r *CoreResourcesRepo) DeleteCartridge(_ context.Context, cartridgeID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.cartridges[cartridgeID]; !ok {
+	existing, ok := r.cartridges[cartridgeID]
+	if !ok {
 		return domain.ErrNotFound
 	}
+	delete(r.barcodeIndex, normalizeBarcodeKey(existing.Barcode))
 	delete(r.cartridges, cartridgeID)
 	return nil
 }

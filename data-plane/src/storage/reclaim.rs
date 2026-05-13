@@ -9,6 +9,65 @@ use super::segment::{read_segment_file, write_segment_file};
 const RECLAIM_RECORD_SIZE: usize = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReclaimReferenceInterval {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReclaimReferenceIndex {
+    intervals: Vec<ReclaimReferenceInterval>,
+}
+
+impl ReclaimReferenceIndex {
+    fn from_lookup_records(records: &[super::map_lookup::MapLookupRecord]) -> Self {
+        let mut intervals = records
+            .iter()
+            .filter_map(|entry| {
+                if entry.blk_map_ref_end < entry.blk_map_ref_start {
+                    return None;
+                }
+                Some(ReclaimReferenceInterval {
+                    start: entry.blk_map_ref_start,
+                    end: entry.blk_map_ref_end,
+                })
+            })
+            .collect::<Vec<_>>();
+        intervals.sort_by_key(|interval| (interval.start, interval.end));
+
+        let mut merged: Vec<ReclaimReferenceInterval> = Vec::with_capacity(intervals.len());
+        for interval in intervals {
+            if let Some(last) = merged.last_mut() {
+                if interval.start <= last.end.saturating_add(1) {
+                    last.end = last.end.max(interval.end);
+                    continue;
+                }
+            }
+            merged.push(interval);
+        }
+
+        Self { intervals: merged }
+    }
+
+    fn contains(&self, record_id: u64) -> bool {
+        if self.intervals.is_empty() {
+            return false;
+        }
+        match self
+            .intervals
+            .binary_search_by_key(&record_id, |interval| interval.start)
+        {
+            Ok(_) => true,
+            Err(0) => false,
+            Err(index) => {
+                let interval = self.intervals[index - 1];
+                record_id <= interval.end
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ReclaimReason {
     Superseded = 1,
@@ -155,13 +214,12 @@ pub fn upsert_reclaim_candidates(
     }
 
     let (_seq, lookups) = load_lookup_records(lookup_path)?;
+    let references = ReclaimReferenceIndex::from_lookup_records(&lookups);
     let mut candidates = load_reclaim_candidates(reclaim_path)?;
     let mut updated = Vec::new();
 
     for record_id in blk_map_record_ids {
-        let still_referenced = lookups.iter().any(|entry| {
-            *record_id >= entry.blk_map_ref_start && *record_id <= entry.blk_map_ref_end
-        });
+        let still_referenced = references.contains(*record_id);
         if let Some(existing) = candidates
             .iter_mut()
             .find(|c| c.blk_map_record_id == *record_id)
@@ -190,14 +248,12 @@ pub fn refresh_reclaim_safety(
     reclaim_path: &Path,
 ) -> Result<usize, StorageError> {
     let (_seq, lookups) = load_lookup_records(lookup_path)?;
+    let references = ReclaimReferenceIndex::from_lookup_records(&lookups);
     let mut candidates = load_reclaim_candidates(reclaim_path)?;
 
     let mut updated = 0usize;
     for candidate in &mut candidates {
-        let referenced = lookups.iter().any(|entry| {
-            candidate.blk_map_record_id >= entry.blk_map_ref_start
-                && candidate.blk_map_record_id <= entry.blk_map_ref_end
-        });
+        let referenced = references.contains(candidate.blk_map_record_id);
         let next = !referenced;
         if candidate.safe_to_reclaim != next {
             candidate.safe_to_reclaim = next;
@@ -222,4 +278,41 @@ fn persist_candidates(path: &Path, candidates: &[ReclaimCandidate]) -> Result<()
         candidates.len() as u64,
         &payload,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::map_lookup::MapLookupRecord;
+
+    fn lookup(start: u64, end: u64) -> MapLookupRecord {
+        MapLookupRecord {
+            lookup_id: 0,
+            logical_min: 0,
+            logical_max: 0,
+            blk_map_ref_start: start,
+            blk_map_ref_end: end,
+        }
+    }
+
+    #[test]
+    fn reference_index_handles_empty_unsorted_and_overlapping_intervals() {
+        let empty = ReclaimReferenceIndex::from_lookup_records(&[]);
+        assert!(!empty.contains(1));
+
+        let index = ReclaimReferenceIndex::from_lookup_records(&[
+            lookup(8, 10),
+            lookup(1, 3),
+            lookup(4, 4),
+            lookup(2, 6),
+            lookup(20, 18),
+        ]);
+
+        for id in [1, 3, 4, 6, 8, 10] {
+            assert!(index.contains(id), "expected {id} to be referenced");
+        }
+        for id in [0, 7, 11, 18, 20] {
+            assert!(!index.contains(id), "expected {id} to be unreferenced");
+        }
+    }
 }
