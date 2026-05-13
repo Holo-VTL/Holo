@@ -1197,6 +1197,180 @@ func TestDriveLoadWritesSharedStateAndKeepsSlotPositions(t *testing.T) {
 	}
 }
 
+func TestCartridgeListIncludesCurrentSlotElementAddress(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-elements","name":"Pool Elements","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-elements","name":"Library Elements","slotCount":12,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-elements","libraryId":"lib-elements","slot":256}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-elements","cartridgeId":"VTA000L06","libraryId":"lib-elements","barcode":"VTA000L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-elements","cartridgeId":"VTA001L06","libraryId":"lib-elements","barcode":"VTA001L06","capacityBytes":549755813888}`, http.StatusCreated},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	slotsPath := filepath.Join(mediaStateDir, sanitizeStateID("lib-elements__drive-elements")+".slots")
+	if err := writeAtomicText(slotsPath, "VTA000L06\n-\n-\n-\n-\n-\n-\n-\n-\n-\nVTA001L06\n-\n"); err != nil {
+		t.Fatalf("write shared slot state: %v", err)
+	}
+
+	listReq := newAuthedRequest(http.MethodGet, "/v1/cartridges", nil)
+	listResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(listResp, listReq)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("expected cartridge list 200, got %d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var cartridges []domain.VirtualCartridge
+	if err := json.Unmarshal(listResp.Body.Bytes(), &cartridges); err != nil {
+		t.Fatalf("decode cartridge list: %v", err)
+	}
+	addressByID := make(map[string]int)
+	for _, cartridge := range cartridges {
+		if cartridge.CurrentElementAddress != nil {
+			addressByID[cartridge.CartridgeID] = *cartridge.CurrentElementAddress
+		}
+	}
+	if addressByID["VTA000L06"] != 1024 {
+		t.Fatalf("expected VTA000L06 at element 1024, got %d", addressByID["VTA000L06"])
+	}
+	if addressByID["VTA001L06"] != 1034 {
+		t.Fatalf("expected VTA001L06 at element 1034, got %d", addressByID["VTA001L06"])
+	}
+}
+
+func TestCartridgeElementAddressUsesNewestDriveSlotFile(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-newest","name":"Pool Newest","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-newest","name":"Library Newest","slotCount":12,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-a","libraryId":"lib-newest","slot":256}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-b","libraryId":"lib-newest","slot":257}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-newest","cartridgeId":"VTA010L06","libraryId":"lib-newest","barcode":"VTA010L06","capacityBytes":549755813888}`, http.StatusCreated},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	stalePath := filepath.Join(mediaStateDir, sanitizeStateID("lib-newest__drive-a")+".slots")
+	freshPath := filepath.Join(mediaStateDir, sanitizeStateID("lib-newest__drive-b")+".slots")
+	if err := writeAtomicText(stalePath, "VTA010L06\n-\n-\n-\n-\n-\n-\n-\n-\n-\n-\n-\n"); err != nil {
+		t.Fatalf("write stale slots: %v", err)
+	}
+	if err := writeAtomicText(freshPath, "-\n-\n-\n-\n-\n-\n-\n-\n-\n-\nVTA010L06\n-\n"); err != nil {
+		t.Fatalf("write fresh slots: %v", err)
+	}
+	oldTime := time.Now().Add(-time.Hour)
+	newTime := time.Now()
+	if err := os.Chtimes(stalePath, oldTime, oldTime); err != nil {
+		t.Fatalf("set stale mtime: %v", err)
+	}
+	if err := os.Chtimes(freshPath, newTime, newTime); err != nil {
+		t.Fatalf("set fresh mtime: %v", err)
+	}
+
+	req := newAuthedRequest(http.MethodGet, "/v1/cartridges/VTA010L06", nil)
+	resp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected cartridge get 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var cartridge domain.VirtualCartridge
+	if err := json.Unmarshal(resp.Body.Bytes(), &cartridge); err != nil {
+		t.Fatalf("decode cartridge: %v", err)
+	}
+	if cartridge.CurrentElementAddress == nil || *cartridge.CurrentElementAddress != 1034 {
+		t.Fatalf("expected newest slot file to place cartridge at 1034, got %#v body=%s", cartridge.CurrentElementAddress, resp.Body.String())
+	}
+}
+
+func TestCartridgeElementAddressOmittedWhenMissingOrMounted(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-omit","name":"Pool Omit","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-omit","name":"Library Omit","slotCount":4,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-omit","libraryId":"lib-omit","slot":256}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-omit","cartridgeId":"VTA020L06","libraryId":"lib-omit","barcode":"VTA020L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-omit","cartridgeId":"VTA021L06","libraryId":"lib-omit","barcode":"VTA021L06","capacityBytes":549755813888}`, http.StatusCreated},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	slotsPath := filepath.Join(mediaStateDir, sanitizeStateID("lib-omit__drive-omit")+".slots")
+	if err := writeAtomicText(slotsPath, "VTA021L06\n-\n-\n-\n"); err != nil {
+		t.Fatalf("write shared slot state: %v", err)
+	}
+	if err := writeDriveMediaState("lib-omit", "drive-omit", "VTA021L06"); err != nil {
+		t.Fatalf("write shared loaded state: %v", err)
+	}
+
+	req := newAuthedRequest(http.MethodGet, "/v1/cartridges", nil)
+	resp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected cartridge list 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var cartridges []domain.VirtualCartridge
+	if err := json.Unmarshal(resp.Body.Bytes(), &cartridges); err != nil {
+		t.Fatalf("decode cartridge list: %v", err)
+	}
+	for _, cartridge := range cartridges {
+		switch cartridge.CartridgeID {
+		case "VTA020L06":
+			if cartridge.CurrentElementAddress != nil {
+				t.Fatalf("expected missing cartridge address to be omitted, got %#v", cartridge.CurrentElementAddress)
+			}
+		case "VTA021L06":
+			if cartridge.LifecycleState != domain.CartridgeMounted {
+				t.Fatalf("expected loaded cartridge to reconcile mounted, got %s", cartridge.LifecycleState)
+			}
+			if cartridge.CurrentElementAddress != nil {
+				t.Fatalf("expected mounted cartridge address to be omitted, got %#v", cartridge.CurrentElementAddress)
+			}
+		}
+	}
+}
+
 func TestResourceListsReconcileSharedDriveState(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)

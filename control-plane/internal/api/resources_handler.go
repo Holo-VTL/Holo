@@ -490,7 +490,9 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 			respondResourceError(w, err)
 			return
 		}
-		respondJSON(w, http.StatusOK, h.repo.ListCartridges(r.Context()))
+		cartridges := h.repo.ListCartridges(r.Context())
+		h.annotateCartridgeElementAddresses(r.Context(), cartridges)
+		respondJSON(w, http.StatusOK, cartridges)
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 	}
@@ -569,6 +571,7 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 				respondResourceError(w, err)
 				return
 			}
+			h.annotateCartridgeElementAddresses(r.Context(), []*domain.VirtualCartridge{cartridge})
 			respondJSON(w, http.StatusOK, cartridge)
 		case http.MethodDelete:
 			deleteCartridge("web-console")
@@ -1271,6 +1274,107 @@ func (h *ResourcesHandler) reconcileMediaState(ctx context.Context) error {
 
 func (h *ResourcesHandler) ReconcileMediaState(ctx context.Context) error {
 	return h.reconcileMediaState(ctx)
+}
+
+func (h *ResourcesHandler) annotateCartridgeElementAddresses(ctx context.Context, cartridges []*domain.VirtualCartridge) {
+	if len(cartridges) == 0 {
+		return
+	}
+	cartridgeByLibraryLabel := make(map[string]map[string]*domain.VirtualCartridge)
+	for _, cartridge := range cartridges {
+		if cartridge == nil {
+			continue
+		}
+		cartridge.CurrentElementAddress = nil
+		libraryID := strings.TrimSpace(cartridge.LibraryID)
+		if libraryID == "" {
+			continue
+		}
+		labels := cartridgeByLibraryLabel[libraryID]
+		if labels == nil {
+			labels = make(map[string]*domain.VirtualCartridge)
+			cartridgeByLibraryLabel[libraryID] = labels
+		}
+		for _, label := range []string{cartridge.CartridgeID, cartridge.Barcode} {
+			key := strings.ToUpper(strings.TrimSpace(label))
+			if key != "" {
+				labels[key] = cartridge
+			}
+		}
+	}
+	for libraryID, cartridgeByLabel := range cartridgeByLibraryLabel {
+		library, err := h.repo.FindLibrary(ctx, libraryID)
+		if err != nil {
+			continue
+		}
+		slotStart := library.SlotStartAddress
+		if slotStart <= 0 {
+			slotStart = 1
+		}
+		for _, label := range readLibrarySlotLabels(ctx, h.repo, libraryID) {
+			key := strings.ToUpper(strings.TrimSpace(label.label))
+			if key == "" {
+				continue
+			}
+			if cartridge := cartridgeByLabel[key]; cartridge != nil && cartridge.LifecycleState != domain.CartridgeMounted && cartridge.LifecycleState != domain.CartridgeExported {
+				address := slotStart + label.index
+				cartridge.CurrentElementAddress = &address
+			}
+		}
+	}
+}
+
+type slotLabel struct {
+	index int
+	label string
+}
+
+func readLibrarySlotLabels(ctx context.Context, repo coreResourcesRepo, libraryID string) []slotLabel {
+	drives := repo.ListDrives(ctx)
+	sort.Slice(drives, func(i, j int) bool {
+		if drives[i] == nil {
+			return false
+		}
+		if drives[j] == nil {
+			return true
+		}
+		return drives[i].DriveID < drives[j].DriveID
+	})
+	var selectedDriveID string
+	var selectedModTime time.Time
+	var selectedLabels []string
+	for _, drive := range drives {
+		if drive == nil || drive.LibraryID != libraryID {
+			continue
+		}
+		labels, modTime, ok := readExistingSlotLabelsWithModTime(libraryID, drive.DriveID)
+		if !ok {
+			continue
+		}
+		if len(labels) == 0 {
+			continue
+		}
+		if selectedLabels == nil || modTime.After(selectedModTime) || (modTime.Equal(selectedModTime) && drive.DriveID < selectedDriveID) {
+			selectedDriveID = drive.DriveID
+			selectedModTime = modTime
+			selectedLabels = labels
+		}
+	}
+	out := make([]slotLabel, 0, len(selectedLabels))
+	for idx, label := range selectedLabels {
+		out = append(out, slotLabel{index: idx, label: label})
+	}
+	return out
+}
+
+func readExistingSlotLabelsWithModTime(libraryID, driveID string) ([]string, time.Time, bool) {
+	stateKey := storageutil.MediaStateKey(libraryID, driveID)
+	path := filepath.Join(mediaStateDir(), sanitizeStateID(stateKey)+".slots")
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	return readExistingSlotLabels(libraryID, driveID), info.ModTime(), true
 }
 
 func (h *ResourcesHandler) syncPoolUsage(ctx context.Context, poolIDs ...string) error {

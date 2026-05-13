@@ -21,14 +21,15 @@ const (
 
 type VirtualCartridge struct {
 	Timestamped
-	CartridgeID    string                  `json:"cartridgeId"`
-	PoolID         string                  `json:"poolId"`
-	LibraryID      string                  `json:"libraryId"`
-	Barcode        string                  `json:"barcode"`
-	CapacityBytes  int64                   `json:"capacityBytes"`
-	UsedBytes      int64                   `json:"usedBytes"`
-	LifecycleState CartridgeLifecycleState `json:"lifecycleState"`
-	RetentionState RetentionState          `json:"retentionState"`
+	CartridgeID           string                  `json:"cartridgeId"`
+	PoolID                string                  `json:"poolId"`
+	LibraryID             string                  `json:"libraryId"`
+	Barcode               string                  `json:"barcode"`
+	CapacityBytes         int64                   `json:"capacityBytes"`
+	UsedBytes             int64                   `json:"usedBytes"`
+	LifecycleState        CartridgeLifecycleState `json:"lifecycleState"`
+	RetentionState        RetentionState          `json:"retentionState"`
+	CurrentElementAddress *int                    `json:"currentElementAddress,omitempty"`
 }
 
 func NewVirtualCartridge(id, poolID, libraryID, barcode string, capacity int64) *VirtualCartridge {
