@@ -323,6 +323,14 @@ func addText(zw *zip.Writer, name, text string) error {
 }
 
 func addPlainFile(zw *zip.Writer, entry, path string) {
+	info, statErr := os.Lstat(path)
+	if statErr != nil {
+		addText(zw, entry+".error.txt", fmt.Sprintf("read failed: %s\n", statErr))
+		return
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		addText(zw, entry+".error.txt", fmt.Sprintf("read failed: %s\n", err))
@@ -336,8 +344,8 @@ func addPlainFile(zw *zip.Writer, entry, path string) {
 }
 
 func addRedactedConfigFiles(zw *zip.Writer, configDir string) {
-	info, err := os.Stat(configDir)
-	if err != nil || !info.IsDir() {
+	info, err := os.Lstat(configDir)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		addText(zw, "config/README.txt", "config directory is unavailable\n")
 		return
 	}
@@ -369,8 +377,8 @@ func addRedactedConfigFiles(zw *zip.Writer, configDir string) {
 }
 
 func addLogFiles(zw *zip.Writer, logDir string) {
-	info, err := os.Stat(logDir)
-	if err != nil || !info.IsDir() {
+	info, err := os.Lstat(logDir)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		addText(zw, "logs/README.txt", "log directory is unavailable\n")
 		return
 	}

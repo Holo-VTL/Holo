@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +51,56 @@ func TestClientIDFromRequestUsesForwardedHeadersOnlyFromTrustedProxy(t *testing.
 	untrusted := newRateLimiter("")
 	if got := untrusted.clientIDFromRequest(req); got != "192.0.2.10" {
 		t.Fatalf("expected untrusted proxy headers to be ignored, got %q", got)
+	}
+}
+
+func TestClientIDFromRequestIgnoresGlobalTrustedProxyCIDRs(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cidr       string
+		remoteAddr string
+		header     string
+		want       string
+	}{
+		{
+			name:       "ipv4 global",
+			cidr:       "0.0.0.0/0",
+			remoteAddr: "198.51.100.50:12345",
+			header:     "203.0.113.7",
+			want:       "198.51.100.50",
+		},
+		{
+			name:       "ipv6 global",
+			cidr:       "::/0",
+			remoteAddr: "[2001:db8::50]:12345",
+			header:     "2001:db8:1::7",
+			want:       "2001:db8::50",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limiter := newRateLimiter(tc.cidr)
+			req := httptest.NewRequest(http.MethodGet, "/v1/support/bundle", nil)
+			req.RemoteAddr = tc.remoteAddr
+			req.Header.Set("X-Forwarded-For", tc.header)
+			if got := limiter.clientIDFromRequest(req); got != tc.want {
+				t.Fatalf("expected global trusted proxy CIDR to be ignored, got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseTrustedProxyCIDRsWarnsForGlobalCIDR(t *testing.T) {
+	var logs bytes.Buffer
+	original := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	prefixes := parseTrustedProxyCIDRs("0.0.0.0/0,127.0.0.1/32,::/0")
+	if len(prefixes) != 1 || prefixes[0].String() != "127.0.0.1/32" {
+		t.Fatalf("expected only specific loopback prefix to remain, got %v", prefixes)
+	}
+	if got := logs.String(); !strings.Contains(got, "0.0.0.0/0") || !strings.Contains(got, "::/0") {
+		t.Fatalf("expected warnings for global CIDRs, got %q", got)
 	}
 }
 

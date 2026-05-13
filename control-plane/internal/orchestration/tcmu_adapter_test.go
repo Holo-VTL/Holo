@@ -171,6 +171,23 @@ func TestTcmuAdapter_RunTargetcliKeepsLegacySudoFallback(t *testing.T) {
 	}
 }
 
+func TestTcmuAdapter_RunTargetcliRejectsUnsupportedCommandShape(t *testing.T) {
+	runner := newMockTcmuRunner()
+	a := &TcmuAdapter{
+		cfg:      normalizeTargetRuntimeConfig(TargetRuntimeConfig{Mode: "tcmu", UseSudo: true}),
+		runner:   runner,
+		registry: newTcmuRegistry(),
+		auditW:   &tcmuNoopAuditWriter{},
+	}
+
+	if err := a.runTargetcli(context.Background(), "/iscsi", "ls"); err != domain.ErrInvalidInput {
+		t.Fatalf("expected invalid input for unsupported targetcli command shape, got %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("expected no targetcli calls for invalid shape, got %v", runner.calls)
+	}
+}
+
 func TestProcessIdentityMismatchPreventsTrustingReusedPID(t *testing.T) {
 	if processIdentityMatches(12345, "definitely-not-this-process") {
 		t.Fatal("expected mismatched process token to be rejected")
@@ -201,7 +218,11 @@ func TestTcmuAdapter_Publish_TargetcliCallOrder(t *testing.T) {
 	ctx := context.Background()
 	backstoreName := runtimeBackstoreName(pub)
 
-	_ = a.runTargetcli(ctx, "/backstores/user:holo", "create", "name="+backstoreName)
+	_ = a.runTargetcli(ctx, "/backstores/user:holo", "create",
+		"name="+backstoreName,
+		"size=64M",
+		"cfgstring="+tcmuSocketPath(pub.PublicationID),
+	)
 	_ = a.runTargetcli(ctx, "/iscsi", "create", pub.TargetIQN)
 
 	backstoreIdx := -1

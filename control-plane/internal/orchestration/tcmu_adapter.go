@@ -38,6 +38,13 @@ type TcmuHandlerSession struct {
 	BackstoreConfigPath string
 }
 
+var tcmuTargetcliTPGAttributes = []string{
+	"authentication=0",
+	"generate_node_acls=1",
+	"demo_mode_write_protect=0",
+	"cache_dynamic_acls=1",
+}
+
 var tcmuISCSIDataPathParameters = []string{
 	"InitialR2T=No",
 	"ImmediateData=Yes",
@@ -175,14 +182,11 @@ func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPub
 	}
 
 	// 4. Configure TPG attributes.
-	if err := a.runTargetcli(ctx,
-		"/iscsi/"+publication.TargetIQN+"/tpg1",
+	tpgAttributeArgs := append([]string{
+		"/iscsi/" + publication.TargetIQN + "/tpg1",
 		"set", "attribute",
-		"authentication=0",
-		"generate_node_acls=1",
-		"demo_mode_write_protect=0",
-		"cache_dynamic_acls=1",
-	); err != nil {
+	}, tcmuTargetcliTPGAttributes...)
+	if err := a.runTargetcli(ctx, tpgAttributeArgs...); err != nil {
 		_ = a.deleteTcmuTarget(ctx, publication.TargetIQN)
 		_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
 		a.killHandler(pid)
@@ -550,6 +554,9 @@ func (a *TcmuAdapter) runTargetcli(ctx context.Context, args ...string) error {
 }
 
 func (a *TcmuAdapter) runTargetcliOutput(ctx context.Context, args ...string) (string, error) {
+	if err := validateTargetcliArgs(args...); err != nil {
+		return "", err
+	}
 	timeout := targetcliTimeout()
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

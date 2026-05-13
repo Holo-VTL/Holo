@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -151,6 +152,10 @@ func parseTrustedProxyCIDRs(raw string) []netip.Prefix {
 			continue
 		}
 		if prefix, err := netip.ParsePrefix(token); err == nil {
+			if prefix.Bits() == 0 {
+				log.Printf("WARNING: ignoring unsafe HOLO_TRUSTED_PROXY_CIDRS entry %q; configure specific proxy CIDRs instead", token)
+				continue
+			}
 			out = append(out, prefix.Masked())
 			continue
 		}

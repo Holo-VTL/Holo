@@ -186,6 +186,80 @@ func TestOpsHandler_SupportBundleSkipsSymlinkedFiles(t *testing.T) {
 	}
 }
 
+func TestOpsHandler_SupportBundleSkipsSymlinkedRoots(t *testing.T) {
+	h := NewOpsHandler(nil, nil, 3260)
+	h.support = testSupportConfig(t)
+	outsideConfig := filepath.Join(t.TempDir(), "outside-config")
+	outsideLog := filepath.Join(t.TempDir(), "outside-log")
+	for _, dir := range []string{outsideConfig, outsideLog} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create outside dir: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outsideConfig, "holo.env"), []byte("HOLO_API_KEY=outside-secret\n"), 0o600); err != nil {
+		t.Fatalf("write outside config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideLog, "holo.log"), []byte("outside-log\n"), 0o600); err != nil {
+		t.Fatalf("write outside log: %v", err)
+	}
+	if err := os.Remove(h.support.ConfigDir); err != nil {
+		t.Fatalf("remove config dir: %v", err)
+	}
+	if err := os.Remove(h.support.LogDir); err != nil {
+		t.Fatalf("remove log dir: %v", err)
+	}
+	if err := os.Symlink(outsideConfig, h.support.ConfigDir); err != nil {
+		t.Fatalf("symlink config root: %v", err)
+	}
+	if err := os.Symlink(outsideLog, h.support.LogDir); err != nil {
+		t.Fatalf("symlink log root: %v", err)
+	}
+
+	bundle, _, err := h.buildSupportBundle(t.Context())
+	if err != nil {
+		t.Fatalf("build support bundle: %v", err)
+	}
+	reader, err := zip.NewReader(bytes.NewReader(bundle), int64(len(bundle)))
+	if err != nil {
+		t.Fatalf("open support bundle zip: %v", err)
+	}
+	entries := zipEntries(reader)
+	if entries["config/holo.env"] || entries["logs/holo.log"] {
+		t.Fatalf("support bundle should skip symlinked roots, got entries=%+v", entries)
+	}
+	if got := zipEntryText(t, reader, "config/README.txt"); !strings.Contains(got, "unavailable") {
+		t.Fatalf("expected config unavailable note, got %q", got)
+	}
+	if got := zipEntryText(t, reader, "logs/README.txt"); !strings.Contains(got, "unavailable") {
+		t.Fatalf("expected logs unavailable note, got %q", got)
+	}
+}
+
+func TestAddPlainFileSkipsReadTimeSymlink(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("outside-secret\n"), 0o600); err != nil {
+		t.Fatalf("write outside fixture: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "candidate.log")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addPlainFile(zw, "logs/candidate.log", link)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	reader, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	if entries := zipEntries(reader); entries["logs/candidate.log"] {
+		t.Fatalf("support bundle should skip read-time symlink, got entries=%+v", entries)
+	}
+}
+
 func TestSupportBundleRedactsEnvironmentLines(t *testing.T) {
 	input := "Environment=\"HOLO_API_KEY=secret-value\" HOLO_HTTP_ADDR=0.0.0.0:80\nHOLO_API_KEY=secret-value\nclient_secret=client-value\nprivate_key=pem-value\nAuthorization: Bearer bearer-value\njwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature\n"
 	got := redactText(input)

@@ -1,8 +1,10 @@
 package orchestration
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -484,16 +486,77 @@ func TestLIOShellAdapterRunTargetcliUsesPrivilegedHelper(t *testing.T) {
 		UseSudo: true,
 	}, runner)
 
-	if err := adapter.runTargetcli(context.Background(), "/iscsi", "ls"); err != nil {
+	if err := adapter.runTargetcli(context.Background(), "/iscsi", "create", "iqn.2026-04.ai.holo:helper-test"); err != nil {
 		t.Fatalf("runTargetcli failed: %v", err)
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("expected one call, got %v", runner.calls)
 	}
 	got := strings.Join(runner.calls[0], " ")
-	want := "sudo -n /opt/holo/bin/holo-targetcli-helper /iscsi ls"
+	want := "sudo -n /opt/holo/bin/holo-targetcli-helper /iscsi create iqn.2026-04.ai.holo:helper-test"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestTargetcliCommandAcceptsCustomInstallPrefixHelper(t *testing.T) {
+	t.Setenv("HOLO_TARGETCLI_PRIVILEGED_HELPER", "/usr/local/holo/bin/holo-targetcli-helper")
+	cmd, args := targetcliCommand(true, "/iscsi", "ls")
+	got := append([]string{cmd}, args...)
+	want := []string{"sudo", "-n", "/usr/local/holo/bin/holo-targetcli-helper", "/iscsi", "ls"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("expected %q, got %q", strings.Join(want, " "), strings.Join(got, " "))
+	}
+}
+
+func TestTargetcliCommandPreservesFallbackWhenHelperUnset(t *testing.T) {
+	t.Setenv("HOLO_TARGETCLI_PRIVILEGED_HELPER", "")
+	cmd, args := targetcliCommand(true, "/iscsi", "ls")
+	got := append([]string{cmd}, args...)
+	want := []string{"sudo", "-n", "targetcli", "/iscsi", "ls"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("expected %q, got %q", strings.Join(want, " "), strings.Join(got, " "))
+	}
+}
+
+func TestTargetcliCommandIgnoresUnsafeHelperValues(t *testing.T) {
+	for _, helper := range []string{
+		"relative/holo-targetcli-helper",
+		"/tmp/holo-targetcli-helper",
+		"/tmp/holo/bin/holo-targetcli-helper",
+		"/var/tmp/holo-targetcli-helper",
+		"/opt/holo/bin/not-holo-targetcli-helper",
+	} {
+		t.Run(helper, func(t *testing.T) {
+			t.Setenv("HOLO_TARGETCLI_PRIVILEGED_HELPER", helper)
+			cmd, args := targetcliCommand(true, "/iscsi", "ls")
+			got := append([]string{cmd}, args...)
+			want := []string{"sudo", "-n", "targetcli", "/iscsi", "ls"}
+			if strings.Join(got, " ") != strings.Join(want, " ") {
+				t.Fatalf("expected unsafe helper %q to fall back to %q, got %q", helper, strings.Join(want, " "), strings.Join(got, " "))
+			}
+		})
+	}
+}
+
+func TestTargetcliCommandWarnsOnceForUnsafeHelper(t *testing.T) {
+	helper := "/opt/holo/bin/invalid-helper-warn-once"
+	t.Setenv("HOLO_TARGETCLI_PRIVILEGED_HELPER", helper)
+	var logs bytes.Buffer
+	original := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	for i := 0; i < 2; i++ {
+		cmd, args := targetcliCommand(true, "/iscsi", "create", "iqn.2026-04.ai.holo:warn-once")
+		got := append([]string{cmd}, args...)
+		want := []string{"sudo", "-n", "targetcli", "/iscsi", "create", "iqn.2026-04.ai.holo:warn-once"}
+		if strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("expected %q, got %q", strings.Join(want, " "), strings.Join(got, " "))
+		}
+	}
+	if got := strings.Count(logs.String(), "ignoring unsafe HOLO_TARGETCLI_PRIVILEGED_HELPER"); got != 1 {
+		t.Fatalf("expected one unsafe helper warning, got %d logs=%q", got, logs.String())
 	}
 }
 
@@ -614,6 +677,12 @@ func TestLIOShellAdapterRejectsUnsafeRuntimeInputs(t *testing.T) {
 	}
 	if err := adapter.runTargetcli(context.Background(), "/iscsi/../backstores", "ls"); err != domain.ErrInvalidInput {
 		t.Fatalf("expected invalid input for targetcli path traversal, got %v", err)
+	}
+	if err := adapter.runTargetcli(context.Background(), "/iscsi", "ls"); err != domain.ErrInvalidInput {
+		t.Fatalf("expected invalid input for unsupported targetcli command shape, got %v", err)
+	}
+	if err := adapter.runTargetcli(context.Background(), "/iscsi/iqn.2026-04.ai.holo:safe/tpg1", "set", "attribute", "authentication=1"); err != domain.ErrInvalidInput {
+		t.Fatalf("expected invalid input for unsupported targetcli attribute, got %v", err)
 	}
 }
 

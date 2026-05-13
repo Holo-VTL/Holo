@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
@@ -197,16 +198,12 @@ func (a *lioShellTargetRuntimeAdapter) Publish(ctx context.Context, publication 
 		return "", fmt.Errorf("create iscsi target: %w", err)
 	}
 
-	if err := a.runTargetcli(
-		ctx,
-		"/iscsi/"+publication.TargetIQN+"/tpg1",
+	tpgAttributeArgs := append([]string{
+		"/iscsi/" + publication.TargetIQN + "/tpg1",
 		"set",
 		"attribute",
-		"authentication=0",
-		"generate_node_acls=1",
-		"demo_mode_write_protect=0",
-		"cache_dynamic_acls=1",
-	); err != nil {
+	}, tcmuTargetcliTPGAttributes...)
+	if err := a.runTargetcli(ctx, tpgAttributeArgs...); err != nil {
 		_ = a.deleteTarget(ctx, publication.TargetIQN)
 		_ = a.deleteBackstore(ctx, backstoreName)
 		return "", fmt.Errorf("configure iscsi tpg attributes: %w", err)
@@ -283,10 +280,44 @@ func targetcliCommand(useSudo bool, args ...string) (string, []string) {
 		return "targetcli", cmdArgs
 	}
 	target := strings.TrimSpace(os.Getenv("HOLO_TARGETCLI_PRIVILEGED_HELPER"))
-	if target == "" {
+	if !isSafeTargetcliHelperPath(target) {
+		if target != "" {
+			warnInvalidTargetcliHelper(target)
+		}
 		target = "targetcli"
 	}
 	return "sudo", append([]string{"-n", target}, cmdArgs...)
+}
+
+var invalidTargetcliHelperWarnings sync.Map
+
+func warnInvalidTargetcliHelper(path string) {
+	if _, loaded := invalidTargetcliHelperWarnings.LoadOrStore(path, struct{}{}); loaded {
+		return
+	}
+	log.Printf("WARNING: ignoring unsafe HOLO_TARGETCLI_PRIVILEGED_HELPER=%q; using targetcli fallback", path)
+}
+
+func isSafeTargetcliHelperPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	cleaned := filepath.Clean(path)
+	if filepath.Base(cleaned) != "holo-targetcli-helper" || filepath.Base(filepath.Dir(cleaned)) != "bin" {
+		return false
+	}
+	for _, unsafeRoot := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
+		if cleaned == unsafeRoot || strings.HasPrefix(cleaned, unsafeRoot+string(os.PathSeparator)) {
+			return false
+		}
+	}
+	exe, err := os.Executable()
+	if err == nil && cleaned == filepath.Join(filepath.Dir(exe), "holo-targetcli-helper") {
+		return true
+	}
+	return strings.HasPrefix(cleaned, string(os.PathSeparator)+"opt"+string(os.PathSeparator)) ||
+		strings.HasPrefix(cleaned, string(os.PathSeparator)+"usr"+string(os.PathSeparator))
 }
 
 func runtimeBackstoreName(publication *domain.TargetPublication) string {
@@ -808,6 +839,7 @@ func safeActor(actor string) string {
 }
 
 var targetcliTokenPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+var targetcliSubtypePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 func validateTargetPublicationForRuntime(publication *domain.TargetPublication) error {
 	if publication == nil {
@@ -829,6 +861,34 @@ func validateTargetPublicationForRuntime(publication *domain.TargetPublication) 
 }
 
 func validateTargetcliArgs(args ...string) error {
+	if err := validateTargetcliArgTokens(args...); err != nil {
+		return err
+	}
+	if len(args) < 2 {
+		return domain.ErrInvalidInput
+	}
+	path, action := args[0], args[1]
+	rest := args[2:]
+
+	switch {
+	case path == "/backstores" && action == "ls":
+		return requireNoTargetcliArgs(rest)
+	case path == "/backstores/fileio":
+		return validateFileioTargetcliCommand(action, rest)
+	case strings.HasPrefix(path, "/backstores/user:"):
+		return validateUserBackstoreTargetcliCommand(path, action, rest)
+	case path == "/iscsi":
+		return validateISCSITargetcliCommand(action, rest)
+	case strings.HasPrefix(path, "/iscsi/") && strings.HasSuffix(path, "/tpg1"):
+		return validateTPGTargetcliCommand(path, action, rest)
+	case strings.HasPrefix(path, "/iscsi/") && strings.HasSuffix(path, "/tpg1/luns"):
+		return validateLUNTargetcliCommand(path, action, rest)
+	default:
+		return domain.ErrInvalidInput
+	}
+}
+
+func validateTargetcliArgTokens(args ...string) error {
 	for _, arg := range args {
 		if strings.TrimSpace(arg) == "" || strings.ContainsRune(arg, '\x00') || strings.ContainsAny(arg, "\r\n") {
 			return domain.ErrInvalidInput
@@ -836,17 +896,162 @@ func validateTargetcliArgs(args ...string) error {
 		if strings.Contains(arg, "..") {
 			return domain.ErrInvalidInput
 		}
-		if strings.HasPrefix(arg, "/iscsi/") {
-			iqn := strings.Trim(strings.TrimPrefix(arg, "/iscsi/"), "/")
-			if idx := strings.Index(iqn, "/"); idx >= 0 {
-				iqn = iqn[:idx]
-			}
-			if _, err := normalizeTargetIQN(iqn, ""); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
+}
+
+func requireNoTargetcliArgs(args []string) error {
+	if len(args) != 0 {
+		return domain.ErrInvalidInput
+	}
+	return nil
+}
+
+func validateFileioTargetcliCommand(action string, args []string) error {
+	switch action {
+	case "create":
+		if len(args) != 3 || !hasSafeAssignment(args[0], "name", isSafeTargetcliToken) ||
+			!hasAbsolutePathAssignment(args[1], "file_or_dev") || !isSizeArg(args[2]) {
+			return domain.ErrInvalidInput
+		}
+		return nil
+	case "delete":
+		if len(args) != 1 || !isSafeTargetcliToken(args[0]) {
+			return domain.ErrInvalidInput
+		}
+		return nil
+	default:
+		return domain.ErrInvalidInput
+	}
+}
+
+func validateUserBackstoreTargetcliCommand(path, action string, args []string) error {
+	subtype := strings.TrimPrefix(path, "/backstores/user:")
+	if !targetcliSubtypePattern.MatchString(subtype) {
+		return domain.ErrInvalidInput
+	}
+	switch action {
+	case "create":
+		if len(args) != 3 || !hasSafeAssignment(args[0], "name", isSafeTargetcliToken) ||
+			!isSizeArg(args[1]) || !hasAbsolutePathAssignment(args[2], "cfgstring") {
+			return domain.ErrInvalidInput
+		}
+		return nil
+	case "delete":
+		if len(args) != 1 || !isSafeTargetcliToken(args[0]) {
+			return domain.ErrInvalidInput
+		}
+		return nil
+	default:
+		return domain.ErrInvalidInput
+	}
+}
+
+func validateISCSITargetcliCommand(action string, args []string) error {
+	if len(args) != 1 || (action != "create" && action != "delete") {
+		return domain.ErrInvalidInput
+	}
+	_, err := normalizeTargetIQN(args[0], "")
+	return err
+}
+
+func validateTPGTargetcliCommand(path, action string, args []string) error {
+	iqn, ok := iqnFromTPGPath(path, "/tpg1")
+	if !ok {
+		return domain.ErrInvalidInput
+	}
+	if _, err := normalizeTargetIQN(iqn, ""); err != nil {
+		return err
+	}
+	if action != "set" || len(args) < 2 {
+		return domain.ErrInvalidInput
+	}
+	switch args[0] {
+	case "attribute":
+		for _, item := range args[1:] {
+			if !containsString(tcmuTargetcliTPGAttributes, item) {
+				return domain.ErrInvalidInput
+			}
+		}
+		return nil
+	case "parameter":
+		if len(args) != 2 {
+			return domain.ErrInvalidInput
+		}
+		if containsString(tcmuISCSIDataPathParameters, args[1]) {
+			return nil
+		}
+		return domain.ErrInvalidInput
+	default:
+		return domain.ErrInvalidInput
+	}
+}
+
+func validateLUNTargetcliCommand(path, action string, args []string) error {
+	iqn, ok := iqnFromTPGPath(path, "/tpg1/luns")
+	if !ok {
+		return domain.ErrInvalidInput
+	}
+	if _, err := normalizeTargetIQN(iqn, ""); err != nil {
+		return err
+	}
+	if action != "create" || len(args) != 1 {
+		return domain.ErrInvalidInput
+	}
+	return validateBackstoreRef(args[0])
+}
+
+func iqnFromTPGPath(path, suffix string) (string, bool) {
+	if !strings.HasPrefix(path, "/iscsi/") || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	iqn := strings.TrimSuffix(strings.TrimPrefix(path, "/iscsi/"), suffix)
+	iqn = strings.Trim(iqn, "/")
+	return iqn, iqn != ""
+}
+
+func validateBackstoreRef(ref string) error {
+	if strings.HasPrefix(ref, "/backstores/fileio/") {
+		name := strings.TrimPrefix(ref, "/backstores/fileio/")
+		if isSafeTargetcliToken(name) {
+			return nil
+		}
+		return domain.ErrInvalidInput
+	}
+	if strings.HasPrefix(ref, "/backstores/user:") {
+		parts := strings.Split(strings.TrimPrefix(ref, "/backstores/user:"), "/")
+		if len(parts) == 2 && targetcliSubtypePattern.MatchString(parts[0]) && isSafeTargetcliToken(parts[1]) {
+			return nil
+		}
+	}
+	return domain.ErrInvalidInput
+}
+
+func hasSafeAssignment(arg, key string, validator func(string) bool) bool {
+	value, ok := strings.CutPrefix(arg, key+"=")
+	return ok && validator(value)
+}
+
+func hasAbsolutePathAssignment(arg, key string) bool {
+	value, ok := strings.CutPrefix(arg, key+"=")
+	return ok && strings.HasPrefix(value, "/") && !strings.Contains(value, "..") && !strings.ContainsAny(value, "\x00\r\n")
+}
+
+func isSizeArg(arg string) bool {
+	value, ok := strings.CutPrefix(arg, "size=")
+	if !ok || !strings.HasSuffix(value, "M") {
+		return false
+	}
+	digits := strings.TrimSuffix(value, "M")
+	if digits == "" {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isSafeTargetcliToken(value string) bool {
