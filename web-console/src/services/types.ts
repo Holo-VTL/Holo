@@ -85,6 +85,7 @@ export interface VirtualCartridge {
   usedBytes: number;
   lifecycleState: string;
   retentionState: string;
+  currentElementAddress?: number;
   createdAt: string;
   updatedAt: string;
 }

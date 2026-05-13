@@ -10,9 +10,9 @@ import { ResourceManagePage } from "./ResourceManagePage";
 vi.mock("../services/api", () => ({
   api: {
     resources: {
-      listLibraries: vi.fn().mockResolvedValue([{ libraryId: "lib-a", name: "Lib A", status: "online", slotCount: 10, driveType: "IBM-LTO6" }]),
+      listLibraries: vi.fn().mockResolvedValue([{ libraryId: "lib-a", name: "Lib A", status: "online", slotCount: 12, slotStartAddress: 1024, driveType: "IBM-LTO6" }]),
       listDrives: vi.fn().mockResolvedValue([{ driveId: "drive-a", libraryId: "lib-a", slot: 1, mountState: "empty" }]),
-      listCartridges: vi.fn().mockResolvedValue([{ cartridgeId: "VTA000L06", poolId: "pool-a", libraryId: "lib-a", barcode: "VTA000L06", capacityBytes: 1000, usedBytes: 100, lifecycleState: "available", retentionState: "none" }]),
+      listCartridges: vi.fn().mockResolvedValue([{ cartridgeId: "VTA000L06", poolId: "pool-a", libraryId: "lib-a", barcode: "VTA000L06", capacityBytes: 1000, usedBytes: 100, lifecycleState: "available", retentionState: "none", currentElementAddress: 1034 }]),
       createLibrary: vi.fn(),
       createDrive: vi.fn(),
       createCartridge: vi.fn(),
@@ -54,5 +54,11 @@ describe("ResourceManagePage", () => {
     expect(await screen.findByRole("button", { name: "Destroy Cartridge" })).toBeEnabled();
     await userEvent.click(screen.getByRole("button", { name: "Short Erase" }));
     expect(await screen.findByText(/Existing tape contents will be cleared/)).toBeInTheDocument();
+  });
+
+  it("places cartridges by reported element address", async () => {
+    renderManagePage();
+    const cartridgeSlot = await screen.findByTitle("VTA000L06 (VTA000L06)");
+    expect(cartridgeSlot).toHaveAttribute("data-slot-address", "1034");
   });
 });

@@ -196,20 +196,48 @@ export function ResourceManagePage() {
     [library?.driveType]
   );
 
-  const slotCount = Math.max(library?.slotCount || 0, slotCartridges.length, 1);
+  const slotStartAddress = library?.slotStartAddress ?? 1;
+  const reportedMaxSlotIndex = slotCartridges.reduce((maxIndex, cartridge) => {
+    if (cartridge.currentElementAddress == null || cartridge.currentElementAddress < slotStartAddress) {
+      return maxIndex;
+    }
+    return Math.max(maxIndex, cartridge.currentElementAddress - slotStartAddress);
+  }, -1);
+  const slotCount = Math.max(library?.slotCount || 0, reportedMaxSlotIndex + 1, slotCartridges.length, 1);
   const occupiedSlots = Math.min(slotCartridges.length, slotCount);
   const emptySlots = Math.max(slotCount - occupiedSlots, 0);
 
   const slotCells = useMemo(() => {
+    const cartridgesByIndex = new Map<number, VirtualCartridge>();
+    const unplaced: VirtualCartridge[] = [];
+    for (const cartridge of slotCartridges) {
+      const address = cartridge.currentElementAddress;
+      const index = address == null ? -1 : address - slotStartAddress;
+      if (index >= 0 && index < slotCount && !cartridgesByIndex.has(index)) {
+        cartridgesByIndex.set(index, cartridge);
+      } else {
+        unplaced.push(cartridge);
+      }
+    }
+    let nextFreeIndex = 0;
+    for (const cartridge of unplaced) {
+      while (nextFreeIndex < slotCount && cartridgesByIndex.has(nextFreeIndex)) {
+        nextFreeIndex += 1;
+      }
+      if (nextFreeIndex >= slotCount) {
+        break;
+      }
+      cartridgesByIndex.set(nextFreeIndex, cartridge);
+      nextFreeIndex += 1;
+    }
     return Array.from({ length: slotCount }, (_, index) => {
-      const cartridge = slotCartridges[index];
       return {
         index,
-        address: (library?.slotStartAddress || 1) + index,
-        cartridge,
+        address: slotStartAddress + index,
+        cartridge: cartridgesByIndex.get(index),
       };
     });
-  }, [slotCount, slotCartridges, library?.slotStartAddress]);
+  }, [slotCount, slotCartridges, slotStartAddress]);
 
   const selectedDrive = useMemo(() => {
     if (!selectedNode || selectedNode.kind !== "drive") {
@@ -748,6 +776,7 @@ export function ResourceManagePage() {
                           key={`${cell.address}-${cell.index}`}
                           className={`${cell.cartridge ? "slot-cell slot-cell-used tape-slot" : "slot-cell"} ${selected ? "topology-node-active" : ""}`}
                           title={cell.cartridge ? `${cell.cartridge.barcode} (${cell.cartridge.cartridgeId})` : `${t("resources.slot")}-${cell.address}`}
+                          data-slot-address={cell.address}
                           type="button"
                           onClick={() =>
                             setSelectedNode(
