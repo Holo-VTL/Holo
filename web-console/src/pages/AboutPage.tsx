@@ -197,7 +197,7 @@ export function AboutPage() {
             </div>
             <div>
               <dt>{t("about.copyright")}</dt>
-              <dd>Copyright (c) 2026 Lei Wei</dd>
+              <dd>© 2026 Lei Wei</dd>
             </div>
           </dl>
         </section>
