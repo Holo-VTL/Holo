@@ -1991,7 +1991,7 @@ func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []
 	hasExistingInventory := false
 	for idx := 0; idx < slotCount && idx < len(existing); idx++ {
 		label := strings.TrimSpace(existing[idx])
-		if _, ok := active[label]; ok {
+		if label != "" && label != "-" {
 			hasExistingInventory = true
 			break
 		}

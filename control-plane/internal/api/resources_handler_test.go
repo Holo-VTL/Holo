@@ -744,6 +744,31 @@ func TestLibrarySlotSyncLeavesDeletedSlotEmptyWithUnassignedBacklog(t *testing.T
 	}
 }
 
+func TestLibrarySlotSyncClearsStaleInventoryWithoutFillingBacklog(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+
+	srv := newTestServer(t)
+	setupSlotFlowLibrary(t, srv, "lib-stale-inventory", "drive-stale-inventory", 2)
+	createUnassignedSlotFlowCartridge(t, srv, "lib-stale-inventory", "VTA003L06")
+
+	slotsPath := filepath.Join(mediaStateDir, "lib-stale-inventory__drive-stale-inventory.slots")
+	if err := os.WriteFile(slotsPath, []byte("VTA001L06\n-\n"), 0o644); err != nil {
+		t.Fatalf("write stale slots: %v", err)
+	}
+
+	if err := srv.resources.syncLibrarySlotsToSharedState(context.Background(), "lib-stale-inventory"); err != nil {
+		t.Fatalf("sync library slots: %v", err)
+	}
+	slots := readExistingSlotLabels("lib-stale-inventory", "drive-stale-inventory")
+	if len(slots) != 2 {
+		t.Fatalf("expected 2 slots after stale repair, got %#v", slots)
+	}
+	if slots[0] != "" || slots[1] != "" {
+		t.Fatalf("expected stale inventory to clear without filling backlog, got %#v", slots)
+	}
+}
+
 func TestLibrarySlotSyncBootstrapsUnassignedCartridgesWithoutExistingInventory(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
