@@ -2216,6 +2216,8 @@ func isShortEraseLayoutArtifact(name string) bool {
 }
 
 func (h *ResourcesHandler) deleteLibraryCascade(ctx context.Context, libraryID string) error {
+	h.slotMu.Lock()
+	defer h.slotMu.Unlock()
 	if _, err := h.repo.FindLibrary(ctx, libraryID); err != nil {
 		return err
 	}
