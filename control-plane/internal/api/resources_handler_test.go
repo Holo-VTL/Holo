@@ -656,6 +656,67 @@ func TestLibrarySlotCountSyncWritesAllConfiguredSlots(t *testing.T) {
 	}
 }
 
+func TestAddLibrarySlotDoesNotCreateCartridge(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+
+	srv := newTestServer(t)
+	setupSlotFlowLibrary(t, srv, "lib-add-empty-slot", "drive-add-empty-slot", 2)
+	createSlotFlowCartridge(t, srv, "lib-add-empty-slot", "VTA000L06", false)
+	createSlotFlowCartridge(t, srv, "lib-add-empty-slot", "VTA001L06", false)
+
+	addReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-empty-slot/slots", bytes.NewBufferString(`{"count":1,"actor":"web-console"}`))
+	addResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(addResp, addReq)
+	if addResp.Code != http.StatusOK {
+		t.Fatalf("expected add slot 200, got %d body=%s", addResp.Code, addResp.Body.String())
+	}
+
+	cartridges := srv.resources.repo.ListCartridges(context.Background())
+	count := 0
+	for _, cartridge := range cartridges {
+		if cartridge != nil && cartridge.LibraryID == "lib-add-empty-slot" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("expected add slot to leave cartridge count at 2, got %d", count)
+	}
+	slots := readExistingSlotLabels("lib-add-empty-slot", "drive-add-empty-slot")
+	if len(slots) != 3 {
+		t.Fatalf("expected 3 slots after expansion, got %#v", slots)
+	}
+	if slots[0] != "VTA000L06" || slots[1] != "VTA001L06" || slots[2] != "" {
+		t.Fatalf("expected new slot to be empty, got %#v", slots)
+	}
+}
+
+func TestLibrarySlotSyncRepairsDuplicateExistingLabels(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+
+	srv := newTestServer(t)
+	setupSlotFlowLibrary(t, srv, "lib-duplicate-slot-labels", "drive-duplicate-slot-labels", 3)
+	createSlotFlowCartridge(t, srv, "lib-duplicate-slot-labels", "VTA000L06", false)
+	createSlotFlowCartridge(t, srv, "lib-duplicate-slot-labels", "VTA001L06", false)
+
+	slotsPath := filepath.Join(mediaStateDir, "lib-duplicate-slot-labels__drive-duplicate-slot-labels.slots")
+	if err := os.WriteFile(slotsPath, []byte("VTA000L06\nVTA001L06\nVTA000L06\n"), 0o644); err != nil {
+		t.Fatalf("write corrupted slots: %v", err)
+	}
+
+	if err := srv.resources.syncLibrarySlotsToSharedState(context.Background(), "lib-duplicate-slot-labels"); err != nil {
+		t.Fatalf("sync library slots: %v", err)
+	}
+	slots := readExistingSlotLabels("lib-duplicate-slot-labels", "drive-duplicate-slot-labels")
+	if len(slots) != 3 {
+		t.Fatalf("expected 3 slots after repair, got %#v", slots)
+	}
+	if slots[0] != "VTA000L06" || slots[1] != "VTA001L06" || slots[2] != "" {
+		t.Fatalf("expected duplicate label to be cleared, got %#v", slots)
+	}
+}
+
 func TestLibrarySlotSyncExcludesLoadedDriveMedia(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)

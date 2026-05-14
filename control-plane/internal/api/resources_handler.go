@@ -1125,6 +1125,8 @@ func (h *ResourcesHandler) assignSlotForNewCartridge(ctx context.Context, librar
 	if err != nil {
 		return 0, false, err
 	}
+	cartridges = h.repo.ListCartridges(ctx)
+	labelSlots = h.libraryLabelSlots(ctx, updated)
 	if slot, ok := h.nextEmptySlotAddressFromSnapshot(updated, cartridges, labelSlots); ok {
 		return slot, true, nil
 	}
@@ -1994,6 +1996,9 @@ func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []
 		if label == "" {
 			continue
 		}
+		if _, ok := placed[label]; ok {
+			continue
+		}
 		idx := *cartridge.AssignedSlotAddress - slotStart
 		if idx < 0 || idx >= len(labels) {
 			continue
@@ -2015,6 +2020,10 @@ func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []
 			continue
 		}
 		if _, ok := active[label]; ok {
+			if _, alreadyPlaced := placed[label]; alreadyPlaced {
+				labels[idx] = "-"
+				continue
+			}
 			labels[idx] = label
 			placed[label] = struct{}{}
 		} else {
