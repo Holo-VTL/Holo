@@ -18,6 +18,8 @@ type DeleteTarget =
 
 type EraseTarget = { id: string; mode: "short" | "long" } | null;
 
+type SlotShortageImportTarget = { cartridgeId: string; barcode: string } | null;
+
 type TopologySelection =
   | { kind: "library" }
   | { kind: "drive"; id: string }
@@ -128,6 +130,7 @@ export function ResourceManagePage() {
   const [busyDelete, setBusyDelete] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [eraseTarget, setEraseTarget] = useState<EraseTarget>(null);
+  const [slotShortageImportTarget, setSlotShortageImportTarget] = useState<SlotShortageImportTarget>(null);
   const [selectedNode, setSelectedNode] = useState<TopologySelection>({ kind: "library" });
 
   const [driveForm, setDriveForm] = useState({ driveId: "", slot: 1 });
@@ -504,6 +507,34 @@ export function ResourceManagePage() {
       await api.resources.importCartridge(cartridge.cartridgeId);
       push(t("messages.requestSuccess"), "success");
       setSelectedNode({ kind: "cartridge", id: cartridge.cartridgeId });
+      await reloadAll();
+    } catch (err) {
+      const apiErr = err as Partial<ApiError>;
+      if (apiErr?.status === 409) {
+        setSlotShortageImportTarget({ cartridgeId: cartridge.cartridgeId, barcode: cartridge.barcode });
+        return;
+      }
+      const message = actionErrorMessage(err);
+      setError(message);
+      push(message, "error");
+    } finally {
+      setBusyResourceAction("");
+    }
+  }
+
+  async function addSlotAndImportCartridge() {
+    if (!library || !slotShortageImportTarget) {
+      return;
+    }
+    const target = slotShortageImportTarget;
+    setBusyResourceAction(`add-slot-import:${target.cartridgeId}`);
+    setError("");
+    try {
+      await api.resources.addLibrarySlots(library.libraryId, { count: 1, actor: "web-console" });
+      await api.resources.importCartridge(target.cartridgeId);
+      push(t("messages.requestSuccess"), "success");
+      setSelectedNode({ kind: "cartridge", id: target.cartridgeId });
+      setSlotShortageImportTarget(null);
       await reloadAll();
     } catch (err) {
       const message = actionErrorMessage(err);
@@ -1260,6 +1291,21 @@ export function ResourceManagePage() {
         onCancel={() => {
           if (!busyResourceAction) {
             setEraseTarget(null);
+          }
+        }}
+      />
+      <ConfirmDialog
+        open={Boolean(slotShortageImportTarget)}
+        title={t("resources.importSlotShortageTitle")}
+        message={t("resources.importSlotShortageMessage", {
+          cartridgeId: slotShortageImportTarget?.barcode || slotShortageImportTarget?.cartridgeId || "",
+        })}
+        confirmLabel={t("resources.addSlotAndImport")}
+        busy={busyResourceAction.startsWith("add-slot-import:")}
+        onConfirm={() => void addSlotAndImportCartridge()}
+        onCancel={() => {
+          if (!busyResourceAction) {
+            setSlotShortageImportTarget(null);
           }
         }}
       />

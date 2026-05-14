@@ -92,4 +92,49 @@ describe("ResourceManagePage", () => {
       expect.objectContaining({ expandSlots: true })
     );
   });
+
+  it("offers to add a slot when vault import has no empty slot", async () => {
+    vi.mocked(api.resources.listCartridges).mockResolvedValue([
+      {
+        cartridgeId: "VTA000L06",
+        poolId: "pool-a",
+        libraryId: "lib-a",
+        barcode: "VTA000L06",
+        capacityBytes: 1000,
+        usedBytes: 100,
+        lifecycleState: "exported",
+        retentionState: "none",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    ]);
+    vi.mocked(api.resources.importCartridge)
+      .mockRejectedValueOnce(Object.assign(new Error("conflict"), { status: 409 }))
+      .mockResolvedValueOnce({
+        cartridgeId: "VTA000L06",
+        poolId: "pool-a",
+        libraryId: "lib-a",
+        barcode: "VTA000L06",
+        capacityBytes: 1000,
+        usedBytes: 100,
+        lifecycleState: "available",
+        retentionState: "none",
+        currentElementAddress: 1035,
+        assignedSlotAddress: 1035,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+    renderManagePage();
+    await userEvent.click(await screen.findByText("VTA000L06"));
+    await userEvent.click(await screen.findByRole("button", { name: "Import from Vault" }));
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(await screen.findByText("No empty slots")).toBeInTheDocument();
+    expect(screen.getByText(/move another cartridge to Vault/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Add Slot and Import" }));
+    expect(api.resources.addLibrarySlots).toHaveBeenCalledWith("lib-a", { count: 1, actor: "web-console" });
+    expect(api.resources.importCartridge).toHaveBeenCalledTimes(2);
+  });
 });
