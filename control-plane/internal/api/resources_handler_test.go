@@ -1282,6 +1282,46 @@ func TestCreateCartridgeRequiresExplicitSlotExpansionWhenFull(t *testing.T) {
 	}
 }
 
+func TestExpandedCartridgeCreateFailureRollsBackSlotExpansion(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	setupSlotFlowLibrary(t, srv, "lib-expand-rollback", "drive-expand-rollback", 1)
+	createSlotFlowCartridge(t, srv, "lib-expand-rollback", "VTA070L06", false)
+
+	duplicateReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-lib-expand-rollback","cartridgeId":"VTA070L06","libraryId":"lib-expand-rollback","barcode":"VTA070L06","capacityBytes":549755813888,"expandSlots":true}`))
+	duplicateResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(duplicateResp, duplicateReq)
+	if duplicateResp.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate expanded cartridge create 409, got %d body=%s", duplicateResp.Code, duplicateResp.Body.String())
+	}
+
+	getLibReq := newAuthedRequest(http.MethodGet, "/v1/libraries/lib-expand-rollback", nil)
+	getLibResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getLibResp, getLibReq)
+	if getLibResp.Code != http.StatusOK {
+		t.Fatalf("expected library get 200, got %d body=%s", getLibResp.Code, getLibResp.Body.String())
+	}
+	var library domain.VirtualLibrary
+	if err := json.Unmarshal(getLibResp.Body.Bytes(), &library); err != nil {
+		t.Fatalf("decode library: %v", err)
+	}
+	if library.SlotCount != 1 {
+		t.Fatalf("expected failed expanded create to roll slot count back to 1, got %d", library.SlotCount)
+	}
+
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if auditResp.Code != http.StatusOK {
+		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
+	}
+	if strings.Contains(auditResp.Body.String(), "create_cartridge_expand_slots") {
+		t.Fatalf("did not expect expansion audit for failed cartridge create, got %s", auditResp.Body.String())
+	}
+}
+
 func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
@@ -1342,6 +1382,36 @@ func TestMissingLibraryDoesNotAllocateSlotLock(t *testing.T) {
 	defer srv.resources.slotLocksMu.Unlock()
 	if got := len(srv.resources.slotLocks); got != 0 {
 		t.Fatalf("expected no slot locks allocated for missing library requests, got %d", got)
+	}
+}
+
+func TestDeleteLibraryRemovesSlotLock(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	setupSlotFlowLibrary(t, srv, "lib-delete-lock", "drive-delete-lock", 1)
+	if _, err := srv.resources.addLibrarySlots(context.Background(), "lib-delete-lock", 1, "tester"); err != nil {
+		t.Fatalf("seed slot lock: %v", err)
+	}
+	srv.resources.slotLocksMu.Lock()
+	if got := len(srv.resources.slotLocks); got != 1 {
+		srv.resources.slotLocksMu.Unlock()
+		t.Fatalf("expected one slot lock before delete, got %d", got)
+	}
+	srv.resources.slotLocksMu.Unlock()
+
+	deleteReq := newAuthedRequest(http.MethodDelete, "/v1/libraries/lib-delete-lock", nil)
+	deleteResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(deleteResp, deleteReq)
+	if deleteResp.Code != http.StatusNoContent {
+		t.Fatalf("expected library delete 204, got %d body=%s", deleteResp.Code, deleteResp.Body.String())
+	}
+
+	srv.resources.slotLocksMu.Lock()
+	defer srv.resources.slotLocksMu.Unlock()
+	if got := len(srv.resources.slotLocks); got != 0 {
+		t.Fatalf("expected slot lock removed after library delete, got %d", got)
 	}
 }
 
