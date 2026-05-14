@@ -122,6 +122,19 @@ export function ResourcesPage() {
     }
   }, [driveTypeOptions, vtlForm.driveType]);
 
+  useEffect(() => {
+    if (!vtlDialogOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setVtlDialogOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [vtlDialogOpen]);
+
   async function createVtl(event: FormEvent) {
     event.preventDefault();
     const trimmedName = vtlForm.name.trim();
@@ -253,9 +266,6 @@ export function ResourcesPage() {
           <div className="modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <h3 style={{ margin: 0 }}>{t("resources.createVtlDialogTitle")}</h3>
-              <button className="btn btn-quiet" type="button" onClick={() => setVtlDialogOpen(false)}>
-                {t("common.close")}
-              </button>
             </div>
             <form className="form-grid" onSubmit={createVtl}>
               <div className="form-row">

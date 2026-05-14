@@ -260,6 +260,14 @@ func cloneCartridge(in *domain.VirtualCartridge) *domain.VirtualCartridge {
 		return nil
 	}
 	cp := *in
+	if in.CurrentElementAddress != nil {
+		value := *in.CurrentElementAddress
+		cp.CurrentElementAddress = &value
+	}
+	if in.AssignedSlotAddress != nil {
+		value := *in.AssignedSlotAddress
+		cp.AssignedSlotAddress = &value
+	}
 	return &cp
 }
 

@@ -18,6 +18,8 @@ type DeleteTarget =
 
 type EraseTarget = { id: string; mode: "short" | "long" } | null;
 
+type SlotShortageImportTarget = { cartridgeId: string; barcode: string } | null;
+
 type TopologySelection =
   | { kind: "library" }
   | { kind: "drive"; id: string }
@@ -128,6 +130,7 @@ export function ResourceManagePage() {
   const [busyDelete, setBusyDelete] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [eraseTarget, setEraseTarget] = useState<EraseTarget>(null);
+  const [slotShortageImportTarget, setSlotShortageImportTarget] = useState<SlotShortageImportTarget>(null);
   const [selectedNode, setSelectedNode] = useState<TopologySelection>({ kind: "library" });
 
   const [driveForm, setDriveForm] = useState({ driveId: "", slot: 1 });
@@ -138,6 +141,7 @@ export function ResourceManagePage() {
     quantity: "1",
     customCapacityValue: "",
     customCapacityUnit: "TB" as CapacityUnit,
+    expandSlots: false,
   });
   const [loadTargetDriveId, setLoadTargetDriveId] = useState("");
 
@@ -203,9 +207,11 @@ export function ResourceManagePage() {
     }
     return Math.max(maxIndex, cartridge.currentElementAddress - slotStartAddress);
   }, -1);
-  const slotCount = Math.max(library?.slotCount || 0, reportedMaxSlotIndex + 1, slotCartridges.length, 1);
+  const slotCount = Math.max(library?.slotCount || 0, reportedMaxSlotIndex + 1, 1);
   const occupiedSlots = Math.min(slotCartridges.length, slotCount);
   const emptySlots = Math.max(slotCount - occupiedSlots, 0);
+  const requestedCartridgeCount = Number.parseInt(cartridgeForm.quantity, 10);
+  const cartridgeCreateNeedsSlots = Number.isFinite(requestedCartridgeCount) && requestedCartridgeCount > emptySlots;
 
   const slotCells = useMemo(() => {
     const cartridgesByIndex = new Map<number, VirtualCartridge>();
@@ -297,8 +303,24 @@ export function ResourceManagePage() {
       quantity: prev.quantity.trim() === "" ? "1" : prev.quantity,
       customCapacityValue: prev.customCapacityValue,
       customCapacityUnit: prev.customCapacityUnit,
+      expandSlots: cartridgeCreateNeedsSlots ? prev.expandSlots : false,
     }));
-  }, [createCartridgeOpen, usablePools]);
+  }, [cartridgeCreateNeedsSlots, createCartridgeOpen, usablePools]);
+
+  useEffect(() => {
+    if (!createDriveOpen && !createCartridgeOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      setCreateDriveOpen(false);
+      setCreateCartridgeOpen(false);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [createCartridgeOpen, createDriveOpen]);
 
   async function reloadAll() {
     setError("");
@@ -359,6 +381,10 @@ export function ResourceManagePage() {
       push(t("resources.cartridgePrefixHint"), "error");
       return;
     }
+    if (quantity > emptySlots && !cartridgeForm.expandSlots) {
+      push(t("resources.addSlotRequired"), "error");
+      return;
+    }
     setBusyCreateCartridge(true);
     try {
       const prefix = normalizeCartridgePrefix(cartridgeForm.prefix);
@@ -382,6 +408,7 @@ export function ResourceManagePage() {
           capacityBytes,
           ltoGeneration: tapeProfile.ltoGeneration,
           mediaType: `LTO${tapeProfile.ltoGeneration}`,
+          expandSlots: cartridgeForm.expandSlots,
         });
       }
       push(t("messages.requestSuccess"), "success");
@@ -393,12 +420,32 @@ export function ResourceManagePage() {
         quantity: "1",
         customCapacityValue: "",
         customCapacityUnit: "TB",
+        expandSlots: false,
       });
       await reloadAll();
     } catch (err) {
       push((err as Error).message || t("messages.requestFailed"), "error");
     } finally {
       setBusyCreateCartridge(false);
+    }
+  }
+
+  async function addSlot() {
+    if (!library) {
+      return;
+    }
+    setBusyResourceAction("add-slot");
+    setError("");
+    try {
+      await api.resources.addLibrarySlots(library.libraryId, { count: 1, actor: "web-console" });
+      push(t("messages.requestSuccess"), "success");
+      await reloadAll();
+    } catch (err) {
+      const message = actionErrorMessage(err);
+      setError(message);
+      push(message, "error");
+    } finally {
+      setBusyResourceAction("");
     }
   }
 
@@ -475,6 +522,34 @@ export function ResourceManagePage() {
       await api.resources.importCartridge(cartridge.cartridgeId);
       push(t("messages.requestSuccess"), "success");
       setSelectedNode({ kind: "cartridge", id: cartridge.cartridgeId });
+      await reloadAll();
+    } catch (err) {
+      const apiErr = err as Partial<ApiError>;
+      if (apiErr?.status === 409) {
+        setSlotShortageImportTarget({ cartridgeId: cartridge.cartridgeId, barcode: cartridge.barcode });
+        return;
+      }
+      const message = actionErrorMessage(err);
+      setError(message);
+      push(message, "error");
+    } finally {
+      setBusyResourceAction("");
+    }
+  }
+
+  async function addSlotAndImportCartridge() {
+    if (!library || !slotShortageImportTarget) {
+      return;
+    }
+    const target = slotShortageImportTarget;
+    setBusyResourceAction(`add-slot-import:${target.cartridgeId}`);
+    setError("");
+    try {
+      await api.resources.addLibrarySlots(library.libraryId, { count: 1, actor: "web-console" });
+      await api.resources.importCartridge(target.cartridgeId);
+      push(t("messages.requestSuccess"), "success");
+      setSelectedNode({ kind: "cartridge", id: target.cartridgeId });
+      setSlotShortageImportTarget(null);
       await reloadAll();
     } catch (err) {
       const message = actionErrorMessage(err);
@@ -808,9 +883,14 @@ export function ResourceManagePage() {
                         </button>
                       );
                     })}
-                    <button className="topology-add-slot" type="button" onClick={() => setCreateCartridgeOpen(true)}>
+                    <button
+                      className="topology-add-slot"
+                      type="button"
+                      disabled={busyResourceAction === "add-slot"}
+                      onClick={() => void addSlot()}
+                    >
                       <Plus size={16} />
-                      <span>{t("resources.addCartridge")}</span>
+                      <span>{busyResourceAction === "add-slot" ? t("common.loading") : t("resources.addSlot")}</span>
                     </button>
                   </div>
                 </div>
@@ -1050,9 +1130,6 @@ export function ResourceManagePage() {
           <div className="modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <h3 style={{ margin: 0 }}>{t("resources.addDrive")}</h3>
-              <button className="btn btn-quiet" type="button" onClick={() => setCreateDriveOpen(false)}>
-                {t("common.close")}
-              </button>
             </div>
             <form className="form-grid" onSubmit={createDrive}>
               <div className="form-row">
@@ -1078,10 +1155,9 @@ export function ResourceManagePage() {
           <div className="modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <h3 style={{ margin: 0 }}>{t("resources.addCartridge")}</h3>
-              <button className="btn btn-quiet" type="button" onClick={() => setCreateCartridgeOpen(false)}>{t("common.close")}</button>
             </div>
             <form className="form-grid" onSubmit={createCartridge}>
-              <div className="form-row">
+              <div className="form-row form-row-wide">
                 <label>{t("resources.poolName")}</label>
                 <SelectInput
                   value={cartridgeForm.poolId}
@@ -1109,8 +1185,9 @@ export function ResourceManagePage() {
                 />
               </div>
               <div className="form-row">
-                <label>{t("resources.cartridgeCount")}</label>
+                <label htmlFor="cartridge-count-input">{t("resources.cartridgeCount")}</label>
                 <input
+                  id="cartridge-count-input"
                   className="input"
                   type="number"
                   min={1}
@@ -1127,6 +1204,21 @@ export function ResourceManagePage() {
                   required
                 />
               </div>
+              {cartridgeCreateNeedsSlots ? (
+                <div className="modal-notice modal-notice-stack" style={{ gridColumn: "1 / -1" }}>
+                  <span>{t("resources.addSlotRequiredDescription", { count: Math.max(requestedCartridgeCount - emptySlots, 1) })}</span>
+                  <label className="checkbox-inline" style={{ marginTop: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={cartridgeForm.expandSlots}
+                      onChange={(event) =>
+                        setCartridgeForm((prev) => ({ ...prev, expandSlots: event.target.checked }))
+                      }
+                    />
+                    <span>{t("resources.addSlotAndInsert")}</span>
+                  </label>
+                </div>
+              ) : null}
               <div className="inline-actions" style={{ gridColumn: "1 / -1", justifyContent: "flex-start" }}>
                 <button
                   className="btn btn-quiet"
@@ -1210,6 +1302,21 @@ export function ResourceManagePage() {
         onCancel={() => {
           if (!busyResourceAction) {
             setEraseTarget(null);
+          }
+        }}
+      />
+      <ConfirmDialog
+        open={Boolean(slotShortageImportTarget)}
+        title={t("resources.importSlotShortageTitle")}
+        message={t("resources.importSlotShortageMessage", {
+          cartridgeId: slotShortageImportTarget?.barcode || slotShortageImportTarget?.cartridgeId || "",
+        })}
+        confirmLabel={t("resources.addSlotAndImport")}
+        busy={busyResourceAction.startsWith("add-slot-import:")}
+        onConfirm={() => void addSlotAndImportCartridge()}
+        onCancel={() => {
+          if (!busyResourceAction) {
+            setSlotShortageImportTarget(null);
           }
         }}
       />

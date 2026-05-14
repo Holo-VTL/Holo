@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 type ConfirmDialogProps = {
@@ -23,6 +23,19 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const { t } = useTranslation();
+  useEffect(() => {
+    if (!open || busy) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onCancel();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [busy, onCancel, open]);
+
   if (!open) {
     return null;
   }
@@ -32,11 +45,8 @@ export function ConfirmDialog({
       <div className="modal-card" onClick={(event) => event.stopPropagation()}>
         <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>{title}</h3>
-          <button className="btn btn-quiet" type="button" onClick={onCancel}>
-            {t("common.close")}
-          </button>
         </div>
-        <div className="notice" style={{ marginBottom: 12 }}>{message}</div>
+        <div className="modal-notice" style={{ marginBottom: 12 }}>{message}</div>
         <div className="inline-actions">
           <button className={`btn ${danger ? "btn-danger" : "btn-primary"}`} type="button" onClick={onConfirm} disabled={busy}>
             {busy ? t("common.loading") : confirmLabel || t("common.confirm")}

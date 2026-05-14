@@ -69,6 +69,19 @@ export function StoragePage() {
     });
   }, [availableDisks, createDialogOpen]);
 
+  useEffect(() => {
+    if (!createDialogOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setCreateDialogOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [createDialogOpen]);
+
   async function createPool(event: FormEvent) {
     event.preventDefault();
     if (!poolForm.name.trim() || !poolForm.devicePath) {
@@ -240,9 +253,6 @@ export function StoragePage() {
           <div className="modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <h3 style={{ margin: 0 }}>{t("storage.createPoolDialogTitle")}</h3>
-              <button className="btn btn-quiet" type="button" onClick={() => setCreateDialogOpen(false)}>
-                {t("common.close")}
-              </button>
             </div>
             {availableDisks.length === 0 ? <p className="notice">{t("storage.noAttachableDisk")}</p> : null}
             <form className="form-grid" onSubmit={createPool}>
