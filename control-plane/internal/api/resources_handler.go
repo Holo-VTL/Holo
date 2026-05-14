@@ -40,6 +40,7 @@ type coreResourcesRepo interface {
 	DeleteCartridge(ctx context.Context, cartridgeID string) error
 	RetireCartridgeBarcode(ctx context.Context, barcode, cartridgeID, actor string) error
 	DestroyCartridge(ctx context.Context, cartridgeID, barcode, actor string) error
+	ListRetiredCartridgeBarcodes(ctx context.Context) []string
 	DeleteDrive(ctx context.Context, driveID string) error
 	DeleteLibrary(ctx context.Context, libraryID string) error
 	FindLibrary(ctx context.Context, libraryID string) (*domain.VirtualLibrary, error)
@@ -130,6 +131,7 @@ type createCartridgeRequest struct {
 	PoolID        string `json:"poolId"`
 	LibraryID     string `json:"libraryId"`
 	Barcode       string `json:"barcode"`
+	BarcodePrefix string `json:"barcodePrefix,omitempty"`
 	CapacityBytes int64  `json:"capacityBytes"`
 	LTOGeneration int    `json:"ltoGeneration,omitempty"`
 	MediaType     string `json:"mediaType,omitempty"`

@@ -1111,6 +1111,52 @@ func TestCartridgeDeleteActionEndpoint(t *testing.T) {
 	}
 }
 
+func TestCreateCartridgeAutoLabelSkipsDestroyedBarcode(t *testing.T) {
+	srv := newTestServer(t)
+
+	createPoolReq := newAuthedRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-auto-label","name":"Pool Auto Label","warningThresholdPct":90}`))
+	createPoolResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createPoolResp, createPoolReq)
+	if createPoolResp.Code != http.StatusCreated {
+		t.Fatalf("expected create pool 201, got %d body=%s", createPoolResp.Code, createPoolResp.Body.String())
+	}
+
+	createLibReq := newAuthedRequest(http.MethodPost, "/v1/libraries", bytes.NewBufferString(`{"libraryId":"lib-auto-label","name":"Library Auto Label"}`))
+	createLibResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createLibResp, createLibReq)
+	if createLibResp.Code != http.StatusCreated {
+		t.Fatalf("expected create library 201, got %d body=%s", createLibResp.Code, createLibResp.Body.String())
+	}
+
+	createFirstReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-auto-label","cartridgeId":"VTA000L06","libraryId":"lib-auto-label","barcode":"VTA000L06","capacityBytes":1073741824}`))
+	createFirstResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createFirstResp, createFirstReq)
+	if createFirstResp.Code != http.StatusCreated {
+		t.Fatalf("expected create cartridge 201, got %d body=%s", createFirstResp.Code, createFirstResp.Body.String())
+	}
+
+	deleteReq := newAuthedRequest(http.MethodPost, "/v1/cartridges/VTA000L06/delete", nil)
+	deleteResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(deleteResp, deleteReq)
+	if deleteResp.Code != http.StatusNoContent {
+		t.Fatalf("expected delete cartridge 204, got %d body=%s", deleteResp.Code, deleteResp.Body.String())
+	}
+
+	createNextReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-auto-label","libraryId":"lib-auto-label","barcodePrefix":"VTA","capacityBytes":1073741824,"ltoGeneration":6}`))
+	createNextResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createNextResp, createNextReq)
+	if createNextResp.Code != http.StatusCreated {
+		t.Fatalf("expected auto-label create 201, got %d body=%s", createNextResp.Code, createNextResp.Body.String())
+	}
+	var cartridge domain.VirtualCartridge
+	if err := json.Unmarshal(createNextResp.Body.Bytes(), &cartridge); err != nil {
+		t.Fatalf("decode cartridge: %v", err)
+	}
+	if cartridge.CartridgeID != "VTA001L06" || cartridge.Barcode != "VTA001L06" {
+		t.Fatalf("expected auto label to skip retired VTA000L06, got id=%q barcode=%q", cartridge.CartridgeID, cartridge.Barcode)
+	}
+}
+
 func TestCartridgeEraseActionEndpointClearsArtifactsAndKeepsBarcodeReusable(t *testing.T) {
 	poolRootBase := t.TempDir()
 	t.Setenv("HOLO_STORAGE_POOL_ROOT_BASE", poolRootBase)

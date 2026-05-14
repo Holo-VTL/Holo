@@ -315,6 +315,22 @@ ON CONFLICT(barcode_key) DO NOTHING`,
 	return tx.Commit()
 }
 
+func (r *CoreResourcesRepo) ListRetiredCartridgeBarcodes(ctx context.Context) []string {
+	rows, err := r.db.QueryContext(ctx, `SELECT barcode FROM destroyed_cartridge_barcodes ORDER BY barcode_key`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var barcode string
+		if err := rows.Scan(&barcode); err == nil {
+			out = append(out, barcode)
+		}
+	}
+	return out
+}
+
 func (r *CoreResourcesRepo) DeleteDrive(ctx context.Context, driveID string) error {
 	return deleteByID(ctx, r.db, `DELETE FROM virtual_drives WHERE drive_id = ?`, driveID)
 }

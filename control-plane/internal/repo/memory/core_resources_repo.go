@@ -138,6 +138,17 @@ func (r *CoreResourcesRepo) DestroyCartridge(_ context.Context, cartridgeID, bar
 	return nil
 }
 
+func (r *CoreResourcesRepo) ListRetiredCartridgeBarcodes(_ context.Context) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.destroyed))
+	for barcode := range r.destroyed {
+		out = append(out, barcode)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (r *CoreResourcesRepo) DeleteCartridge(_ context.Context, cartridgeID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

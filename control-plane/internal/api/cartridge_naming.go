@@ -12,12 +12,11 @@ import (
 
 var tapeLabelPattern = regexp.MustCompile(`^([A-Z0-9]{1,3})([0-9]{3})L([0-9]{2})$`)
 
-const maxTapeSequence = 26 * 1000
-
 func (h *ResourcesHandler) resolveCartridgeIdentity(ctx context.Context, req createCartridgeRequest) (string, string, error) {
 	libraryID := strings.TrimSpace(req.LibraryID)
 	cartridgeID := strings.TrimSpace(req.CartridgeID)
 	barcode := strings.TrimSpace(req.Barcode)
+	barcodePrefix := strings.TrimSpace(req.BarcodePrefix)
 	generation, err := resolveRequestedLTOGeneration(req.LTOGeneration, req.MediaType)
 	if err != nil {
 		return "", "", domain.ErrInvalidInput
@@ -27,7 +26,7 @@ func (h *ResourcesHandler) resolveCartridgeIdentity(ctx context.Context, req cre
 		if generation == 0 {
 			return "", "", domain.ErrInvalidInput
 		}
-		label, labelErr := h.nextTapeLabel(ctx, libraryID, generation)
+		label, labelErr := h.nextTapeLabel(ctx, libraryID, barcodePrefix, generation)
 		if labelErr != nil {
 			return "", "", labelErr
 		}
@@ -53,21 +52,28 @@ func (h *ResourcesHandler) resolveCartridgeIdentity(ctx context.Context, req cre
 	return normalizedID, normalizedBarcode, nil
 }
 
-func (h *ResourcesHandler) nextTapeLabel(ctx context.Context, libraryID string, generation int) (string, error) {
+func (h *ResourcesHandler) nextTapeLabel(ctx context.Context, libraryID, prefix string, generation int) (string, error) {
+	prefix, err := normalizeTapePrefix(prefix)
+	if err != nil {
+		return "", domain.ErrInvalidInput
+	}
 	usedSequences := make(map[int]struct{})
 	usedLabels := make(map[string]struct{})
 	for _, cartridge := range h.repo.ListCartridges(ctx) {
 		if cartridge == nil || cartridge.LibraryID != libraryID {
 			continue
 		}
-		markUsedTapeLabel(usedSequences, usedLabels, cartridge.CartridgeID)
-		markUsedTapeLabel(usedSequences, usedLabels, cartridge.Barcode)
+		markUsedTapeLabel(usedSequences, usedLabels, cartridge.CartridgeID, prefix, generation)
+		markUsedTapeLabel(usedSequences, usedLabels, cartridge.Barcode, prefix, generation)
 	}
-	for sequence := 0; sequence < maxTapeSequence; sequence++ {
+	for _, label := range h.repo.ListRetiredCartridgeBarcodes(ctx) {
+		markUsedTapeLabel(usedSequences, usedLabels, label, prefix, generation)
+	}
+	for sequence := 0; sequence < 1000; sequence++ {
 		if _, exists := usedSequences[sequence]; exists {
 			continue
 		}
-		label := formatTapeLabel(sequence, generation)
+		label := formatTapeLabel(prefix, sequence, generation)
 		if _, exists := usedLabels[strings.ToUpper(label)]; exists {
 			continue
 		}
@@ -76,12 +82,15 @@ func (h *ResourcesHandler) nextTapeLabel(ctx context.Context, libraryID string, 
 	return "", domain.ErrConflict
 }
 
-func markUsedTapeLabel(usedSequences map[int]struct{}, usedLabels map[string]struct{}, raw string) {
+func markUsedTapeLabel(usedSequences map[int]struct{}, usedLabels map[string]struct{}, raw, prefix string, generation int) {
 	normalized, sequence, _, ok := normalizeTapeLabel(raw)
 	if !ok {
 		return
 	}
-	if sequence >= 0 {
+	if labelPrefix, labelSequence, labelGeneration, ok := parseTapeLabelParts(normalized); ok && labelPrefix == prefix && labelGeneration == generation {
+		usedSequences[labelSequence] = struct{}{}
+	}
+	if sequence >= 0 && prefix == "VTA" {
 		usedSequences[sequence] = struct{}{}
 	}
 	usedLabels[normalized] = struct{}{}
@@ -132,10 +141,24 @@ func parseLTOGeneration(raw string) (int, error) {
 	return value, nil
 }
 
-func formatTapeLabel(sequence, generation int) string {
-	letter := rune('A' + (sequence / 1000))
-	index := sequence % 1000
-	return fmt.Sprintf("VT%c%03dL%02d", letter, index, generation)
+func normalizeTapePrefix(raw string) (string, error) {
+	prefix := strings.ToUpper(strings.TrimSpace(raw))
+	if prefix == "" {
+		return "VTA", nil
+	}
+	if len(prefix) > 3 {
+		return "", fmt.Errorf("invalid tape prefix")
+	}
+	for _, ch := range prefix {
+		if (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') {
+			return "", fmt.Errorf("invalid tape prefix")
+		}
+	}
+	return prefix, nil
+}
+
+func formatTapeLabel(prefix string, sequence, generation int) string {
+	return fmt.Sprintf("%s%03dL%02d", prefix, sequence, generation)
 }
 
 func normalizeTapeLabel(raw string) (string, int, int, bool) {
@@ -161,4 +184,21 @@ func normalizeTapeLabel(raw string) (string, int, int, bool) {
 		}
 	}
 	return candidate, sequence, generation, true
+}
+
+func parseTapeLabelParts(raw string) (string, int, int, bool) {
+	candidate := strings.ToUpper(strings.TrimSpace(raw))
+	match := tapeLabelPattern.FindStringSubmatch(candidate)
+	if len(match) != 4 {
+		return "", 0, 0, false
+	}
+	sequence, err := strconv.Atoi(match[2])
+	if err != nil {
+		return "", 0, 0, false
+	}
+	generation, err := strconv.Atoi(match[3])
+	if err != nil {
+		return "", 0, 0, false
+	}
+	return match[1], sequence, generation, true
 }

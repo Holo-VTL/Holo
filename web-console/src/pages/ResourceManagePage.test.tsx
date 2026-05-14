@@ -122,8 +122,12 @@ describe("ResourceManagePage", () => {
     await userEvent.click(screen.getByLabelText(/Add slot and insert cartridge/));
     await userEvent.click(screen.getByRole("button", { name: "Create" }));
     expect(api.resources.createCartridge).toHaveBeenCalledWith(
-      expect.objectContaining({ expandSlots: true })
+      expect.objectContaining({ barcodePrefix: "VTA", expandSlots: true })
     );
+    const calls = vi.mocked(api.resources.createCartridge).mock.calls;
+    const request = calls[calls.length - 1]?.[0];
+    expect(request).not.toHaveProperty("barcode");
+    expect(request).not.toHaveProperty("cartridgeId");
   });
 
   it("offers to add a slot when vault import has no empty slot", async () => {

@@ -302,6 +302,7 @@ export const api = {
       poolId: string;
       libraryId: string;
       barcode?: string;
+      barcodePrefix?: string;
       capacityBytes: number;
       ltoGeneration?: number;
       mediaType?: string;
