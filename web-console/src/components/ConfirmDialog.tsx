@@ -8,6 +8,7 @@ type ConfirmDialogProps = {
   confirmLabel?: string;
   danger?: boolean;
   busy?: boolean;
+  noticeTone?: "default" | "attention";
   onConfirm: () => void;
   onCancel: () => void;
 };
@@ -19,6 +20,7 @@ export function ConfirmDialog({
   confirmLabel,
   danger = false,
   busy = false,
+  noticeTone = "default",
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -32,11 +34,8 @@ export function ConfirmDialog({
       <div className="modal-card" onClick={(event) => event.stopPropagation()}>
         <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>{title}</h3>
-          <button className="btn btn-quiet" type="button" onClick={onCancel}>
-            {t("common.close")}
-          </button>
         </div>
-        <div className="notice" style={{ marginBottom: 12 }}>{message}</div>
+        <div className={`notice ${noticeTone === "attention" ? "notice-attention" : ""}`} style={{ marginBottom: 12 }}>{message}</div>
         <div className="inline-actions">
           <button className={`btn ${danger ? "btn-danger" : "btn-primary"}`} type="button" onClick={onConfirm} disabled={busy}>
             {busy ? t("common.loading") : confirmLabel || t("common.confirm")}

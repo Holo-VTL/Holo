@@ -825,6 +825,26 @@ textarea {
   padding: 8px 10px;
 }
 
+.notice-attention {
+  border-color: color-mix(in srgb, var(--warning) 48%, rgba(255, 255, 255, 0.2));
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--warning) 22%, rgba(12, 10, 8, 0.82)),
+      color-mix(in srgb, var(--warning) 8%, rgba(8, 8, 8, 0.72))
+    );
+  color: var(--text-strong);
+}
+
+.notice-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.notice-stack .checkbox-inline {
+  margin-top: 0 !important;
+}
+
 .notice-error {
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
   background: color-mix(in srgb, var(--danger) 12%, transparent);

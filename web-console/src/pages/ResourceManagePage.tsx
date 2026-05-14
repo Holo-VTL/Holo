@@ -1115,9 +1115,6 @@ export function ResourceManagePage() {
           <div className="modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <h3 style={{ margin: 0 }}>{t("resources.addDrive")}</h3>
-              <button className="btn btn-quiet" type="button" onClick={() => setCreateDriveOpen(false)}>
-                {t("common.close")}
-              </button>
             </div>
             <form className="form-grid" onSubmit={createDrive}>
               <div className="form-row">
@@ -1143,10 +1140,9 @@ export function ResourceManagePage() {
           <div className="modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <h3 style={{ margin: 0 }}>{t("resources.addCartridge")}</h3>
-              <button className="btn btn-quiet" type="button" onClick={() => setCreateCartridgeOpen(false)}>{t("common.close")}</button>
             </div>
             <form className="form-grid" onSubmit={createCartridge}>
-              <div className="form-row">
+              <div className="form-row form-row-wide">
                 <label>{t("resources.poolName")}</label>
                 <SelectInput
                   value={cartridgeForm.poolId}
@@ -1194,8 +1190,8 @@ export function ResourceManagePage() {
                 />
               </div>
               {cartridgeCreateNeedsSlots ? (
-                <div className="notice" style={{ gridColumn: "1 / -1" }}>
-                  {t("resources.addSlotRequiredDescription", { count: Math.max(requestedCartridgeCount - emptySlots, 1) })}
+                <div className="notice notice-attention notice-stack" style={{ gridColumn: "1 / -1" }}>
+                  <span>{t("resources.addSlotRequiredDescription", { count: Math.max(requestedCartridgeCount - emptySlots, 1) })}</span>
                   <label className="checkbox-inline" style={{ marginTop: 8 }}>
                     <input
                       type="checkbox"
@@ -1301,6 +1297,7 @@ export function ResourceManagePage() {
           cartridgeId: slotShortageImportTarget?.barcode || slotShortageImportTarget?.cartridgeId || "",
         })}
         confirmLabel={t("resources.addSlotAndImport")}
+        noticeTone="attention"
         busy={busyResourceAction.startsWith("add-slot-import:")}
         onConfirm={() => void addSlotAndImportCartridge()}
         onCancel={() => {
