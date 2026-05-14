@@ -1197,6 +1197,176 @@ func TestDriveLoadWritesSharedStateAndKeepsSlotPositions(t *testing.T) {
 	}
 }
 
+func TestCreateCartridgeRequiresExplicitSlotExpansionWhenFull(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-full-slots","name":"Pool Full Slots","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-full-slots","name":"Library Full Slots","slotCount":1,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-full-slots","libraryId":"lib-full-slots","slot":256}`, http.StatusCreated},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	firstReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-full-slots","cartridgeId":"VTA001L06","libraryId":"lib-full-slots","barcode":"VTA001L06","capacityBytes":549755813888}`))
+	firstResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(firstResp, firstReq)
+	if firstResp.Code != http.StatusCreated {
+		t.Fatalf("expected first cartridge 201, got %d body=%s", firstResp.Code, firstResp.Body.String())
+	}
+	var first domain.VirtualCartridge
+	if err := json.Unmarshal(firstResp.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first cartridge: %v", err)
+	}
+	if first.AssignedSlotAddress == nil || *first.AssignedSlotAddress != 1024 {
+		t.Fatalf("expected first cartridge assigned to slot 1024, got %+v", first.AssignedSlotAddress)
+	}
+
+	fullReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-full-slots","cartridgeId":"VTA002L06","libraryId":"lib-full-slots","barcode":"VTA002L06","capacityBytes":549755813888}`))
+	fullResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(fullResp, fullReq)
+	if fullResp.Code != http.StatusConflict {
+		t.Fatalf("expected full ordinary create 409, got %d body=%s", fullResp.Code, fullResp.Body.String())
+	}
+
+	expandReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-full-slots","cartridgeId":"VTA002L06","libraryId":"lib-full-slots","barcode":"VTA002L06","capacityBytes":549755813888,"expandSlots":true}`))
+	expandResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(expandResp, expandReq)
+	if expandResp.Code != http.StatusCreated {
+		t.Fatalf("expected explicit expansion create 201, got %d body=%s", expandResp.Code, expandResp.Body.String())
+	}
+	var expanded domain.VirtualCartridge
+	if err := json.Unmarshal(expandResp.Body.Bytes(), &expanded); err != nil {
+		t.Fatalf("decode expanded cartridge: %v", err)
+	}
+	if expanded.AssignedSlotAddress == nil || *expanded.AssignedSlotAddress != 1025 {
+		t.Fatalf("expected expanded cartridge assigned to slot 1025, got %+v", expanded.AssignedSlotAddress)
+	}
+
+	getLibReq := newAuthedRequest(http.MethodGet, "/v1/libraries/lib-full-slots", nil)
+	getLibResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getLibResp, getLibReq)
+	if getLibResp.Code != http.StatusOK {
+		t.Fatalf("expected library get 200, got %d body=%s", getLibResp.Code, getLibResp.Body.String())
+	}
+	var library domain.VirtualLibrary
+	if err := json.Unmarshal(getLibResp.Body.Bytes(), &library); err != nil {
+		t.Fatalf("decode library: %v", err)
+	}
+	if library.SlotCount != 2 {
+		t.Fatalf("expected explicit expansion to increase slot count to 2, got %d", library.SlotCount)
+	}
+}
+
+func TestDriveUnloadReturnsToAssignedSlot(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-assigned-unload","name":"Pool Assigned Unload","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-assigned-unload","name":"Library Assigned Unload","slotCount":2,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-assigned-unload","libraryId":"lib-assigned-unload","slot":256}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-assigned-unload","cartridgeId":"VTA010L06","libraryId":"lib-assigned-unload","barcode":"VTA010L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-assigned-unload","cartridgeId":"VTA011L06","libraryId":"lib-assigned-unload","barcode":"VTA011L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives/drive-assigned-unload/load", `{"cartridgeId":"VTA011L06","actor":"web-console"}`, http.StatusOK},
+		{http.MethodPost, "/v1/drives/drive-assigned-unload/unload", `{"actor":"web-console"}`, http.StatusOK},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	getCartridgeReq := newAuthedRequest(http.MethodGet, "/v1/cartridges/VTA011L06", nil)
+	getCartridgeResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getCartridgeResp, getCartridgeReq)
+	if getCartridgeResp.Code != http.StatusOK {
+		t.Fatalf("expected cartridge get 200, got %d body=%s", getCartridgeResp.Code, getCartridgeResp.Body.String())
+	}
+	var cartridge domain.VirtualCartridge
+	if err := json.Unmarshal(getCartridgeResp.Body.Bytes(), &cartridge); err != nil {
+		t.Fatalf("decode cartridge: %v", err)
+	}
+	if cartridge.CurrentElementAddress == nil || *cartridge.CurrentElementAddress != 1025 {
+		t.Fatalf("expected unloaded cartridge back in slot 1025, got %+v", cartridge.CurrentElementAddress)
+	}
+}
+
+func TestDriveUnloadRejectsOccupiedAssignedSlot(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+	ctx := context.Background()
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-occupied-assigned","name":"Pool Occupied Assigned","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-occupied-assigned","name":"Library Occupied Assigned","slotCount":2,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-occupied-assigned","libraryId":"lib-occupied-assigned","slot":256}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-occupied-assigned","cartridgeId":"VTA020L06","libraryId":"lib-occupied-assigned","barcode":"VTA020L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-occupied-assigned","cartridgeId":"VTA021L06","libraryId":"lib-occupied-assigned","barcode":"VTA021L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives/drive-occupied-assigned/load", `{"cartridgeId":"VTA020L06","actor":"web-console"}`, http.StatusOK},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	mounted, err := srv.resources.repo.FindCartridge(ctx, "VTA020L06")
+	if err != nil {
+		t.Fatalf("find mounted cartridge: %v", err)
+	}
+	if mounted.AssignedSlotAddress == nil {
+		t.Fatalf("expected mounted cartridge to retain assigned slot")
+	}
+	occupier, err := srv.resources.repo.FindCartridge(ctx, "VTA021L06")
+	if err != nil {
+		t.Fatalf("find occupying cartridge: %v", err)
+	}
+	assignedSlot := *mounted.AssignedSlotAddress
+	occupier.AssignedSlotAddress = &assignedSlot
+	if err := srv.resources.repo.SaveCartridge(ctx, occupier); err != nil {
+		t.Fatalf("save occupying cartridge: %v", err)
+	}
+
+	unloadReq := newAuthedRequest(http.MethodPost, "/v1/drives/drive-occupied-assigned/unload", bytes.NewBufferString(`{"actor":"web-console"}`))
+	unloadResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(unloadResp, unloadReq)
+	if unloadResp.Code != http.StatusConflict {
+		t.Fatalf("expected occupied assigned slot unload 409, got %d body=%s", unloadResp.Code, unloadResp.Body.String())
+	}
+}
+
 func TestCartridgeListIncludesCurrentSlotElementAddress(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)

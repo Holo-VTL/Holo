@@ -30,6 +30,7 @@ type VirtualCartridge struct {
 	LifecycleState        CartridgeLifecycleState `json:"lifecycleState"`
 	RetentionState        RetentionState          `json:"retentionState"`
 	CurrentElementAddress *int                    `json:"currentElementAddress,omitempty"`
+	AssignedSlotAddress   *int                    `json:"assignedSlotAddress,omitempty"`
 }
 
 func NewVirtualCartridge(id, poolID, libraryID, barcode string, capacity int64) *VirtualCartridge {

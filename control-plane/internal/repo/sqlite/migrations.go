@@ -181,6 +181,12 @@ CREATE TABLE IF NOT EXISTS local_mount_settings (
 );
 `,
 	},
+	{
+		version: 6,
+		sql: `
+ALTER TABLE virtual_cartridges ADD COLUMN assigned_slot_address INTEGER;
+`,
+	},
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {

@@ -138,6 +138,7 @@ export function ResourceManagePage() {
     quantity: "1",
     customCapacityValue: "",
     customCapacityUnit: "TB" as CapacityUnit,
+    expandSlots: false,
   });
   const [loadTargetDriveId, setLoadTargetDriveId] = useState("");
 
@@ -203,9 +204,11 @@ export function ResourceManagePage() {
     }
     return Math.max(maxIndex, cartridge.currentElementAddress - slotStartAddress);
   }, -1);
-  const slotCount = Math.max(library?.slotCount || 0, reportedMaxSlotIndex + 1, slotCartridges.length, 1);
+  const slotCount = Math.max(library?.slotCount || 0, reportedMaxSlotIndex + 1, 1);
   const occupiedSlots = Math.min(slotCartridges.length, slotCount);
   const emptySlots = Math.max(slotCount - occupiedSlots, 0);
+  const requestedCartridgeCount = Number.parseInt(cartridgeForm.quantity, 10);
+  const cartridgeCreateNeedsSlots = Number.isFinite(requestedCartridgeCount) && requestedCartridgeCount > emptySlots;
 
   const slotCells = useMemo(() => {
     const cartridgesByIndex = new Map<number, VirtualCartridge>();
@@ -297,8 +300,9 @@ export function ResourceManagePage() {
       quantity: prev.quantity.trim() === "" ? "1" : prev.quantity,
       customCapacityValue: prev.customCapacityValue,
       customCapacityUnit: prev.customCapacityUnit,
+      expandSlots: cartridgeCreateNeedsSlots ? prev.expandSlots : false,
     }));
-  }, [createCartridgeOpen, usablePools]);
+  }, [cartridgeCreateNeedsSlots, createCartridgeOpen, usablePools]);
 
   async function reloadAll() {
     setError("");
@@ -359,6 +363,10 @@ export function ResourceManagePage() {
       push(t("resources.cartridgePrefixHint"), "error");
       return;
     }
+    if (quantity > emptySlots && !cartridgeForm.expandSlots) {
+      push(t("resources.addSlotRequired"), "error");
+      return;
+    }
     setBusyCreateCartridge(true);
     try {
       const prefix = normalizeCartridgePrefix(cartridgeForm.prefix);
@@ -382,6 +390,7 @@ export function ResourceManagePage() {
           capacityBytes,
           ltoGeneration: tapeProfile.ltoGeneration,
           mediaType: `LTO${tapeProfile.ltoGeneration}`,
+          expandSlots: cartridgeForm.expandSlots,
         });
       }
       push(t("messages.requestSuccess"), "success");
@@ -393,12 +402,32 @@ export function ResourceManagePage() {
         quantity: "1",
         customCapacityValue: "",
         customCapacityUnit: "TB",
+        expandSlots: false,
       });
       await reloadAll();
     } catch (err) {
       push((err as Error).message || t("messages.requestFailed"), "error");
     } finally {
       setBusyCreateCartridge(false);
+    }
+  }
+
+  async function addSlot() {
+    if (!library) {
+      return;
+    }
+    setBusyResourceAction("add-slot");
+    setError("");
+    try {
+      await api.resources.addLibrarySlots(library.libraryId, { count: 1, actor: "web-console" });
+      push(t("messages.requestSuccess"), "success");
+      await reloadAll();
+    } catch (err) {
+      const message = actionErrorMessage(err);
+      setError(message);
+      push(message, "error");
+    } finally {
+      setBusyResourceAction("");
     }
   }
 
@@ -808,9 +837,14 @@ export function ResourceManagePage() {
                         </button>
                       );
                     })}
-                    <button className="topology-add-slot" type="button" onClick={() => setCreateCartridgeOpen(true)}>
+                    <button
+                      className="topology-add-slot"
+                      type="button"
+                      disabled={busyResourceAction === "add-slot"}
+                      onClick={() => void addSlot()}
+                    >
                       <Plus size={16} />
-                      <span>{t("resources.addCartridge")}</span>
+                      <span>{busyResourceAction === "add-slot" ? t("common.loading") : t("resources.addSlot")}</span>
                     </button>
                   </div>
                 </div>
@@ -1109,8 +1143,9 @@ export function ResourceManagePage() {
                 />
               </div>
               <div className="form-row">
-                <label>{t("resources.cartridgeCount")}</label>
+                <label htmlFor="cartridge-count-input">{t("resources.cartridgeCount")}</label>
                 <input
+                  id="cartridge-count-input"
                   className="input"
                   type="number"
                   min={1}
@@ -1127,6 +1162,21 @@ export function ResourceManagePage() {
                   required
                 />
               </div>
+              {cartridgeCreateNeedsSlots ? (
+                <div className="notice" style={{ gridColumn: "1 / -1" }}>
+                  {t("resources.addSlotRequiredDescription", { count: Math.max(requestedCartridgeCount - emptySlots, 1) })}
+                  <label className="checkbox-inline" style={{ marginTop: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={cartridgeForm.expandSlots}
+                      onChange={(event) =>
+                        setCartridgeForm((prev) => ({ ...prev, expandSlots: event.target.checked }))
+                      }
+                    />
+                    <span>{t("resources.addSlotAndInsert")}</span>
+                  </label>
+                </div>
+              ) : null}
               <div className="inline-actions" style={{ gridColumn: "1 / -1", justifyContent: "flex-start" }}>
                 <button
                   className="btn btn-quiet"

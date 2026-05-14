@@ -168,8 +168,8 @@ func (r *CoreResourcesRepo) CreateCartridge(ctx context.Context, cartridge *doma
 	_, err = r.db.ExecContext(ctx, `
 INSERT INTO virtual_cartridges (
   cartridge_id, pool_id, library_id, barcode, barcode_key, capacity_bytes, used_bytes,
-  lifecycle_state, retention_state, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  lifecycle_state, retention_state, assigned_slot_address, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cartridge.CartridgeID,
 		cartridge.PoolID,
 		cartridge.LibraryID,
@@ -179,6 +179,7 @@ INSERT INTO virtual_cartridges (
 		cartridge.UsedBytes,
 		string(cartridge.LifecycleState),
 		string(cartridge.RetentionState),
+		nullableInt(cartridge.AssignedSlotAddress),
 		formatTime(cartridge.CreatedAt),
 		formatTime(cartridge.UpdatedAt),
 	)
@@ -213,8 +214,8 @@ func (r *CoreResourcesRepo) SaveCartridge(ctx context.Context, cartridge *domain
 	_, err = r.db.ExecContext(ctx, `
 INSERT INTO virtual_cartridges (
   cartridge_id, pool_id, library_id, barcode, barcode_key, capacity_bytes, used_bytes,
-  lifecycle_state, retention_state, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  lifecycle_state, retention_state, assigned_slot_address, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(cartridge_id) DO UPDATE SET
   pool_id=excluded.pool_id,
   library_id=excluded.library_id,
@@ -224,6 +225,7 @@ ON CONFLICT(cartridge_id) DO UPDATE SET
   used_bytes=excluded.used_bytes,
   lifecycle_state=excluded.lifecycle_state,
   retention_state=excluded.retention_state,
+  assigned_slot_address=excluded.assigned_slot_address,
   created_at=excluded.created_at,
   updated_at=excluded.updated_at`,
 		cartridge.CartridgeID,
@@ -235,6 +237,7 @@ ON CONFLICT(cartridge_id) DO UPDATE SET
 		cartridge.UsedBytes,
 		string(cartridge.LifecycleState),
 		string(cartridge.RetentionState),
+		nullableInt(cartridge.AssignedSlotAddress),
 		formatTime(cartridge.CreatedAt),
 		formatTime(cartridge.UpdatedAt),
 	)
@@ -339,7 +342,7 @@ FROM virtual_drives WHERE drive_id = ?`, strings.TrimSpace(driveID))
 func (r *CoreResourcesRepo) FindCartridge(ctx context.Context, cartridgeID string) (*domain.VirtualCartridge, error) {
 	row := r.db.QueryRowContext(ctx, `
 SELECT cartridge_id, pool_id, library_id, barcode, capacity_bytes, used_bytes,
-       lifecycle_state, retention_state, created_at, updated_at
+       lifecycle_state, retention_state, assigned_slot_address, created_at, updated_at
 FROM virtual_cartridges WHERE cartridge_id = ?`, strings.TrimSpace(cartridgeID))
 	return scanCartridge(row)
 }
@@ -385,7 +388,7 @@ FROM virtual_drives ORDER BY drive_id`)
 func (r *CoreResourcesRepo) ListCartridges(ctx context.Context) []*domain.VirtualCartridge {
 	rows, err := r.db.QueryContext(ctx, `
 SELECT cartridge_id, pool_id, library_id, barcode, capacity_bytes, used_bytes,
-       lifecycle_state, retention_state, created_at, updated_at
+       lifecycle_state, retention_state, assigned_slot_address, created_at, updated_at
 FROM virtual_cartridges ORDER BY cartridge_id`)
 	if err != nil {
 		return nil
@@ -470,6 +473,7 @@ func scanDrive(row scanner) (*domain.VirtualDrive, error) {
 func scanCartridge(row scanner) (*domain.VirtualCartridge, error) {
 	var cartridge domain.VirtualCartridge
 	var lifecycleState, retentionState, createdAt, updatedAt string
+	var assignedSlot sql.NullInt64
 	err := row.Scan(
 		&cartridge.CartridgeID,
 		&cartridge.PoolID,
@@ -479,6 +483,7 @@ func scanCartridge(row scanner) (*domain.VirtualCartridge, error) {
 		&cartridge.UsedBytes,
 		&lifecycleState,
 		&retentionState,
+		&assignedSlot,
 		&createdAt,
 		&updatedAt,
 	)
@@ -490,9 +495,20 @@ func scanCartridge(row scanner) (*domain.VirtualCartridge, error) {
 	}
 	cartridge.LifecycleState = domain.CartridgeLifecycleState(lifecycleState)
 	cartridge.RetentionState = domain.RetentionState(retentionState)
+	if assignedSlot.Valid {
+		value := int(assignedSlot.Int64)
+		cartridge.AssignedSlotAddress = &value
+	}
 	cartridge.CreatedAt = parseTime(createdAt)
 	cartridge.UpdatedAt = parseTime(updatedAt)
 	return &cartridge, nil
+}
+
+func nullableInt(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func deleteByID(ctx context.Context, db *sql.DB, stmt, id string) error {

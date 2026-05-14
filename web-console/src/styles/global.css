@@ -830,6 +830,15 @@ textarea {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .toast-host {
   position: fixed;
   right: 16px;

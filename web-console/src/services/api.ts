@@ -282,6 +282,8 @@ export const api = {
     }) => request<VirtualLibrary>("/v1/libraries", { method: "POST", body }),
     deleteLibrary: (libraryId: string) =>
       request<void>(`/v1/libraries/${encodeURIComponent(libraryId)}/delete`, { method: "POST" }),
+    addLibrarySlots: (libraryId: string, body: { count?: number; actor?: string }) =>
+      request<VirtualLibrary>(`/v1/libraries/${encodeURIComponent(libraryId)}/slots`, { method: "POST", body }),
     listDrives: () => request<VirtualDrive[]>("/v1/drives"),
     createDrive: (body: { driveId: string; libraryId: string; slot: number }) =>
       request<VirtualDrive>("/v1/drives", { method: "POST", body }),
@@ -303,6 +305,7 @@ export const api = {
       capacityBytes: number;
       ltoGeneration?: number;
       mediaType?: string;
+      expandSlots?: boolean;
     }) => request<VirtualCartridge>("/v1/cartridges", { method: "POST", body }),
     deleteCartridge: (cartridgeId: string) =>
       request<void>(`/v1/cartridges/${encodeURIComponent(cartridgeId)}/delete`, { method: "POST" }),
