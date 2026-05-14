@@ -1473,6 +1473,9 @@ func TestCreateCartridgeRequiresExplicitSlotExpansionWhenFull(t *testing.T) {
 	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), "create_cartridge_expand_slots") {
 		t.Fatalf("expected slot expansion audit event, got %s", auditResp.Body.String())
 	}
+	if !strings.Contains(auditResp.Body.String(), "cartridge_create") || !strings.Contains(auditResp.Body.String(), `"assignedSlotAddress":1025`) {
+		t.Fatalf("expected cartridge create audit event, got %s", auditResp.Body.String())
+	}
 }
 
 func TestExpandedCartridgeCreateFailureRollsBackSlotExpansion(t *testing.T) {

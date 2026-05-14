@@ -215,26 +215,12 @@ export function ResourceManagePage() {
 
   const slotCells = useMemo(() => {
     const cartridgesByIndex = new Map<number, VirtualCartridge>();
-    const unplaced: VirtualCartridge[] = [];
     for (const cartridge of slotCartridges) {
       const address = cartridge.currentElementAddress;
       const index = address == null ? -1 : address - slotStartAddress;
       if (index >= 0 && index < slotCount && !cartridgesByIndex.has(index)) {
         cartridgesByIndex.set(index, cartridge);
-      } else {
-        unplaced.push(cartridge);
       }
-    }
-    let nextFreeIndex = 0;
-    for (const cartridge of unplaced) {
-      while (nextFreeIndex < slotCount && cartridgesByIndex.has(nextFreeIndex)) {
-        nextFreeIndex += 1;
-      }
-      if (nextFreeIndex >= slotCount) {
-        break;
-      }
-      cartridgesByIndex.set(nextFreeIndex, cartridge);
-      nextFreeIndex += 1;
     }
     return Array.from({ length: slotCount }, (_, index) => {
       return {

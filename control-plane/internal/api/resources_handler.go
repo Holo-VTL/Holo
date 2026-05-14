@@ -585,6 +585,10 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 				log.Printf("library slot expansion audit skipped library=%s cartridge=%s err=%v", library.LibraryID, cartridge.CartridgeID, findErr)
 			}
 		}
+		h.emitCartridgeAudit(r.Context(), "web-console", "cartridge_create", cartridge, "success", map[string]any{
+			"assignedSlotAddress": slotAddress,
+			"expandedSlots":       expandedSlots,
+		})
 		respondJSON(w, http.StatusCreated, cartridge)
 	case http.MethodGet:
 		if err := h.reconcileMediaState(r.Context()); err != nil {

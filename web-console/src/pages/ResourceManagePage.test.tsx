@@ -78,6 +78,35 @@ describe("ResourceManagePage", () => {
     expect(cartridgeSlot).toHaveAttribute("data-slot-address", "1034");
   });
 
+  it("does not place cartridges without a reported slot address", async () => {
+    vi.mocked(api.resources.listCartridges).mockResolvedValue([
+      {
+        cartridgeId: "VTA000L06",
+        poolId: "pool-a",
+        libraryId: "lib-a",
+        barcode: "VTA000L06",
+        capacityBytes: 1000,
+        usedBytes: 100,
+        lifecycleState: "available",
+        retentionState: "none",
+        currentElementAddress: 1034,
+      },
+      {
+        cartridgeId: "VTA031L06",
+        poolId: "pool-a",
+        libraryId: "lib-a",
+        barcode: "VTA031L06",
+        capacityBytes: 1000,
+        usedBytes: 0,
+        lifecycleState: "available",
+        retentionState: "none",
+      },
+    ]);
+    renderManagePage();
+    expect(await screen.findByTitle("VTA000L06 (VTA000L06)")).toBeInTheDocument();
+    expect(screen.queryByText("VTA031L06")).not.toBeInTheDocument();
+  });
+
   it("requires explicit slot expansion when creating more cartridges than empty slots", async () => {
     renderManagePage();
     const addCartridgeButtons = await screen.findAllByRole("button", { name: "Add Cartridge" });
