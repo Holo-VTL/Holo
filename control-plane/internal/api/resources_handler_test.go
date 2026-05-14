@@ -1312,6 +1312,39 @@ func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
 	}
 }
 
+func TestMissingLibraryDoesNotAllocateSlotLock(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	createPoolReq := newAuthedRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-missing-lock","name":"Pool Missing Lock","warningThresholdPct":90}`))
+	createPoolResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createPoolResp, createPoolReq)
+	if createPoolResp.Code != http.StatusCreated {
+		t.Fatalf("expected pool create 201, got %d body=%s", createPoolResp.Code, createPoolResp.Body.String())
+	}
+
+	createCartridgeReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-missing-lock","cartridgeId":"VTA404L06","libraryId":"lib-missing-lock","barcode":"VTA404L06","capacityBytes":549755813888}`))
+	createCartridgeResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createCartridgeResp, createCartridgeReq)
+	if createCartridgeResp.Code != http.StatusNotFound {
+		t.Fatalf("expected missing library create 404, got %d body=%s", createCartridgeResp.Code, createCartridgeResp.Body.String())
+	}
+
+	addSlotReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-missing-lock/slots", bytes.NewBufferString(`{"count":1}`))
+	addSlotResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(addSlotResp, addSlotReq)
+	if addSlotResp.Code != http.StatusNotFound {
+		t.Fatalf("expected missing library add-slot 404, got %d body=%s", addSlotResp.Code, addSlotResp.Body.String())
+	}
+
+	srv.resources.slotLocksMu.Lock()
+	defer srv.resources.slotLocksMu.Unlock()
+	if got := len(srv.resources.slotLocks); got != 0 {
+		t.Fatalf("expected no slot locks allocated for missing library requests, got %d", got)
+	}
+}
+
 func TestConcurrentExpandedCartridgeCreatesGetDistinctSlots(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)

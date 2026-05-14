@@ -485,6 +485,10 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 			respondResourceError(w, domain.ErrInvalidInput)
 			return
 		}
+		if validateManagementID(req.LibraryID) != nil {
+			respondResourceError(w, domain.ErrInvalidInput)
+			return
+		}
 		if h.storage == nil {
 			respondResourceError(w, domain.ErrInvalidState)
 			return
@@ -496,6 +500,10 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 		}
 		if storageutil.StrictStorageFlowEnabled() && len(pool.Disks) == 0 {
 			respondResourceError(w, domain.ErrInvalidState)
+			return
+		}
+		if _, err := h.repo.FindLibrary(r.Context(), req.LibraryID); err != nil {
+			respondResourceError(w, err)
 			return
 		}
 		unlock := h.lockLibrarySlots(req.LibraryID)
@@ -1004,6 +1012,13 @@ func (h *ResourcesHandler) wouldExceedLibraryDriveLimit(ctx context.Context, lib
 }
 
 func (h *ResourcesHandler) addLibrarySlots(ctx context.Context, libraryID string, count int, actor string) (*domain.VirtualLibrary, error) {
+	libraryID = strings.TrimSpace(libraryID)
+	if validateManagementID(libraryID) != nil {
+		return nil, domain.ErrInvalidInput
+	}
+	if _, err := h.repo.FindLibrary(ctx, libraryID); err != nil {
+		return nil, err
+	}
 	unlock := h.lockLibrarySlots(libraryID)
 	defer unlock()
 	library, added, err := h.addLibrarySlotsLocked(ctx, libraryID, count)
@@ -2342,6 +2357,13 @@ func isShortEraseLayoutArtifact(name string) bool {
 }
 
 func (h *ResourcesHandler) deleteLibraryCascade(ctx context.Context, libraryID string) error {
+	libraryID = strings.TrimSpace(libraryID)
+	if validateManagementID(libraryID) != nil {
+		return domain.ErrInvalidInput
+	}
+	if _, err := h.repo.FindLibrary(ctx, libraryID); err != nil {
+		return err
+	}
 	unlock := h.lockLibrarySlots(libraryID)
 	defer unlock()
 	if _, err := h.repo.FindLibrary(ctx, libraryID); err != nil {
