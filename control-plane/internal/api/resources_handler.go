@@ -1988,6 +1988,14 @@ func readExistingVaultLabels(libraryID, driveID string) []string {
 func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []*domain.VirtualCartridge, active map[string]struct{}) []string {
 	labels := make([]string, slotCount)
 	placed := make(map[string]struct{})
+	hasExistingInventory := false
+	for idx := 0; idx < slotCount && idx < len(existing); idx++ {
+		label := strings.TrimSpace(existing[idx])
+		if _, ok := active[label]; ok {
+			hasExistingInventory = true
+			break
+		}
+	}
 	for _, cartridge := range cartridges {
 		if cartridge == nil || cartridge.AssignedSlotAddress == nil {
 			continue
@@ -2037,6 +2045,9 @@ func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []
 	}
 	nextSlot := 0
 	for _, cartridge := range cartridges {
+		if cartridge == nil || cartridge.AssignedSlotAddress != nil || hasExistingInventory {
+			continue
+		}
 		label := cartridgeSharedLabel(cartridge)
 		if label == "" {
 			continue
