@@ -259,7 +259,7 @@
     "unloadFromDrive": "Unload to Assigned Slot",
     "noEmptyDrive": "No empty drive is available",
     "exportToVault": "Export to Vault",
-    "importFromVault": "Import to Slot",
+    "importFromVault": "Import from Vault",
     "actionApiUnavailable": "This backend does not expose topology action endpoints yet. Please update control-plane and retry.",
     "actionPending": "Enable after backend action endpoints are available",
     "emptySlot": "Empty Slot",

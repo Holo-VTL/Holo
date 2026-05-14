@@ -259,7 +259,7 @@
     "unloadFromDrive": "卸载回分配槽位",
     "noEmptyDrive": "暂无空闲驱动器",
     "exportToVault": "磁带离线出库",
-    "importFromVault": "磁带上线入库",
+    "importFromVault": "从 Vault 导入",
     "actionApiUnavailable": "当前后端未部署拓扑动作接口，请先更新 control-plane 后再重试。",
     "actionPending": "需要后端动作接口后启用",
     "emptySlot": "空槽位",
