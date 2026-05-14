@@ -1597,7 +1597,7 @@ func (h *ResourcesHandler) syncLibrarySlotsToSharedState(ctx context.Context, li
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	existingLabels := readExistingSlotLabels(libraryID, driveIDs[0])
+	existingLabels := librarySlotLabelsSnapshot(ctx, h.repo, libraryID, slotCount)
 	labels := stableSlotLabels(slotCount, librarySlotStart(library), existingLabels, filtered, activeLabels)
 	removeLoadedLabelsFromSlots(labels, readLoadedLabels(libraryID, driveIDs))
 	slotPayload := strings.Join(labels, "\n") + "\n"
@@ -1810,6 +1810,7 @@ func readLibrarySlotLabels(ctx context.Context, repo coreResourcesRepo, libraryI
 	var selectedDriveID string
 	var selectedModTime time.Time
 	var selectedLabels []string
+	selectedHasInventory := false
 	for _, drive := range drives {
 		if drive == nil || drive.LibraryID != libraryID {
 			continue
@@ -1821,10 +1822,14 @@ func readLibrarySlotLabels(ctx context.Context, repo coreResourcesRepo, libraryI
 		if len(labels) == 0 {
 			continue
 		}
-		if selectedLabels == nil || modTime.After(selectedModTime) || (modTime.Equal(selectedModTime) && drive.DriveID < selectedDriveID) {
+		hasInventory := slotLabelsHaveInventory(labels)
+		if selectedLabels == nil ||
+			(hasInventory && !selectedHasInventory) ||
+			(hasInventory == selectedHasInventory && (modTime.After(selectedModTime) || (modTime.Equal(selectedModTime) && drive.DriveID < selectedDriveID))) {
 			selectedDriveID = drive.DriveID
 			selectedModTime = modTime
 			selectedLabels = labels
+			selectedHasInventory = hasInventory
 		}
 	}
 	out := make([]slotLabel, 0, len(selectedLabels))
@@ -1832,6 +1837,31 @@ func readLibrarySlotLabels(ctx context.Context, repo coreResourcesRepo, libraryI
 		out = append(out, slotLabel{index: idx, label: label})
 	}
 	return out
+}
+
+func slotLabelsHaveInventory(labels []string) bool {
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label != "" && label != "-" {
+			return true
+		}
+	}
+	return false
+}
+
+func librarySlotLabelsSnapshot(ctx context.Context, repo coreResourcesRepo, libraryID string, slotCount int) []string {
+	slotLabels := readLibrarySlotLabels(ctx, repo, libraryID)
+	if len(slotLabels) == 0 {
+		return nil
+	}
+	labels := make([]string, slotCount)
+	for _, slotLabel := range slotLabels {
+		if slotLabel.index < 0 || slotLabel.index >= len(labels) {
+			continue
+		}
+		labels[slotLabel.index] = slotLabel.label
+	}
+	return labels
 }
 
 func readExistingSlotLabelsWithModTime(libraryID, driveID string) ([]string, time.Time, bool) {
@@ -1988,14 +2018,7 @@ func readExistingVaultLabels(libraryID, driveID string) []string {
 func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []*domain.VirtualCartridge, active map[string]struct{}) []string {
 	labels := make([]string, slotCount)
 	placed := make(map[string]struct{})
-	hasExistingInventory := false
-	for idx := 0; idx < slotCount && idx < len(existing); idx++ {
-		label := strings.TrimSpace(existing[idx])
-		if label != "" && label != "-" {
-			hasExistingInventory = true
-			break
-		}
-	}
+	hasExistingSnapshot := len(existing) > 0
 	for _, cartridge := range cartridges {
 		if cartridge == nil || cartridge.AssignedSlotAddress == nil {
 			continue
@@ -2045,7 +2068,7 @@ func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []
 	}
 	nextSlot := 0
 	for _, cartridge := range cartridges {
-		if cartridge == nil || cartridge.AssignedSlotAddress != nil || hasExistingInventory {
+		if cartridge == nil || cartridge.AssignedSlotAddress != nil || hasExistingSnapshot {
 			continue
 		}
 		label := cartridgeSharedLabel(cartridge)

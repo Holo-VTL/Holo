@@ -769,12 +769,71 @@ func TestLibrarySlotSyncClearsStaleInventoryWithoutFillingBacklog(t *testing.T) 
 	}
 }
 
+func TestLibrarySlotSyncUsesInventorySnapshotAcrossDrives(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+
+	srv := newTestServer(t)
+	setupSlotFlowLibrary(t, srv, "lib-multi-drive-inventory", "drive-multi-b", 2)
+	createDriveReq := newAuthedRequest(http.MethodPost, "/v1/drives", bytes.NewBufferString(`{"driveId":"drive-multi-a","libraryId":"lib-multi-drive-inventory","slot":257}`))
+	createDriveResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createDriveResp, createDriveReq)
+	if createDriveResp.Code != http.StatusCreated {
+		t.Fatalf("expected second drive 201, got %d body=%s", createDriveResp.Code, createDriveResp.Body.String())
+	}
+	createUnassignedSlotFlowCartridge(t, srv, "lib-multi-drive-inventory", "VTA003L06")
+
+	emptyFirstDrivePath := filepath.Join(mediaStateDir, "lib-multi-drive-inventory__drive-multi-a.slots")
+	if err := os.WriteFile(emptyFirstDrivePath, []byte("-\n-\n"), 0o644); err != nil {
+		t.Fatalf("write empty first drive slots: %v", err)
+	}
+	inventorySecondDrivePath := filepath.Join(mediaStateDir, "lib-multi-drive-inventory__drive-multi-b.slots")
+	if err := os.WriteFile(inventorySecondDrivePath, []byte("VTA001L06\n-\n"), 0o644); err != nil {
+		t.Fatalf("write inventory second drive slots: %v", err)
+	}
+
+	if err := srv.resources.syncLibrarySlotsToSharedState(context.Background(), "lib-multi-drive-inventory"); err != nil {
+		t.Fatalf("sync library slots: %v", err)
+	}
+	slots := readExistingSlotLabels("lib-multi-drive-inventory", "drive-multi-a")
+	if len(slots) != 2 {
+		t.Fatalf("expected 2 slots after sync, got %#v", slots)
+	}
+	if slots[0] != "" || slots[1] != "" {
+		t.Fatalf("expected stale inventory snapshot to prevent backlog fill on every drive, got %#v", slots)
+	}
+}
+
+func TestLibrarySlotSyncDoesNotFillBacklogWhenSnapshotIsEmpty(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+
+	srv := newTestServer(t)
+	setupSlotFlowLibrary(t, srv, "lib-empty-snapshot", "drive-empty-snapshot", 2)
+	createUnassignedSlotFlowCartridge(t, srv, "lib-empty-snapshot", "VTA003L06")
+
+	if err := srv.resources.syncLibrarySlotsToSharedState(context.Background(), "lib-empty-snapshot"); err != nil {
+		t.Fatalf("sync library slots: %v", err)
+	}
+	slots := readExistingSlotLabels("lib-empty-snapshot", "drive-empty-snapshot")
+	if len(slots) != 2 {
+		t.Fatalf("expected 2 slots after sync, got %#v", slots)
+	}
+	if slots[0] != "" || slots[1] != "" {
+		t.Fatalf("expected empty snapshot to remain empty instead of filling backlog, got %#v", slots)
+	}
+}
+
 func TestLibrarySlotSyncBootstrapsUnassignedCartridgesWithoutExistingInventory(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
 
 	srv := newTestServer(t)
 	setupSlotFlowLibrary(t, srv, "lib-bootstrap-unassigned", "drive-bootstrap-unassigned", 3)
+	slotsPath := filepath.Join(mediaStateDir, "lib-bootstrap-unassigned__drive-bootstrap-unassigned.slots")
+	if err := os.Remove(slotsPath); err != nil {
+		t.Fatalf("remove bootstrap slots snapshot: %v", err)
+	}
 	createUnassignedSlotFlowCartridge(t, srv, "lib-bootstrap-unassigned", "VTA000L06")
 	createUnassignedSlotFlowCartridge(t, srv, "lib-bootstrap-unassigned", "VTA001L06")
 
