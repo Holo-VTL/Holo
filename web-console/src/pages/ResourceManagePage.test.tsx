@@ -90,6 +90,8 @@ describe("ResourceManagePage", () => {
         lifecycleState: "available",
         retentionState: "none",
         currentElementAddress: 1034,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       },
       {
         cartridgeId: "VTA031L06",
@@ -100,6 +102,8 @@ describe("ResourceManagePage", () => {
         usedBytes: 0,
         lifecycleState: "available",
         retentionState: "none",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       },
     ]);
     renderManagePage();
