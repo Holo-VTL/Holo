@@ -1190,7 +1190,7 @@ export function ResourceManagePage() {
                 />
               </div>
               {cartridgeCreateNeedsSlots ? (
-                <div className="notice notice-attention notice-stack" style={{ gridColumn: "1 / -1" }}>
+                <div className="modal-notice modal-notice-stack" style={{ gridColumn: "1 / -1" }}>
                   <span>{t("resources.addSlotRequiredDescription", { count: Math.max(requestedCartridgeCount - emptySlots, 1) })}</span>
                   <label className="checkbox-inline" style={{ marginTop: 8 }}>
                     <input
@@ -1297,7 +1297,6 @@ export function ResourceManagePage() {
           cartridgeId: slotShortageImportTarget?.barcode || slotShortageImportTarget?.cartridgeId || "",
         })}
         confirmLabel={t("resources.addSlotAndImport")}
-        noticeTone="attention"
         busy={busyResourceAction.startsWith("add-slot-import:")}
         onConfirm={() => void addSlotAndImportCartridge()}
         onCancel={() => {
