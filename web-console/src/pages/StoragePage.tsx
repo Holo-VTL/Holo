@@ -69,6 +69,19 @@ export function StoragePage() {
     });
   }, [availableDisks, createDialogOpen]);
 
+  useEffect(() => {
+    if (!createDialogOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setCreateDialogOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [createDialogOpen]);
+
   async function createPool(event: FormEvent) {
     event.preventDefault();
     if (!poolForm.name.trim() || !poolForm.devicePath) {

@@ -22,11 +22,12 @@ import (
 )
 
 type ResourcesHandler struct {
-	repo    coreResourcesRepo
-	storage resourceStoragePoolService
-	target  resourceTargetService
-	auditW  audit.Writer
-	slotMu  sync.Mutex
+	repo        coreResourcesRepo
+	storage     resourceStoragePoolService
+	target      resourceTargetService
+	auditW      audit.Writer
+	slotLocksMu sync.Mutex
+	slotLocks   map[string]*sync.Mutex
 }
 
 type coreResourcesRepo interface {
@@ -69,6 +70,25 @@ func NewResourcesHandlerWithAudit(repo coreResourcesRepo, storage resourceStorag
 	return &ResourcesHandler{repo: repo, storage: storage, target: target, auditW: auditW}
 }
 
+func (h *ResourcesHandler) lockLibrarySlots(libraryID string) func() {
+	key := strings.TrimSpace(libraryID)
+	if key == "" {
+		key = "__unknown_library__"
+	}
+	h.slotLocksMu.Lock()
+	if h.slotLocks == nil {
+		h.slotLocks = make(map[string]*sync.Mutex)
+	}
+	mu := h.slotLocks[key]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		h.slotLocks[key] = mu
+	}
+	h.slotLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
 func (h *ResourcesHandler) logCompensationError(ctx context.Context, operation string, err error, fields ...any) {
 	if err == nil {
 		return
@@ -79,6 +99,7 @@ func (h *ResourcesHandler) logCompensationError(ctx context.Context, operation s
 const (
 	maxLibraryDriveCount = 4
 	maxLibrarySlotCount  = 10000
+	defaultLibrarySlots  = 20
 )
 
 type createLibraryRequest struct {
@@ -185,7 +206,7 @@ func (h *ResourcesHandler) handleLibraries(w http.ResponseWriter, r *http.Reques
 		library.DriveStartAddress = req.DriveStartAddress
 		library.SlotCount = req.SlotCount
 		if library.SlotCount == 0 {
-			library.SlotCount = 20
+			library.SlotCount = defaultLibrarySlots
 		}
 		library.SlotStartAddress = req.SlotStartAddress
 		library.IEPortCount = req.IEPortCount
@@ -265,7 +286,7 @@ func (h *ResourcesHandler) handleLibraryByID(w http.ResponseWriter, r *http.Requ
 			respondResourceError(w, err)
 			return
 		}
-		library, err := h.addLibrarySlots(r.Context(), libraryID, req.Count)
+		library, err := h.addLibrarySlots(r.Context(), libraryID, req.Count, req.Actor)
 		if err != nil {
 			respondResourceError(w, err)
 			return
@@ -464,11 +485,6 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 			respondResourceError(w, domain.ErrInvalidInput)
 			return
 		}
-		library, err := h.repo.FindLibrary(r.Context(), req.LibraryID)
-		if err != nil {
-			respondResourceError(w, err)
-			return
-		}
 		if h.storage == nil {
 			respondResourceError(w, domain.ErrInvalidState)
 			return
@@ -482,6 +498,13 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 			respondResourceError(w, domain.ErrInvalidState)
 			return
 		}
+		unlock := h.lockLibrarySlots(req.LibraryID)
+		defer unlock()
+		library, err := h.repo.FindLibrary(r.Context(), req.LibraryID)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
 		cartridgeID, barcode, err := h.resolveCartridgeIdentity(r.Context(), req)
 		if err != nil {
 			respondResourceError(w, err)
@@ -489,12 +512,23 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 		}
 		cartridge := domain.NewVirtualCartridge(cartridgeID, req.PoolID, req.LibraryID, barcode, req.CapacityBytes)
 		cartridge.UpdatedAt = time.Now().UTC()
-		h.slotMu.Lock()
-		defer h.slotMu.Unlock()
-		slotAddress, err := h.assignSlotForNewCartridge(r.Context(), library, req.ExpandSlots)
+		slotAddress, expandedSlots, err := h.assignSlotForNewCartridge(r.Context(), library, req.ExpandSlots)
 		if err != nil {
 			respondResourceError(w, err)
 			return
+		}
+		if expandedSlots {
+			updatedLibrary, findErr := h.repo.FindLibrary(r.Context(), library.LibraryID)
+			if findErr == nil {
+				h.emitLibraryAudit(r.Context(), "web-console", "library_add_slots", updatedLibrary, "success", map[string]any{
+					"addedSlots":  1,
+					"slotCount":   updatedLibrary.SlotCount,
+					"reason":      "create_cartridge_expand_slots",
+					"cartridgeId": cartridge.CartridgeID,
+				})
+			} else {
+				log.Printf("library slot expansion audit skipped library=%s cartridge=%s err=%v", library.LibraryID, cartridge.CartridgeID, findErr)
+			}
 		}
 		cartridge.AssignedSlotAddress = &slotAddress
 		if err := h.repo.CreateCartridge(r.Context(), cartridge); err != nil {
@@ -551,8 +585,13 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 	}
 
 	deleteCartridge := func(actor string) {
-		h.slotMu.Lock()
-		defer h.slotMu.Unlock()
+		existing, err := h.repo.FindCartridge(r.Context(), cartridgeID)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		unlock := h.lockLibrarySlots(existing.LibraryID)
+		defer unlock()
 		if err := h.reconcileMediaState(r.Context()); err != nil {
 			respondResourceError(w, err)
 			return
@@ -883,6 +922,29 @@ func (h *ResourcesHandler) emitCartridgeAudit(ctx context.Context, actor, action
 	}
 }
 
+func (h *ResourcesHandler) emitLibraryAudit(ctx context.Context, actor, action string, library *domain.VirtualLibrary, result string, details map[string]any) {
+	if h.auditW == nil || library == nil {
+		return
+	}
+	if details == nil {
+		details = make(map[string]any)
+	}
+	details["libraryId"] = library.LibraryID
+	evt := audit.Event{
+		EventID:    fmt.Sprintf("%s-%s-%d", action, library.LibraryID, time.Now().UTC().UnixNano()),
+		Actor:      nonEmpty(strings.TrimSpace(actor), "web-console"),
+		Action:     action,
+		ObjectType: "library",
+		ObjectID:   library.LibraryID,
+		Result:     result,
+		Details:    details,
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := h.auditW.Write(ctx, evt); err != nil {
+		log.Printf("AUDIT WRITE FAILURE: %v (event: %s/%s)", err, evt.Action, evt.ObjectID)
+	}
+}
+
 func respondResourceError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	message := "internal server error"
@@ -941,55 +1003,75 @@ func (h *ResourcesHandler) wouldExceedLibraryDriveLimit(ctx context.Context, lib
 	return count >= maxLibraryDriveCount
 }
 
-func (h *ResourcesHandler) addLibrarySlots(ctx context.Context, libraryID string, count int) (*domain.VirtualLibrary, error) {
-	h.slotMu.Lock()
-	defer h.slotMu.Unlock()
-	return h.addLibrarySlotsLocked(ctx, libraryID, count)
-}
-
-func (h *ResourcesHandler) addLibrarySlotsLocked(ctx context.Context, libraryID string, count int) (*domain.VirtualLibrary, error) {
-	library, err := h.repo.FindLibrary(ctx, strings.TrimSpace(libraryID))
+func (h *ResourcesHandler) addLibrarySlots(ctx context.Context, libraryID string, count int, actor string) (*domain.VirtualLibrary, error) {
+	unlock := h.lockLibrarySlots(libraryID)
+	defer unlock()
+	library, added, err := h.addLibrarySlotsLocked(ctx, libraryID, count)
 	if err != nil {
 		return nil, err
 	}
-	if count <= 0 {
+	h.emitLibraryAudit(ctx, actor, "library_add_slots", library, "success", map[string]any{
+		"addedSlots": added,
+		"slotCount":  library.SlotCount,
+	})
+	return library, nil
+}
+
+func (h *ResourcesHandler) addLibrarySlotsLocked(ctx context.Context, libraryID string, count int) (*domain.VirtualLibrary, int, error) {
+	library, err := h.repo.FindLibrary(ctx, strings.TrimSpace(libraryID))
+	if err != nil {
+		return nil, 0, err
+	}
+	if count < 0 || library.SlotCount < 0 {
+		return nil, 0, domain.ErrInvalidInput
+	}
+	if count == 0 {
 		count = 1
 	}
-	if count > maxLibrarySlotCount || library.SlotCount+count > maxLibrarySlotCount {
-		return nil, domain.ErrInvalidInput
+	if library.SlotCount > maxLibrarySlotCount || count > maxLibrarySlotCount-library.SlotCount {
+		return nil, 0, domain.ErrInvalidInput
 	}
 	library.SlotCount += count
 	library.UpdatedAt = time.Now().UTC()
 	if err := h.repo.SaveLibrary(ctx, library); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := h.syncLibrarySlotsToSharedState(ctx, library.LibraryID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return library, nil
+	return library, count, nil
 }
 
-func (h *ResourcesHandler) assignSlotForNewCartridge(ctx context.Context, library *domain.VirtualLibrary, expandSlots bool) (int, error) {
+func (h *ResourcesHandler) assignSlotForNewCartridge(ctx context.Context, library *domain.VirtualLibrary, expandSlots bool) (int, bool, error) {
 	if library == nil {
-		return 0, domain.ErrInvalidInput
+		return 0, false, domain.ErrInvalidInput
 	}
-	if slot, ok := h.nextEmptySlotAddress(ctx, library); ok {
-		return slot, nil
+	cartridges := h.repo.ListCartridges(ctx)
+	labelSlots := h.libraryLabelSlots(ctx, library)
+	if slot, ok := h.nextEmptySlotAddressFromSnapshot(library, cartridges, labelSlots); ok {
+		return slot, false, nil
 	}
 	if !expandSlots {
-		return 0, domain.ErrConflict
+		return 0, false, domain.ErrConflict
 	}
-	updated, err := h.addLibrarySlotsLocked(ctx, library.LibraryID, 1)
+	updated, _, err := h.addLibrarySlotsLocked(ctx, library.LibraryID, 1)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	if slot, ok := h.nextEmptySlotAddress(ctx, updated); ok {
-		return slot, nil
+	if slot, ok := h.nextEmptySlotAddressFromSnapshot(updated, cartridges, labelSlots); ok {
+		return slot, true, nil
 	}
-	return 0, domain.ErrConflict
+	return 0, true, domain.ErrConflict
 }
 
 func (h *ResourcesHandler) nextEmptySlotAddress(ctx context.Context, library *domain.VirtualLibrary) (int, bool) {
+	if library == nil {
+		return 0, false
+	}
+	return h.nextEmptySlotAddressFromSnapshot(library, h.repo.ListCartridges(ctx), h.libraryLabelSlots(ctx, library))
+}
+
+func (h *ResourcesHandler) nextEmptySlotAddressFromSnapshot(library *domain.VirtualLibrary, cartridges []*domain.VirtualCartridge, labelSlots map[string]int) (int, bool) {
 	if library == nil {
 		return 0, false
 	}
@@ -998,7 +1080,7 @@ func (h *ResourcesHandler) nextEmptySlotAddress(ctx context.Context, library *do
 		return 0, false
 	}
 	slotStart := librarySlotStart(library)
-	occupied := h.occupiedSlotAddresses(ctx, library.LibraryID)
+	occupied := occupiedSlotAddressesFromSnapshot(library.LibraryID, cartridges, labelSlots)
 	for idx := 0; idx < slotCount; idx++ {
 		address := slotStart + idx
 		if _, exists := occupied[address]; !exists {
@@ -1009,20 +1091,31 @@ func (h *ResourcesHandler) nextEmptySlotAddress(ctx context.Context, library *do
 }
 
 func (h *ResourcesHandler) occupiedSlotAddresses(ctx context.Context, libraryID string) map[int]struct{} {
-	occupied := make(map[int]struct{})
 	library, err := h.repo.FindLibrary(ctx, libraryID)
 	if err != nil {
-		return occupied
+		return make(map[int]struct{})
+	}
+	return occupiedSlotAddressesFromSnapshot(libraryID, h.repo.ListCartridges(ctx), h.libraryLabelSlots(ctx, library))
+}
+
+func (h *ResourcesHandler) libraryLabelSlots(ctx context.Context, library *domain.VirtualLibrary) map[string]int {
+	labelSlots := make(map[string]int)
+	if library == nil {
+		return labelSlots
 	}
 	slotStart := librarySlotStart(library)
-	labelSlots := make(map[string]int)
-	for _, label := range readLibrarySlotLabels(ctx, h.repo, libraryID) {
+	for _, label := range readLibrarySlotLabels(ctx, h.repo, library.LibraryID) {
 		key := strings.ToUpper(strings.TrimSpace(label.label))
 		if key != "" {
 			labelSlots[key] = slotStart + label.index
 		}
 	}
-	for _, cartridge := range h.repo.ListCartridges(ctx) {
+	return labelSlots
+}
+
+func occupiedSlotAddressesFromSnapshot(libraryID string, cartridges []*domain.VirtualCartridge, labelSlots map[string]int) map[int]struct{} {
+	occupied := make(map[int]struct{})
+	for _, cartridge := range cartridges {
 		if cartridge == nil || strings.TrimSpace(cartridge.LibraryID) != libraryID {
 			continue
 		}
@@ -1146,13 +1239,16 @@ func (h *ResourcesHandler) loadCartridgeIntoDrive(ctx context.Context, driveID, 
 	if driveID == "" || cartridgeID == "" {
 		return nil, domain.ErrInvalidInput
 	}
-	h.slotMu.Lock()
-	defer h.slotMu.Unlock()
+	drive, err := h.repo.FindDrive(ctx, driveID)
+	if err != nil {
+		return nil, err
+	}
+	unlock := h.lockLibrarySlots(drive.LibraryID)
+	defer unlock()
 	if err := h.reconcileMediaState(ctx); err != nil {
 		return nil, err
 	}
-
-	drive, err := h.repo.FindDrive(ctx, driveID)
+	drive, err = h.repo.FindDrive(ctx, driveID)
 	if err != nil {
 		return nil, err
 	}
@@ -1201,13 +1297,16 @@ func (h *ResourcesHandler) unloadDrive(ctx context.Context, driveID, _ string) (
 	if driveID == "" {
 		return nil, domain.ErrInvalidInput
 	}
-	h.slotMu.Lock()
-	defer h.slotMu.Unlock()
+	drive, err := h.repo.FindDrive(ctx, driveID)
+	if err != nil {
+		return nil, err
+	}
+	unlock := h.lockLibrarySlots(drive.LibraryID)
+	defer unlock()
 	if err := h.reconcileMediaState(ctx); err != nil {
 		return nil, err
 	}
-
-	drive, err := h.repo.FindDrive(ctx, driveID)
+	drive, err = h.repo.FindDrive(ctx, driveID)
 	if err != nil {
 		return nil, err
 	}
@@ -1222,6 +1321,17 @@ func (h *ResourcesHandler) unloadDrive(ctx context.Context, driveID, _ string) (
 	if cartridge.LifecycleState != domain.CartridgeMounted {
 		return nil, domain.ErrInvalidState
 	}
+	if cartridge.AssignedSlotAddress == nil {
+		library, err := h.repo.FindLibrary(ctx, cartridge.LibraryID)
+		if err != nil {
+			return nil, err
+		}
+		slotAddress, ok := h.nextEmptySlotAddress(ctx, library)
+		if !ok {
+			return nil, domain.ErrConflict
+		}
+		cartridge.AssignedSlotAddress = &slotAddress
+	}
 	if !h.assignedSlotAvailableFor(ctx, cartridge.LibraryID, cartridge.AssignedSlotAddress, cartridge.CartridgeID) {
 		return nil, domain.ErrConflict
 	}
@@ -1232,6 +1342,7 @@ func (h *ResourcesHandler) unloadDrive(ctx context.Context, driveID, _ string) (
 	if err := cartridge.TransitionTo(domain.CartridgeAvailable); err != nil {
 		return nil, err
 	}
+	cartridge.CurrentElementAddress = cartridge.AssignedSlotAddress
 	if err := h.repo.SaveCartridge(ctx, cartridge); err != nil {
 		return nil, err
 	}
@@ -1252,13 +1363,16 @@ func (h *ResourcesHandler) exportCartridge(ctx context.Context, cartridgeID, _ s
 	if cartridgeID == "" {
 		return nil, domain.ErrInvalidInput
 	}
-	h.slotMu.Lock()
-	defer h.slotMu.Unlock()
+	cartridge, err := h.repo.FindCartridge(ctx, cartridgeID)
+	if err != nil {
+		return nil, err
+	}
+	unlock := h.lockLibrarySlots(cartridge.LibraryID)
+	defer unlock()
 	if err := h.reconcileMediaState(ctx); err != nil {
 		return nil, err
 	}
-
-	cartridge, err := h.repo.FindCartridge(ctx, cartridgeID)
+	cartridge, err = h.repo.FindCartridge(ctx, cartridgeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1284,18 +1398,21 @@ func (h *ResourcesHandler) exportCartridge(ctx context.Context, cartridgeID, _ s
 	return cartridge, nil
 }
 
-func (h *ResourcesHandler) importCartridge(ctx context.Context, cartridgeID, _ string) (*domain.VirtualCartridge, error) {
+func (h *ResourcesHandler) importCartridge(ctx context.Context, cartridgeID, actor string) (*domain.VirtualCartridge, error) {
 	cartridgeID = strings.TrimSpace(cartridgeID)
 	if cartridgeID == "" {
 		return nil, domain.ErrInvalidInput
 	}
-	h.slotMu.Lock()
-	defer h.slotMu.Unlock()
+	cartridge, err := h.repo.FindCartridge(ctx, cartridgeID)
+	if err != nil {
+		return nil, err
+	}
+	unlock := h.lockLibrarySlots(cartridge.LibraryID)
+	defer unlock()
 	if err := h.reconcileMediaState(ctx); err != nil {
 		return nil, err
 	}
-
-	cartridge, err := h.repo.FindCartridge(ctx, cartridgeID)
+	cartridge, err = h.repo.FindCartridge(ctx, cartridgeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1316,13 +1433,20 @@ func (h *ResourcesHandler) importCartridge(ctx context.Context, cartridgeID, _ s
 	if err := cartridge.TransitionTo(domain.CartridgeAvailable); err != nil {
 		return nil, err
 	}
+	cartridge.CurrentElementAddress = &importSlot
 	if err := h.repo.SaveCartridge(ctx, cartridge); err != nil {
 		return nil, err
 	}
 	if err := h.syncLibrarySlotsToSharedState(ctx, cartridge.LibraryID); err != nil {
 		return nil, err
 	}
-	cartridge.CurrentElementAddress = &importSlot
+	if reassigned {
+		h.emitCartridgeAudit(ctx, actor, "cartridge_slot_reassigned", cartridge, "success", map[string]any{
+			"oldAssignedSlot": oldSlot,
+			"newAssignedSlot": importSlot,
+			"reason":          "vault_import_assigned_slot_unavailable",
+		})
+	}
 	return cartridge, nil
 }
 
@@ -1810,6 +1934,8 @@ func stableSlotLabels(slotCount, slotStart int, existing []string, cartridges []
 		if labels[idx] == "" || labels[idx] == "-" || labels[idx] == label {
 			labels[idx] = label
 			placed[label] = struct{}{}
+		} else {
+			log.Printf("slot assignment collision librarySlot=%d existing=%s cartridge=%s assignedSlot=%d", slotStart+idx, labels[idx], label, *cartridge.AssignedSlotAddress)
 		}
 	}
 	for idx := 0; idx < slotCount && idx < len(existing); idx++ {
@@ -2216,8 +2342,8 @@ func isShortEraseLayoutArtifact(name string) bool {
 }
 
 func (h *ResourcesHandler) deleteLibraryCascade(ctx context.Context, libraryID string) error {
-	h.slotMu.Lock()
-	defer h.slotMu.Unlock()
+	unlock := h.lockLibrarySlots(libraryID)
+	defer unlock()
 	if _, err := h.repo.FindLibrary(ctx, libraryID); err != nil {
 		return err
 	}

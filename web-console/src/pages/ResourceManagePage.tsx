@@ -307,6 +307,21 @@ export function ResourceManagePage() {
     }));
   }, [cartridgeCreateNeedsSlots, createCartridgeOpen, usablePools]);
 
+  useEffect(() => {
+    if (!createDriveOpen && !createCartridgeOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      setCreateDriveOpen(false);
+      setCreateCartridgeOpen(false);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [createCartridgeOpen, createDriveOpen]);
+
   async function reloadAll() {
     setError("");
     setLoading(true);

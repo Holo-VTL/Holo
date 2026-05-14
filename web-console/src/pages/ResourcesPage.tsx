@@ -122,6 +122,19 @@ export function ResourcesPage() {
     }
   }, [driveTypeOptions, vtlForm.driveType]);
 
+  useEffect(() => {
+    if (!vtlDialogOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setVtlDialogOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [vtlDialogOpen]);
+
   async function createVtl(event: FormEvent) {
     event.preventDefault();
     const trimmedName = vtlForm.name.trim();

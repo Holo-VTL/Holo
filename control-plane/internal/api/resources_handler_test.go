@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1269,6 +1270,91 @@ func TestCreateCartridgeRequiresExplicitSlotExpansionWhenFull(t *testing.T) {
 	if library.SlotCount != 2 {
 		t.Fatalf("expected explicit expansion to increase slot count to 2, got %d", library.SlotCount)
 	}
+
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if auditResp.Code != http.StatusOK {
+		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
+	}
+	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), "create_cartridge_expand_slots") {
+		t.Fatalf("expected slot expansion audit event, got %s", auditResp.Body.String())
+	}
+}
+
+func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	setupSlotFlowLibrary(t, srv, "lib-add-slot-audit", "drive-add-slot-audit", 2)
+	badReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-slot-audit/slots", bytes.NewBufferString(`{"count":-2,"actor":"tester"}`))
+	badResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(badResp, badReq)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected negative slot count 400, got %d body=%s", badResp.Code, badResp.Body.String())
+	}
+
+	addReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-slot-audit/slots", bytes.NewBufferString(`{"count":2,"actor":"tester"}`))
+	addResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(addResp, addReq)
+	if addResp.Code != http.StatusOK {
+		t.Fatalf("expected add slots 200, got %d body=%s", addResp.Code, addResp.Body.String())
+	}
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if auditResp.Code != http.StatusOK {
+		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
+	}
+	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), `"addedSlots":2`) {
+		t.Fatalf("expected add slots audit event, got %s", auditResp.Body.String())
+	}
+}
+
+func TestConcurrentExpandedCartridgeCreatesGetDistinctSlots(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	setupSlotFlowLibrary(t, srv, "lib-concurrent-expand", "drive-concurrent-expand", 1)
+	createSlotFlowCartridge(t, srv, "lib-concurrent-expand", "VTA060L06", false)
+
+	var wg sync.WaitGroup
+	errs := make(chan string, 2)
+	for _, id := range []string{"VTA061L06", "VTA062L06"} {
+		wg.Add(1)
+		go func(cartridgeID string) {
+			defer wg.Done()
+			body := `{"poolId":"pool-lib-concurrent-expand","cartridgeId":"` + cartridgeID + `","libraryId":"lib-concurrent-expand","barcode":"` + cartridgeID + `","capacityBytes":549755813888,"expandSlots":true}`
+			req := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(body))
+			resp := httptest.NewRecorder()
+			srv.Router().ServeHTTP(resp, req)
+			if resp.Code != http.StatusCreated {
+				errs <- cartridgeID + ": " + resp.Body.String()
+			}
+		}(id)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent create failed: %s", err)
+	}
+
+	assigned := make(map[int]string)
+	for _, id := range []string{"VTA060L06", "VTA061L06", "VTA062L06"} {
+		cartridge, err := srv.resources.repo.FindCartridge(context.Background(), id)
+		if err != nil {
+			t.Fatalf("find cartridge %s: %v", id, err)
+		}
+		if cartridge.AssignedSlotAddress == nil {
+			t.Fatalf("expected assigned slot for %s", id)
+		}
+		if other, exists := assigned[*cartridge.AssignedSlotAddress]; exists {
+			t.Fatalf("slot %d assigned to both %s and %s", *cartridge.AssignedSlotAddress, other, id)
+		}
+		assigned[*cartridge.AssignedSlotAddress] = id
+	}
 }
 
 func TestDriveUnloadReturnsToAssignedSlot(t *testing.T) {
@@ -1311,6 +1397,67 @@ func TestDriveUnloadReturnsToAssignedSlot(t *testing.T) {
 	}
 	if cartridge.CurrentElementAddress == nil || *cartridge.CurrentElementAddress != 1025 {
 		t.Fatalf("expected unloaded cartridge back in slot 1025, got %+v", cartridge.CurrentElementAddress)
+	}
+}
+
+func TestDriveUnloadRepairsLegacyMissingAssignedSlot(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+	ctx := context.Background()
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		code   int
+	}{
+		{http.MethodPost, "/v1/storage/pools", `{"poolId":"pool-legacy-unload","name":"Pool Legacy Unload","warningThresholdPct":90}`, http.StatusCreated},
+		{http.MethodPost, "/v1/libraries", `{"libraryId":"lib-legacy-unload","name":"Library Legacy Unload","slotCount":2,"slotStartAddress":1024}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives", `{"driveId":"drive-legacy-unload","libraryId":"lib-legacy-unload","slot":256}`, http.StatusCreated},
+		{http.MethodPost, "/v1/cartridges", `{"poolId":"pool-legacy-unload","cartridgeId":"VTA012L06","libraryId":"lib-legacy-unload","barcode":"VTA012L06","capacityBytes":549755813888}`, http.StatusCreated},
+		{http.MethodPost, "/v1/drives/drive-legacy-unload/load", `{"cartridgeId":"VTA012L06","actor":"web-console"}`, http.StatusOK},
+	}
+	for _, request := range requests {
+		req := newAuthedRequest(request.method, request.path, bytes.NewBufferString(request.body))
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		if resp.Code != request.code {
+			t.Fatalf("%s %s expected %d got %d body=%s", request.method, request.path, request.code, resp.Code, resp.Body.String())
+		}
+	}
+
+	cartridge, err := srv.resources.repo.FindCartridge(ctx, "VTA012L06")
+	if err != nil {
+		t.Fatalf("find legacy mounted cartridge: %v", err)
+	}
+	cartridge.AssignedSlotAddress = nil
+	if err := srv.resources.repo.SaveCartridge(ctx, cartridge); err != nil {
+		t.Fatalf("clear legacy assigned slot: %v", err)
+	}
+
+	unloadReq := newAuthedRequest(http.MethodPost, "/v1/drives/drive-legacy-unload/unload", bytes.NewBufferString(`{"actor":"web-console"}`))
+	unloadResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(unloadResp, unloadReq)
+	if unloadResp.Code != http.StatusOK {
+		t.Fatalf("expected legacy unload 200, got %d body=%s", unloadResp.Code, unloadResp.Body.String())
+	}
+
+	getReq := newAuthedRequest(http.MethodGet, "/v1/cartridges/VTA012L06", nil)
+	getResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getResp, getReq)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("expected cartridge get 200, got %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	var repaired domain.VirtualCartridge
+	if err := json.Unmarshal(getResp.Body.Bytes(), &repaired); err != nil {
+		t.Fatalf("decode repaired cartridge: %v", err)
+	}
+	if repaired.AssignedSlotAddress == nil || *repaired.AssignedSlotAddress != 1024 {
+		t.Fatalf("expected unload to repair assigned slot 1024, got %+v", repaired.AssignedSlotAddress)
+	}
+	if repaired.CurrentElementAddress == nil || *repaired.CurrentElementAddress != 1024 {
+		t.Fatalf("expected legacy unload to return cartridge to slot 1024, got %+v", repaired.CurrentElementAddress)
 	}
 }
 
@@ -1444,6 +1591,16 @@ func TestVaultImportReassignsWhenAssignedSlotWasReused(t *testing.T) {
 	}
 	if cartridge.CurrentElementAddress == nil || *cartridge.CurrentElementAddress != 3 {
 		t.Fatalf("expected imported cartridge to occupy slot 3, got %+v", cartridge.CurrentElementAddress)
+	}
+
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if auditResp.Code != http.StatusOK {
+		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
+	}
+	if !strings.Contains(auditResp.Body.String(), "cartridge_slot_reassigned") || !strings.Contains(auditResp.Body.String(), "vault_import_assigned_slot_unavailable") {
+		t.Fatalf("expected vault import reassignment audit event, got %s", auditResp.Body.String())
 	}
 }
 
