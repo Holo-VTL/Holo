@@ -1557,6 +1557,9 @@ func (h *ResourcesHandler) syncLibrarySlotsToSharedState(ctx context.Context, li
 		return err
 	}
 
+	if err := h.repairLegacyAssignedSlotsForLibrary(ctx, library); err != nil {
+		return err
+	}
 	cartridges := h.repo.ListCartridges(ctx)
 	filtered := make([]*domain.VirtualCartridge, 0)
 	exported := make([]*domain.VirtualCartridge, 0)
@@ -1706,6 +1709,10 @@ func (h *ResourcesHandler) reconcileMediaState(ctx context.Context) error {
 		}
 	}
 
+	if err := h.repairLegacyAssignedSlots(ctx, cartridges, mounted, exported); err != nil {
+		return err
+	}
+
 	for _, cartridge := range cartridges {
 		if cartridge == nil || cartridge.LifecycleState == domain.CartridgeRetired {
 			continue
@@ -1743,6 +1750,97 @@ func (h *ResourcesHandler) reconcileMediaState(ctx context.Context) error {
 		}
 	}
 	return h.syncPoolUsageForCartridges(ctx, h.repo.ListCartridges(ctx))
+}
+
+func (h *ResourcesHandler) repairLegacyAssignedSlotsForLibrary(ctx context.Context, library *domain.VirtualLibrary) error {
+	if library == nil {
+		return nil
+	}
+	libraryID := strings.TrimSpace(library.LibraryID)
+	cartridges := make([]*domain.VirtualCartridge, 0)
+	for _, cartridge := range h.repo.ListCartridges(ctx) {
+		if cartridge != nil && strings.TrimSpace(cartridge.LibraryID) == libraryID {
+			cartridges = append(cartridges, cartridge)
+		}
+	}
+	return h.repairLegacyAssignedSlots(ctx, cartridges, nil, nil)
+}
+
+func (h *ResourcesHandler) repairLegacyAssignedSlots(ctx context.Context, cartridges []*domain.VirtualCartridge, mounted, exported map[string]struct{}) error {
+	occupiedByLibrary := make(map[string]map[int]string)
+	libraryCache := make(map[string]*domain.VirtualLibrary)
+	labelSlotsByLibrary := make(map[string]map[string]int)
+
+	for _, cartridge := range cartridges {
+		if cartridge == nil || cartridge.AssignedSlotAddress == nil {
+			continue
+		}
+		libraryID := strings.TrimSpace(cartridge.LibraryID)
+		if libraryID == "" || cartridge.LifecycleState == domain.CartridgeExported || cartridge.LifecycleState == domain.CartridgeRetired {
+			continue
+		}
+		occupied := occupiedByLibrary[libraryID]
+		if occupied == nil {
+			occupied = make(map[int]string)
+			occupiedByLibrary[libraryID] = occupied
+		}
+		occupied[*cartridge.AssignedSlotAddress] = cartridge.CartridgeID
+	}
+
+	for _, cartridge := range cartridges {
+		if cartridge == nil || cartridge.AssignedSlotAddress != nil || cartridge.LifecycleState == domain.CartridgeMounted || cartridge.LifecycleState == domain.CartridgeExported || cartridge.LifecycleState == domain.CartridgeRetired {
+			continue
+		}
+		if _, ok := mounted[cartridge.CartridgeID]; ok {
+			continue
+		}
+		if _, ok := exported[cartridge.CartridgeID]; ok {
+			continue
+		}
+		libraryID := strings.TrimSpace(cartridge.LibraryID)
+		if libraryID == "" {
+			continue
+		}
+		library := libraryCache[libraryID]
+		if library == nil {
+			found, err := h.repo.FindLibrary(ctx, libraryID)
+			if err != nil {
+				continue
+			}
+			library = found
+			libraryCache[libraryID] = found
+		}
+		labelSlots := labelSlotsByLibrary[libraryID]
+		if labelSlots == nil {
+			labelSlots = h.libraryLabelSlots(ctx, library)
+			labelSlotsByLibrary[libraryID] = labelSlots
+		}
+		address, ok := labelSlots[strings.ToUpper(strings.TrimSpace(cartridge.CartridgeID))]
+		if !ok {
+			address, ok = labelSlots[strings.ToUpper(strings.TrimSpace(cartridge.Barcode))]
+		}
+		if !ok {
+			continue
+		}
+		occupied := occupiedByLibrary[libraryID]
+		if occupied == nil {
+			occupied = make(map[int]string)
+			occupiedByLibrary[libraryID] = occupied
+		}
+		if existing := occupied[address]; existing != "" && existing != cartridge.CartridgeID {
+			log.Printf("legacy slot assignment repair skipped library=%s cartridge=%s slot=%d occupiedBy=%s", libraryID, cartridge.CartridgeID, address, existing)
+			continue
+		}
+		cartridge.AssignedSlotAddress = &address
+		cartridge.CurrentElementAddress = &address
+		cartridge.UpdatedAt = time.Now().UTC()
+		if err := h.repo.SaveCartridge(ctx, cartridge); err != nil {
+			return err
+		}
+		occupied[address] = cartridge.CartridgeID
+		log.Printf("legacy slot assignment repaired library=%s cartridge=%s assignedSlot=%d", libraryID, cartridge.CartridgeID, address)
+	}
+	return nil
 }
 
 func (h *ResourcesHandler) ReconcileMediaState(ctx context.Context) error {

@@ -769,6 +769,43 @@ func TestLibrarySlotSyncClearsStaleInventoryWithoutFillingBacklog(t *testing.T) 
 	}
 }
 
+func TestLibrarySlotSyncRepairsLegacyAssignedSlotsFromInventory(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+
+	srv := newTestServer(t)
+	setupSlotFlowLibrary(t, srv, "lib-legacy-assign", "drive-legacy-assign", 3)
+	createUnassignedSlotFlowCartridge(t, srv, "lib-legacy-assign", "VTA000L06")
+	createUnassignedSlotFlowCartridge(t, srv, "lib-legacy-assign", "VTA001L06")
+
+	slotsPath := filepath.Join(mediaStateDir, "lib-legacy-assign__drive-legacy-assign.slots")
+	if err := os.WriteFile(slotsPath, []byte("VTA000L06\n-\nVTA001L06\n"), 0o644); err != nil {
+		t.Fatalf("write legacy slots: %v", err)
+	}
+
+	if err := srv.resources.syncLibrarySlotsToSharedState(context.Background(), "lib-legacy-assign"); err != nil {
+		t.Fatalf("sync library slots: %v", err)
+	}
+	first, err := srv.resources.repo.FindCartridge(context.Background(), "VTA000L06")
+	if err != nil {
+		t.Fatalf("find first cartridge: %v", err)
+	}
+	second, err := srv.resources.repo.FindCartridge(context.Background(), "VTA001L06")
+	if err != nil {
+		t.Fatalf("find second cartridge: %v", err)
+	}
+	if first.AssignedSlotAddress == nil || *first.AssignedSlotAddress != 1 {
+		t.Fatalf("expected VTA000L06 assigned to slot 1, got %#v", first.AssignedSlotAddress)
+	}
+	if second.AssignedSlotAddress == nil || *second.AssignedSlotAddress != 3 {
+		t.Fatalf("expected VTA001L06 assigned to slot 3, got %#v", second.AssignedSlotAddress)
+	}
+	slots := readExistingSlotLabels("lib-legacy-assign", "drive-legacy-assign")
+	if len(slots) != 3 || slots[0] != "VTA000L06" || slots[1] != "" || slots[2] != "VTA001L06" {
+		t.Fatalf("expected legacy inventory to remain stable, got %#v", slots)
+	}
+}
+
 func TestLibrarySlotSyncUsesInventorySnapshotAcrossDrives(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
