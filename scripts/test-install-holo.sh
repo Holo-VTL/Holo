@@ -228,6 +228,7 @@ test_upgrade_plan() {
   local out
   out="$(run_dry_action upgrade "${osr}" "${bundle}")"
   assert_contains "${out}" "Action: upgrade"
+  assert_contains "${out}" "Dry-run active iSCSI session check deferred"
   assert_contains "${out}" "Stopping control-plane before upgrade"
   assert_contains "${out}" "systemctl\\ stop\\ holo-control-plane"
   assert_contains "${out}" "[dry-run][summary] action=upgrade"

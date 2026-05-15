@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ACTION="install"
 DRY_RUN=0
+STRICT_ISCSI_UPGRADE_GUARD=0
 WITH_VALIDATION_TOOLS=0
 BUILD_TCMU_PLUGIN=0
 PURGE_DATA=0
@@ -62,6 +63,8 @@ Commands:
 
 Options:
   --dry-run                 Print planned actions without changes
+  --strict-iscsi-upgrade-guard
+                            Refuse upgrade while Holo iSCSI target sessions are active
   --bundle-dir PATH         Release artifacts directory (default: script directory)
   --deps-dir PATH           Bundled tcmu-runner RPM/DEB packages directory
   --prefix PATH             Install prefix (default: /opt/holo)
@@ -171,6 +174,8 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run)               DRY_RUN=1; shift ;;
+      --strict-iscsi-upgrade-guard)
+                               STRICT_ISCSI_UPGRADE_GUARD=1; shift ;;
       --bundle-dir)            [[ $# -ge 2 ]] || die_usage "--bundle-dir requires a path"
                                BUNDLE_DIR="$2"; shift 2 ;;
       --deps-dir)              [[ $# -ge 2 ]] || die_usage "--deps-dir requires a path"
@@ -1430,6 +1435,42 @@ stop_control_plane_for_upgrade() {
   run_shell "systemctl stop holo-control-plane 2>/dev/null || true"
 }
 
+holo_target_session_count() {
+  local configfs_root="${HOLO_INSTALL_ISCSI_CONFIGFS_ROOT:-/sys/kernel/config/target/iscsi}" count=0 file
+  if [[ -d "${configfs_root}" ]]; then
+    while IFS= read -r -d '' file; do
+      count=$((count + $(tr '\0' '\n' <"${file}" | awk 'NF { c++ } END { print c + 0 }')))
+    done < <(find "${configfs_root}" -path '*/dynamic_sessions' -print0 2>/dev/null)
+    printf '%s\n' "${count}"
+    return 0
+  fi
+
+  if command -v targetcli >/dev/null 2>&1; then
+    TARGETCLI_HOME="${TARGETCLI_HOME:-/run/holo/targetcli-home}" targetcli sessions detail 2>/dev/null \
+      | awk 'BEGIN { c = 0 } index($0, "iqn.") && /->/ { c++ } END { print c + 0 }'
+    return 0
+  fi
+
+  printf '0\n'
+}
+
+check_active_iscsi_sessions_for_upgrade() {
+  if [[ "${ACTION}" != "upgrade" ]]; then return 0; fi
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "Dry-run active iSCSI session check deferred"
+    return 0
+  fi
+
+  local sessions
+  sessions="$(holo_target_session_count)"
+  if [[ "${sessions}" =~ ^[0-9]+$ ]] && (( sessions > 0 )); then
+    if [[ "${STRICT_ISCSI_UPGRADE_GUARD}" == "1" ]]; then
+      die "refusing upgrade while ${sessions} Holo iSCSI target session(s) are active; stop backup jobs, log out initiators/rescan backup software, then rerun upgrade"
+    fi
+    warn "detected ${sessions} active Holo iSCSI target session(s); upgrade will restart target services and initiators may need logout/login, OS rescan, and backup software inventory before new jobs run"
+  fi
+}
+
 build_tcmu_plugin() {
   log "Building TCMU plugin from source"
   local handler_src="${BUNDLE_DIR}/handler_holo.c"
@@ -1904,6 +1945,7 @@ install_or_upgrade_holo() {
   resolve_plugin_source_dir
   load_kernel_modules
   ensure_user_and_dirs
+  check_active_iscsi_sessions_for_upgrade
   stop_control_plane_for_upgrade
   if [[ "${ACTION}" == "upgrade" ]]; then
     cleanup_runtime_targets
