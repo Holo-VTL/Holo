@@ -2159,6 +2159,8 @@ pub(crate) fn drive_mam_attributes(
                 .to_be_bytes()
                 .to_vec(),
         }, // volume change reference
+        // 0x020A-0x020D are device make/serial history slots, not host
+        // application metadata. Host-writable application fields start at 0x0800.
         ReadAttributeEntry {
             id: 0x020A,
             format: 0x81,
