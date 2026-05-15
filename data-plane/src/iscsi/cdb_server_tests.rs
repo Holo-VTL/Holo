@@ -28,7 +28,7 @@ mod tests {
         }
     }
 
-    fn read_attr_value(state: &mut crate::scsi_tape::state::TapeState, attr: u16) -> Vec<u8> {
+    fn read_attr_entry(state: &mut crate::scsi_tape::state::TapeState, attr: u16) -> (u8, Vec<u8>) {
         let mut cdb = vec![
             0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // op/service + partition
             0x00, 0x00, // first attribute
@@ -44,9 +44,14 @@ mod tests {
         );
         assert!(response.reply.len() >= 9);
         assert_eq!(&response.reply[4..6], &attr.to_be_bytes());
+        let format = response.reply[6];
         let value_len = u16::from_be_bytes([response.reply[7], response.reply[8]]) as usize;
         assert!(response.reply.len() >= 9 + value_len);
-        response.reply[9..9 + value_len].to_vec()
+        (format, response.reply[9..9 + value_len].to_vec())
+    }
+
+    fn read_attr_value(state: &mut crate::scsi_tape::state::TapeState, attr: u16) -> Vec<u8> {
+        read_attr_entry(state, attr).1
     }
 
     fn attr_u64(state: &mut crate::scsi_tape::state::TapeState, attr: u16) -> u64 {
@@ -2178,6 +2183,49 @@ mod tests {
     }
 
     #[test]
+    fn test_drive_read_attribute_0401_reports_loaded_medium_serial() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let drive_id = format!("IBMvtldrv010-{nanos}");
+        let cartridge_id = format!("DBK{nanos}");
+        let mut state = crate::scsi_tape::state::TapeState::new(drive_id.clone());
+        crate::media::mount_bridge::attach_cartridge(&mut state, &cartridge_id).expect("attach");
+        write_shared_loaded_cartridge(&drive_id, Some(&cartridge_id)).expect("write shared state");
+        drain_unit_attention(&mut state);
+
+        let cdb = vec![
+            0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // op/service + partition
+            0x04, 0x01, // first attribute: medium serial number
+            0x00, 0x00, 0x04, 0x00, // Dbackup-sized allocation length
+            0x00, 0x00,
+        ];
+        let response = dispatch_raw_cdb(&mut state, &cdb, &[]);
+        assert_eq!(
+            response.status, SCSI_STATUS_GOOD,
+            "sense={:?}",
+            response.sense
+        );
+        assert!(response.reply.len() >= 41);
+        assert_eq!(&response.reply[4..6], &[0x04, 0x01]);
+        assert_eq!(response.reply[6], 0x81);
+        assert_eq!(&response.reply[7..9], &[0x00, 0x20]);
+        assert_eq!(
+            &response.reply[9..9 + cartridge_id.len()],
+            cartridge_id.as_bytes()
+        );
+        let serial =
+            std::str::from_utf8(&response.reply[9..41]).expect("medium serial should be ASCII");
+        assert!(
+            !serial.contains(&drive_id),
+            "medium serial must not be derived from drive id: {serial:?}"
+        );
+
+        let _ = write_shared_loaded_cartridge(&drive_id, None);
+    }
+
+    #[test]
     fn test_drive_shared_cartridge_metadata_overrides_reported_capacity() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2197,7 +2245,7 @@ mod tests {
         apply_shared_cartridge_metadata(&mut state);
 
         assert_eq!(attr_u64(&mut state, 0x0001), 42 * 1024);
-        assert_eq!(attr_u64(&mut state, 0x0407), 42 * 1024);
+        assert_eq!(attr_u64(&mut state, 0x0407), 4096);
 
         let mode_sense =
             dispatch_raw_cdb(&mut state, &[0x5A, 0x00, 0x10, 0, 0, 0, 0, 0, 0x40, 0], &[]);
@@ -2282,33 +2330,30 @@ mod tests {
     }
 
     #[test]
-    fn test_drive_read_attribute_mam_capacity_0407_is_legacy_4096() {
+    fn test_drive_read_attribute_standard_mam_attributes_are_readonly() {
         let mut state = crate::scsi_tape::state::TapeState::new("drive-attr-0407");
         state.mount_state = crate::scsi_tape::state::MountState::Loaded;
 
-        let cdb = vec![
-            0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // op/service + partition
-            0x04, 0x07, // first attribute
-            0x00, 0x00, 0x00, 0x40, // allocation length
-            0x00, 0x00,
-        ];
-        let response = dispatch_raw_cdb(&mut state, &cdb, &[]);
-        assert_eq!(response.status, SCSI_STATUS_GOOD);
-        assert!(response.reply.len() >= 17);
-        assert_eq!(&response.reply[4..6], &[0x04, 0x07]);
-        assert_eq!(response.reply[6], 0x80);
-        assert_eq!(&response.reply[7..9], &[0x00, 0x08]);
-        let mam_capacity = u64::from_be_bytes([
-            response.reply[9],
-            response.reply[10],
-            response.reply[11],
-            response.reply[12],
-            response.reply[13],
-            response.reply[14],
-            response.reply[15],
-            response.reply[16],
-        ]);
-        assert_eq!(mam_capacity, 4096);
+        for (attr, expected_format) in [
+            (0x0008u16, 0x81u8),
+            (0x0009u16, 0x80u8),
+            (0x020Au16, 0x81u8),
+            (0x020Bu16, 0x81u8),
+            (0x020Cu16, 0x81u8),
+            (0x020Du16, 0x81u8),
+            (0x0400u16, 0x81u8),
+            (0x0404u16, 0x81u8),
+            (0x0407u16, 0x80u8),
+        ] {
+            let (format, _) = read_attr_entry(&mut state, attr);
+            assert_eq!(format, expected_format, "attribute 0x{attr:04X}");
+        }
+
+        assert_eq!(
+            read_attr_value(&mut state, 0x0404),
+            fixed_ascii_value("LTO-CVE", 8)
+        );
+        assert_eq!(attr_u64(&mut state, 0x0407), 4096);
     }
 
     #[test]

@@ -2089,13 +2089,20 @@ pub(crate) fn drive_mam_attributes(
     let remaining_bytes = capacity_bytes.saturating_sub(state.eod_position);
     let medium_type = medium_type_for_loaded_media(state, profile);
     let density_code = density_code_for_profile(profile);
-    let serial = profile
+    let fallback_serial = profile
         .serial_for_vpd_seed(&state.drive_id)
         .unwrap_or_else(|_| state.drive_id.clone());
+    let medium_serial = state
+        .cartridge_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(&fallback_serial)
+        .trim();
     let host_signature = "";
     let capacity_mib = bytes_to_mib_u32(capacity_bytes) as u64;
     let remaining_mib = bytes_to_mib_u32(remaining_bytes) as u64;
     let active_partition = state.partition_runtime.active_partition;
+    let device_make_serial = format!("{} {}", profile.vendor.trim(), fallback_serial.trim());
 
     vec![
         // Cartridge attributes
@@ -2142,34 +2149,34 @@ pub(crate) fn drive_mam_attributes(
         }, // initialization count baseline
         ReadAttributeEntry {
             id: 0x0008,
-            format: 0x01,
+            format: 0x81,
             value: fixed_ascii_value("", 32),
         },
         ReadAttributeEntry {
             id: 0x0009,
-            format: 0x00,
+            format: 0x80,
             value: clamp_u64_to_u32(state.usage_counters.volume_change_reference)
                 .to_be_bytes()
                 .to_vec(),
         }, // volume change reference
         ReadAttributeEntry {
             id: 0x020A,
-            format: 0x01,
-            value: fixed_ascii_value(host_signature, 40),
+            format: 0x81,
+            value: fixed_ascii_value(&device_make_serial, 40),
         },
         ReadAttributeEntry {
             id: 0x020B,
-            format: 0x01,
+            format: 0x81,
             value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
             id: 0x020C,
-            format: 0x01,
+            format: 0x81,
             value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
             id: 0x020D,
-            format: 0x01,
+            format: 0x81,
             value: fixed_ascii_value(host_signature, 40),
         },
         ReadAttributeEntry {
@@ -2213,13 +2220,13 @@ pub(crate) fn drive_mam_attributes(
         // Medium attributes
         ReadAttributeEntry {
             id: 0x0400,
-            format: 0x01,
+            format: 0x81,
             value: fixed_ascii_value(profile.vendor.trim(), 8),
         },
         ReadAttributeEntry {
             id: 0x0401,
-            format: 0x01,
-            value: fixed_ascii_value(&serial, 32),
+            format: 0x81,
+            value: fixed_ascii_value(medium_serial, 32),
         },
         ReadAttributeEntry {
             id: 0x0402,
@@ -2236,7 +2243,7 @@ pub(crate) fn drive_mam_attributes(
         ReadAttributeEntry {
             id: 0x0404,
             format: 0x81,
-            value: fixed_ascii_value("HOLO", 8),
+            value: fixed_ascii_value("LTO-CVE", 8),
         },
         ReadAttributeEntry {
             id: 0x0405,
@@ -2251,10 +2258,8 @@ pub(crate) fn drive_mam_attributes(
         ReadAttributeEntry {
             id: 0x0407,
             format: 0x80,
-            value: mam_capacity_attribute_value(state, profile, capacity_mib)
-                .to_be_bytes()
-                .to_vec(),
-        }, // MAM capacity / custom capacity compatibility value
+            value: 4096u64.to_be_bytes().to_vec(),
+        }, // MAM capacity, not tape data capacity.
         ReadAttributeEntry {
             id: 0x0408,
             format: 0x80,
@@ -2570,17 +2575,6 @@ pub(crate) fn medium_length_meters_for_state(
         .saturating_add(native_capacity - 1)
         / native_capacity;
     scaled.clamp(1, u16::MAX as u64) as u16
-}
-
-pub(crate) fn mam_capacity_attribute_value(
-    state: &TapeState,
-    profile: &DeviceIdentityProfile,
-    capacity_mib: u64,
-) -> u64 {
-    if has_custom_capacity_override(state, profile) {
-        return capacity_mib;
-    }
-    4096
 }
 
 pub(crate) fn drive_medium_descriptor(
