@@ -1890,19 +1890,28 @@ pub(crate) fn read_attribute_drive(
                 return invalid_field_in_cdb_response();
             }
             for entry in attrs.iter().filter(|entry| entry.id >= first_attribute) {
+                if allocation_length >= 4
+                    && payload
+                        .len()
+                        .saturating_add(read_attribute_entry_len(entry))
+                        > allocation_length
+                {
+                    break;
+                }
                 append_read_attribute_entry(&mut payload, entry);
             }
-            let length = (payload.len().saturating_sub(4)) as u32;
-            payload[0..4].copy_from_slice(&length.to_be_bytes());
+            finalize_read_attribute_payload(&mut payload);
             payload
         }
         READ_ATTRIBUTE_ACTION_LIST => {
             let mut payload = vec![0u8; 4];
             for entry in &attrs {
+                if allocation_length >= 4 && payload.len().saturating_add(2) > allocation_length {
+                    break;
+                }
                 payload.extend_from_slice(&entry.id.to_be_bytes());
             }
-            let length = (payload.len().saturating_sub(4)) as u32;
-            payload[0..4].copy_from_slice(&length.to_be_bytes());
+            finalize_read_attribute_payload(&mut payload);
             payload
         }
         _ => return invalid_field_in_cdb_response(),
@@ -2079,6 +2088,15 @@ pub(crate) fn append_read_attribute_entry(out: &mut Vec<u8>, entry: &ReadAttribu
     out.push(entry.format);
     out.extend_from_slice(&(entry.value.len() as u16).to_be_bytes());
     out.extend_from_slice(&entry.value);
+}
+
+pub(crate) fn read_attribute_entry_len(entry: &ReadAttributeEntry) -> usize {
+    5usize.saturating_add(entry.value.len())
+}
+
+pub(crate) fn finalize_read_attribute_payload(payload: &mut [u8]) {
+    let length = (payload.len().saturating_sub(4)) as u32;
+    payload[0..4].copy_from_slice(&length.to_be_bytes());
 }
 
 pub(crate) fn drive_mam_attributes(

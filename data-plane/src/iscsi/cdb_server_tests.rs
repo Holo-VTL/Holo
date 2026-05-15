@@ -2226,6 +2226,61 @@ mod tests {
     }
 
     #[test]
+    fn test_drive_read_attribute_avoids_partial_entries_when_allocation_truncates() {
+        let drive_id = "drive-attr-truncate";
+        let cartridge_id = "VTA000L09";
+        let mut state = crate::scsi_tape::state::TapeState::new(drive_id);
+        state.mount_state = crate::scsi_tape::state::MountState::Loaded;
+        state.cartridge_id = Some(cartridge_id.to_string());
+        write_shared_loaded_cartridge(drive_id, Some(cartridge_id)).expect("write shared state");
+        drain_unit_attention(&mut state);
+
+        let cdb = vec![
+            0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // op/service + partition
+            0x00, 0x00, // first attribute
+            0x00, 0x00, 0x04, 0x00, // Dbackup-sized allocation length
+            0x00, 0x00,
+        ];
+        let response = dispatch_raw_cdb(&mut state, &cdb, &[]);
+        assert_eq!(
+            response.status, SCSI_STATUS_GOOD,
+            "sense={:?}",
+            response.sense
+        );
+        assert!(response.reply.len() <= 1024);
+        assert!(response.reply.len() >= 4);
+        let payload_len = u32::from_be_bytes([
+            response.reply[0],
+            response.reply[1],
+            response.reply[2],
+            response.reply[3],
+        ]) as usize;
+        assert_eq!(payload_len, response.reply.len().saturating_sub(4));
+
+        let mut offset = 4usize;
+        let mut seen = Vec::new();
+        while offset < response.reply.len() {
+            assert!(
+                response.reply.len().saturating_sub(offset) >= 5,
+                "truncated attribute header at offset {offset}"
+            );
+            let attr = u16::from_be_bytes([response.reply[offset], response.reply[offset + 1]]);
+            let value_len =
+                u16::from_be_bytes([response.reply[offset + 3], response.reply[offset + 4]])
+                    as usize;
+            let next = offset + 5 + value_len;
+            assert!(
+                next <= response.reply.len(),
+                "truncated attribute 0x{attr:04X}"
+            );
+            assert!(!seen.contains(&attr), "duplicated attribute 0x{attr:04X}");
+            seen.push(attr);
+            offset = next;
+        }
+        let _ = write_shared_loaded_cartridge(drive_id, None);
+    }
+
+    #[test]
     fn test_drive_shared_cartridge_metadata_overrides_reported_capacity() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
