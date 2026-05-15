@@ -2642,15 +2642,12 @@ pub(crate) fn drive_medium_descriptor(
 
 pub(crate) fn medium_type_for_loaded_media(
     state: &TapeState,
-    _profile: &DeviceIdentityProfile,
+    profile: &DeviceIdentityProfile,
 ) -> u8 {
     if state.mount_state != crate::scsi_tape::state::MountState::Loaded {
         return 0;
     }
-    // Linux + Veeam treats legacy LTO medium type values such as 0x48 as
-    // unknown. Density and generation remain available through block
-    // descriptors, REPORT DENSITY SUPPORT, and MAM capacity attributes.
-    0
+    density_code_for_profile(profile)
 }
 
 pub(crate) fn device_specific_mode_parameter(state: &TapeState) -> u8 {

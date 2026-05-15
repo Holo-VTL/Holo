@@ -1676,12 +1676,27 @@ mod tests {
         let response = dispatch_raw_cdb(&mut state, &cdb, &[]);
         assert_eq!(response.status, SCSI_STATUS_GOOD);
         assert!(response.reply.len() >= 8);
-        assert_eq!(response.reply[2], 0x00);
+        assert_eq!(response.reply[2], 0x5A);
         assert_eq!(
             response.reply[3] & 0x80,
             0x80,
             "WP bit should be set for locked WORM"
         );
+    }
+
+    #[test]
+    fn test_drive_mode_sense_6_medium_type_matches_loaded_lto_generation() {
+        let mut state = crate::scsi_tape::state::TapeState::new("drive-ms6-lto9");
+        state.mount_state = crate::scsi_tape::state::MountState::Loaded;
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td9");
+        let cdb = vec![0x1A, 0x00, 0x00, 0x00, 0x0C, 0x00];
+
+        let response = mode_sense_6_drive(&state, &cdb, &profile);
+        assert_eq!(response.status, SCSI_STATUS_GOOD);
+        assert!(response.reply.len() >= 12);
+        assert_eq!(response.reply[1], 0x5F);
+        assert_eq!(response.reply[3], 0x08);
+        assert_eq!(response.reply[4], 0x5F);
     }
 
     #[test]
@@ -2151,6 +2166,26 @@ mod tests {
     }
 
     #[test]
+    fn test_drive_read_attribute_medium_type_matches_loaded_lto_generation() {
+        let mut state = crate::scsi_tape::state::TapeState::new("drive-attr-medium-type-lto9");
+        state.mount_state = crate::scsi_tape::state::MountState::Loaded;
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td9");
+        let cdb = vec![
+            0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // op/service + partition
+            0x04, 0x08, // first attribute (medium type)
+            0x00, 0x00, 0x00, 0x20, // allocation length
+            0x00, 0x00,
+        ];
+
+        let response = read_attribute_drive(&mut state, &cdb, &profile);
+        assert_eq!(response.status, SCSI_STATUS_GOOD);
+        assert_eq!(&response.reply[4..6], &[0x04, 0x08]);
+        assert_eq!(response.reply[6], 0x80);
+        assert_eq!(&response.reply[7..9], &[0x00, 0x01]);
+        assert_eq!(response.reply[9], 0x5F);
+    }
+
+    #[test]
     fn test_drive_read_attribute_capacity_is_reported_in_mib_units() {
         let mut state = crate::scsi_tape::state::TapeState::new("drive-attr-cap-mib");
         state.mount_state = crate::scsi_tape::state::MountState::Loaded;
@@ -2305,7 +2340,7 @@ mod tests {
         let mode_sense =
             dispatch_raw_cdb(&mut state, &[0x5A, 0x00, 0x10, 0, 0, 0, 0, 0, 0x40, 0], &[]);
         assert_eq!(mode_sense.status, SCSI_STATUS_GOOD);
-        assert_eq!(mode_sense.reply[2], 0x00);
+        assert_eq!(mode_sense.reply[2], 0x5A);
         assert_eq!(&mode_sense.reply[6..8], &[0x00, 0x08]);
         let reported_blocks = u32::from_be_bytes([
             0x00,
@@ -2427,7 +2462,7 @@ mod tests {
         assert_eq!(&response.reply[4..6], &[0x04, 0x08]);
         assert_eq!(response.reply[6], 0x80);
         assert_eq!(&response.reply[7..9], &[0x00, 0x01]);
-        assert_eq!(response.reply[9], 0x00);
+        assert_eq!(response.reply[9], 0x5A);
     }
 
     #[test]
