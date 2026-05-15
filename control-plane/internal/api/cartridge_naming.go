@@ -90,6 +90,8 @@ func markUsedTapeLabel(usedSequences map[int]struct{}, usedLabels map[string]str
 	if labelPrefix, labelSequence, labelGeneration, ok := parseTapeLabelParts(normalized); ok && labelPrefix == prefix && labelGeneration == generation {
 		usedSequences[labelSequence] = struct{}{}
 	}
+	// Legacy auto-labeling folded VTA/VTB/... into one VTA sequence space,
+	// so VTA generation still reserves labels parsed by the old normalizer.
 	if sequence >= 0 && prefix == "VTA" {
 		usedSequences[sequence] = struct{}{}
 	}

@@ -1766,6 +1766,8 @@ func (h *ResourcesHandler) repairLegacyAssignedSlotsForLibrary(ctx context.Conte
 	return h.repairLegacyAssignedSlots(ctx, cartridges, nil, nil)
 }
 
+// repairLegacyAssignedSlots backfills AssignedSlotAddress from the shared
+// changer inventory for cartridges created before slot assignment existed.
 func (h *ResourcesHandler) repairLegacyAssignedSlots(ctx context.Context, cartridges []*domain.VirtualCartridge, mounted, exported map[string]struct{}) error {
 	occupiedByLibrary := make(map[string]map[int]string)
 	libraryCache := make(map[string]*domain.VirtualLibrary)
@@ -1838,6 +1840,10 @@ func (h *ResourcesHandler) repairLegacyAssignedSlots(ctx context.Context, cartri
 			return err
 		}
 		occupied[address] = cartridge.CartridgeID
+		h.emitCartridgeAudit(ctx, "system", "cartridge_slot_repaired", cartridge, "success", map[string]any{
+			"assignedSlot": address,
+			"reason":       "legacy_unassigned",
+		})
 		log.Printf("legacy slot assignment repaired library=%s cartridge=%s assignedSlot=%d", libraryID, cartridge.CartridgeID, address)
 	}
 	return nil

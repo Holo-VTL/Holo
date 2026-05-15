@@ -1244,12 +1244,12 @@ fn should_verify_dedup_hit(entry: &DedupIndexEntry) -> bool {
     std::env::var("HOLO_TAPE_DEDUP_VERIFY_HITS")
         .ok()
         .map(|raw| {
-            matches!(
+            !matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
+                "0" | "false" | "no"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn load_blob_by_id(path: &Path, blob_id: u64) -> Result<DataBlob, StorageError> {
@@ -1787,21 +1787,21 @@ mod tests {
     }
 
     #[test]
-    fn dedup_hit_verification_defaults_off_for_blake3_identity() {
+    fn dedup_hit_verification_defaults_on_for_blake3_identity() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         std::env::remove_var("HOLO_TAPE_DEDUP_VERIFY_HITS");
 
-        assert!(!should_verify_dedup_hit(&test_dedup_entry(
+        assert!(should_verify_dedup_hit(&test_dedup_entry(
             DEDUP_IDENTITY_BLAKE3_128
         )));
     }
 
     #[test]
-    fn dedup_hit_verification_can_be_explicitly_enabled_for_diagnostics() {
+    fn dedup_hit_verification_can_be_explicitly_disabled_for_perf() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::set_var("HOLO_TAPE_DEDUP_VERIFY_HITS", "1");
+        std::env::set_var("HOLO_TAPE_DEDUP_VERIFY_HITS", "0");
 
-        assert!(should_verify_dedup_hit(&test_dedup_entry(
+        assert!(!should_verify_dedup_hit(&test_dedup_entry(
             DEDUP_IDENTITY_BLAKE3_128
         )));
 

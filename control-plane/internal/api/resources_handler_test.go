@@ -804,6 +804,16 @@ func TestLibrarySlotSyncRepairsLegacyAssignedSlotsFromInventory(t *testing.T) {
 	if len(slots) != 3 || slots[0] != "VTA000L06" || slots[1] != "" || slots[2] != "VTA001L06" {
 		t.Fatalf("expected legacy inventory to remain stable, got %#v", slots)
 	}
+
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if auditResp.Code != http.StatusOK {
+		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
+	}
+	if !strings.Contains(auditResp.Body.String(), "cartridge_slot_repaired") || !strings.Contains(auditResp.Body.String(), "legacy_unassigned") {
+		t.Fatalf("expected legacy slot repair audit event, got %s", auditResp.Body.String())
+	}
 }
 
 func TestLibrarySlotSyncUsesInventorySnapshotAcrossDrives(t *testing.T) {
