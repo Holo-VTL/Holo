@@ -281,6 +281,18 @@ pub fn load_dedup_index(path: &Path) -> Result<(u64, Vec<DedupIndexEntry>), Stor
     Ok((entry.sequence, entry.entries.clone()))
 }
 
+pub fn dedup_cache_ready(path: &Path) -> bool {
+    lock_storage_mutex(cache(), "dedup")
+        .map(|guard| guard.contains_key(path))
+        .unwrap_or(false)
+}
+
+pub fn discard_dedup_cache(path: &Path) {
+    if let Ok(mut guard) = lock_storage_mutex(cache(), "dedup") {
+        guard.remove(path);
+    }
+}
+
 pub fn lookup_entry_by_id(path: &Path, entry_id: u64) -> Result<DedupIndexEntry, StorageError> {
     ensure_cache_fresh(path)?;
     let guard = lock_storage_mutex(cache(), "dedup")?;

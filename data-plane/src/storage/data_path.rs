@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -14,9 +14,10 @@ use super::blk_map::{
 };
 use super::compression::{compress_payload, decompress_payload, CompressionCodec};
 use super::dedup::{
-    decrement_ref_counts, fingerprint128, insert_dedup_collision_entry, load_dedup_index,
-    lookup_identity, persist_dedup_entries, rebuild_ref_counts, sync_dedup, upsert_dedup_entry,
-    DedupIndexEntry, DedupLookup, DedupUpsertResult, DEDUP_IDENTITY_BLAKE3_128,
+    decrement_ref_counts, dedup_cache_ready, discard_dedup_cache, fingerprint128,
+    insert_dedup_collision_entry, load_dedup_index, lookup_identity, persist_dedup_entries,
+    rebuild_ref_counts, sync_dedup, upsert_dedup_entry, DedupIndexEntry, DedupLookup,
+    DedupUpsertResult, DEDUP_IDENTITY_BLAKE3_128,
 };
 use super::layout::{checksum32, integrity32, LayoutPaths, SegmentKind, STORAGE_LAYOUT_VERSION};
 use super::map_lookup::{
@@ -45,6 +46,7 @@ const DATA_BLOB_HEADER_SIZE: usize = 24;
 const DATA_LOG_PREFIX: &[u8; 4] = b"DTV2";
 const DEFAULT_SYNC_EVERY_WRITES: u32 = 64;
 const DEFAULT_SLOW_WRITE_STAGE_MS: u64 = 1000;
+const DEFAULT_DEDUP_COLD_LOAD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOptions {
@@ -192,6 +194,49 @@ fn slow_write_stage_threshold() -> Duration {
             .unwrap_or(DEFAULT_SLOW_WRITE_STAGE_MS);
         Duration::from_millis(millis)
     })
+}
+
+fn dedup_cold_load_max_bytes() -> Option<u64> {
+    let limit = std::env::var("HOLO_TAPE_DEDUP_COLD_LOAD_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DEDUP_COLD_LOAD_MAX_BYTES);
+    if limit == 0 {
+        None
+    } else {
+        Some(limit)
+    }
+}
+
+fn cold_dedup_skip_log() -> &'static Mutex<HashSet<PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn should_skip_cold_dedup(path: &Path) -> bool {
+    if dedup_cache_ready(path) {
+        return false;
+    }
+    let Some(limit) = dedup_cold_load_max_bytes() else {
+        return false;
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() <= limit {
+        return false;
+    }
+    if let Ok(mut logged) = lock_storage_mutex(cold_dedup_skip_log(), "cold dedup skip") {
+        if logged.insert(path.to_path_buf()) {
+            eprintln!(
+                "[storage] cold dedup index exceeds write-path limit; skipping synchronous dedup lookup on write path={} size_bytes={} limit_bytes={}",
+                path.display(),
+                metadata.len(),
+                limit
+            );
+        }
+    }
+    true
 }
 
 struct StorageWriteTrace<'a> {
@@ -353,6 +398,7 @@ pub fn discard_layout_caches(paths: &LayoutPaths) {
     if let Ok(mut guard) = lock_storage_mutex(data_cache(), "data") {
         guard.retain(|path, _| !path.starts_with(&paths.root));
     }
+    discard_dedup_cache(&paths.dedup_file);
     invalidate_segment_index_cache(&paths.segment_index_file);
 }
 
@@ -469,6 +515,7 @@ pub fn write_logical_block(
     let mut collision_detected = false;
     let (dedup_entry_id, blob_id, codec_used, stored_len, physical_segment_id) = if options
         .dedup_enabled
+        && !should_skip_cold_dedup(&paths.dedup_file)
     {
         let (fp_hi, fp_lo) = fingerprint128(payload);
         let identity = lookup_identity(
@@ -1197,12 +1244,12 @@ fn should_verify_dedup_hit(entry: &DedupIndexEntry) -> bool {
     std::env::var("HOLO_TAPE_DEDUP_VERIFY_HITS")
         .ok()
         .map(|raw| {
-            !matches!(
+            matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no"
+                "1" | "true" | "yes"
             )
         })
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn load_blob_by_id(path: &Path, blob_id: u64) -> Result<DataBlob, StorageError> {
@@ -1649,6 +1696,25 @@ mod tests {
         dir
     }
 
+    fn temp_layout_paths(name: &str) -> LayoutPaths {
+        let mut root = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        root.push(format!("holo-data-path-layout-{name}-{nanos}"));
+        LayoutPaths {
+            root: root.clone(),
+            data_file: root.join("data.segment"),
+            metadata_file: root.join("metadata.segment"),
+            blk_map_file: root.join("blk_map.segment"),
+            lookup_file: root.join("lookup.segment"),
+            reclaim_file: root.join("reclaim.segment"),
+            dedup_file: root.join("dedup.segment"),
+            segment_index_file: root.join("segment_index.segment"),
+        }
+    }
+
     #[test]
     fn checked_u32_len_allows_u32_max() {
         let value =
@@ -1721,21 +1787,21 @@ mod tests {
     }
 
     #[test]
-    fn dedup_hit_verification_defaults_on_for_blake3_identity() {
+    fn dedup_hit_verification_defaults_off_for_blake3_identity() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         std::env::remove_var("HOLO_TAPE_DEDUP_VERIFY_HITS");
 
-        assert!(should_verify_dedup_hit(&test_dedup_entry(
+        assert!(!should_verify_dedup_hit(&test_dedup_entry(
             DEDUP_IDENTITY_BLAKE3_128
         )));
     }
 
     #[test]
-    fn dedup_hit_verification_can_be_explicitly_disabled_for_perf() {
+    fn dedup_hit_verification_can_be_explicitly_enabled_for_diagnostics() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        std::env::set_var("HOLO_TAPE_DEDUP_VERIFY_HITS", "0");
+        std::env::set_var("HOLO_TAPE_DEDUP_VERIFY_HITS", "1");
 
-        assert!(!should_verify_dedup_hit(&test_dedup_entry(
+        assert!(should_verify_dedup_hit(&test_dedup_entry(
             DEDUP_IDENTITY_BLAKE3_128
         )));
 
@@ -1750,5 +1816,51 @@ mod tests {
         assert!(should_verify_dedup_hit(&test_dedup_entry(0)));
 
         std::env::remove_var("HOLO_TAPE_DEDUP_VERIFY_HITS");
+    }
+
+    #[test]
+    fn cold_large_dedup_index_skips_write_path_lookup() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("HOLO_TAPE_DEDUP_COLD_LOAD_MAX_BYTES", "128");
+
+        let paths = temp_layout_paths("cold-dedup-skip");
+        crate::storage::layout::initialize_layout(&paths).expect("layout init");
+        let entries = (0..4)
+            .map(|index| DedupIndexEntry {
+                entry_id: index + 1,
+                fingerprint_hi: index + 100,
+                fingerprint_lo: index + 200,
+                payload_checksum: index as u32,
+                logical_len: 4,
+                stored_blob_id: index + 10,
+                stored_len: 4,
+                compression: CompressionCodec::None,
+                identity_version: DEDUP_IDENTITY_BLAKE3_128,
+                ref_count: 1,
+            })
+            .collect::<Vec<_>>();
+        persist_dedup_entries(&paths.dedup_file, &entries).expect("persist dedup entries");
+        discard_layout_caches(&paths);
+
+        let report = write_logical_block(
+            &paths,
+            0,
+            b"cold-dedup-write",
+            0,
+            WriteOptions {
+                dedup_enabled: true,
+                preferred_codec: CompressionCodec::None,
+                force_sync: false,
+                payload_checksum_enabled: true,
+            },
+            None,
+        )
+        .expect("write should skip cold dedup and succeed");
+
+        assert_eq!(report.dedup_entry_id, 0);
+        assert!(!report.dedup_hit);
+
+        std::env::remove_var("HOLO_TAPE_DEDUP_COLD_LOAD_MAX_BYTES");
+        let _ = fs::remove_dir_all(&paths.root);
     }
 }
