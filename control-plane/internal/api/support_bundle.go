@@ -193,6 +193,9 @@ func (h *OpsHandler) addCommandSnapshots(ctx context.Context, zw *zip.Writer) {
 		priv.command("commands/journalctl-holo-cdb-trace.txt", "journalctl-cdb-trace",
 			[]string{"holo-control-plane", "20000"},
 			"sh", []string{"-c", "journalctl -u holo-control-plane -n 20000 --no-pager -o short-iso | grep '\\[cdb_trace\\]' || true"}),
+		priv.command("commands/journalctl-holo-cdb-trace-focus.txt", "journalctl-cdb-trace-focus",
+			[]string{"holo-control-plane", "200000"},
+			"sh", []string{"-c", "journalctl -u holo-control-plane -n 200000 --no-pager -o short-iso | grep '\\[cdb_trace\\]' | grep -v 'opcode=0x0A' || true"}),
 		priv.command("commands/journalctl-tcmu-runner.txt", "journalctl-unit",
 			[]string{"tcmu-runner", "800"},
 			"journalctl", []string{"-u", "tcmu-runner", "-n", "800", "--no-pager", "-o", "short-iso"}),
@@ -421,7 +424,7 @@ func addCommandOutput(ctx context.Context, zw *zip.Writer, command supportComman
 	cmd := exec.CommandContext(cmdCtx, path, command.args...)
 	output, runErr := cmd.CombinedOutput()
 	maxBytes := supportMaxCommand
-	if command.entry == "commands/journalctl-holo-cdb-trace.txt" {
+	if strings.HasPrefix(command.entry, "commands/journalctl-holo-cdb-trace") {
 		maxBytes = supportMaxTraceCommand
 	}
 	if len(output) > maxBytes {

@@ -1411,6 +1411,16 @@ case "${sub}" in
     "${bin}" -u "$1" -n "$2" --no-pager -o short-iso | "${grep_bin}" '\[cdb_trace\]'
     exit 0
     ;;
+  journalctl-cdb-trace-focus)
+    [[ $# -eq 2 ]] || die "journalctl-cdb-trace-focus requires <unit> <count>"
+    valid_unit "$1" || die "invalid unit name"
+    valid_count "$2" || die "invalid count"
+    bin="$(resolve_bin journalctl /bin/journalctl /usr/bin/journalctl)"
+    grep_bin="$(resolve_bin grep /bin/grep /usr/bin/grep)"
+    set +o pipefail
+    "${bin}" -u "$1" -n "$2" --no-pager -o short-iso | "${grep_bin}" '\[cdb_trace\]' | "${grep_bin}" -v 'opcode=0x0A'
+    exit 0
+    ;;
   *)
     die "unsupported support helper subcommand: ${sub}"
     ;;
