@@ -1438,8 +1438,9 @@ pub(crate) fn trace_cdb_if_enabled(
     }
     let data_out_checksum = checksum32(data_out);
     let data_in_checksum = checksum32(&response.reply);
+    let read_attribute_trace = read_attribute_trace_suffix(cdb, &response.reply);
     eprintln!(
-        "[cdb_trace] role={role} opcode=0x{opcode:02X} status=0x{status:02X} data_out_len={data_out_len} data_in_len={data_in_len} data_out_checksum=0x{data_out_checksum:08X} data_in_checksum=0x{data_in_checksum:08X} cdb=[{cdb_hex}] data_out_preview=[{data_out_hex}] data_preview=[{data_hex}] sense=[{sense_hex}]",
+        "[cdb_trace] role={role} opcode=0x{opcode:02X} status=0x{status:02X} data_out_len={data_out_len} data_in_len={data_in_len} data_out_checksum=0x{data_out_checksum:08X} data_in_checksum=0x{data_in_checksum:08X} cdb=[{cdb_hex}] data_out_preview=[{data_out_hex}] data_preview=[{data_hex}] sense=[{sense_hex}]{read_attribute_trace}",
         opcode = cdb[0],
         status = response.status,
         data_out_len = data_out.len(),
@@ -1450,7 +1451,53 @@ pub(crate) fn trace_cdb_if_enabled(
         data_out_hex = bytes_to_hex(data_out, 8),
         data_hex = bytes_to_hex(&response.reply, 8),
         sense_hex = bytes_to_hex(&response.sense, 18),
+        read_attribute_trace = read_attribute_trace,
     );
+}
+
+pub(crate) fn read_attribute_trace_suffix(cdb: &[u8], payload: &[u8]) -> String {
+    if cdb.first().copied() != Some(0x8C) || payload.len() < 4 {
+        return String::new();
+    }
+    let declared_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let mut offset = 4usize;
+    let mut entries = Vec::new();
+    while offset < payload.len() {
+        let remaining = payload.len() - offset;
+        if remaining < 5 {
+            entries.push(format!("truncated_header_at={offset} remaining={remaining}"));
+            break;
+        }
+        let id = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        let format = payload[offset + 2];
+        let value_len = u16::from_be_bytes([payload[offset + 3], payload[offset + 4]]) as usize;
+        offset += 5;
+        if payload.len().saturating_sub(offset) < value_len {
+            entries.push(format!(
+                "id=0x{id:04X} fmt=0x{format:02X} len={value_len} truncated_value_remaining={}",
+                payload.len().saturating_sub(offset)
+            ));
+            break;
+        }
+        let value = &payload[offset..offset + value_len];
+        entries.push(format!(
+            "id=0x{id:04X} fmt=0x{format:02X} len={value_len} hex=[{}] ascii=\"{}\"",
+            bytes_to_hex(value, value.len()),
+            trace_ascii(value)
+        ));
+        offset += value_len;
+    }
+    format!(" read_attr_declared_len={declared_len} read_attr=[{}]", entries.join("; "))
+}
+
+pub(crate) fn trace_ascii(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| match b {
+            b' '..=b'~' => b as char,
+            _ => '.',
+        })
+        .collect()
 }
 
 pub(crate) fn projected_write_bytes(state: &TapeState, cdb: &[u8], data_out: &[u8]) -> u64 {

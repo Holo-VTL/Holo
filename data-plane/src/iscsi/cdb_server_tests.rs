@@ -80,6 +80,22 @@ mod tests {
         mutex.clear_poison();
     }
 
+    #[test]
+    fn read_attribute_trace_suffix_decodes_attribute_entries() {
+        let cdb = vec![0x8C, 0x00, 0, 0, 0, 0, 0, 0, 0x04, 0x01, 0, 0, 0, 0x40, 0, 0];
+        let payload = vec![
+            0x00, 0x00, 0x00, 0x0B, // declared payload length
+            0x04, 0x01, 0x01, 0x00, 0x03, b'A', b'B', b'C',
+            0x04, 0x08, 0x80, 0x00, 0x01, 0x98,
+        ];
+
+        let suffix = read_attribute_trace_suffix(&cdb, &payload);
+
+        assert!(suffix.contains("read_attr_declared_len=11"));
+        assert!(suffix.contains("id=0x0401 fmt=0x01 len=3 hex=[41 42 43] ascii=\"ABC\""));
+        assert!(suffix.contains("id=0x0408 fmt=0x80 len=1 hex=[98] ascii=\".\""));
+    }
+
     fn log_param_u32(page: &[u8], code: u16) -> Option<u32> {
         let mut cursor = 4usize;
         while page.len().saturating_sub(cursor) >= 4 {
