@@ -2647,7 +2647,23 @@ pub(crate) fn medium_type_for_loaded_media(
     if state.mount_state != crate::scsi_tape::state::MountState::Loaded {
         return 0;
     }
-    density_code_for_profile(profile)
+    medium_type_for_profile(state, profile)
+}
+
+pub(crate) fn medium_type_for_profile(
+    state: &TapeState,
+    profile: &DeviceIdentityProfile,
+) -> u8 {
+    let generation = lto_generation_for_profile(profile);
+    let base = match generation {
+        1..=9 => generation.saturating_mul(0x10).saturating_add(0x08),
+        _ => 0x68,
+    };
+    if state.retention_policy.is_worm_media {
+        base.saturating_add(0x04)
+    } else {
+        base
+    }
 }
 
 pub(crate) fn device_specific_mode_parameter(state: &TapeState) -> u8 {
