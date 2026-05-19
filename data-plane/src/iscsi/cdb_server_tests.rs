@@ -2244,7 +2244,7 @@ mod tests {
         );
         assert!(response.reply.len() >= 41);
         assert_eq!(&response.reply[4..6], &[0x04, 0x01]);
-        assert_eq!(response.reply[6], 0x81);
+        assert_eq!(response.reply[6], 0x01);
         assert_eq!(&response.reply[7..9], &[0x00, 0x20]);
         assert_eq!(
             &response.reply[9..9 + cartridge_id.len()],
@@ -2256,6 +2256,17 @@ mod tests {
             !serial.contains(&drive_id),
             "medium serial must not be derived from drive id: {serial:?}"
         );
+        let medium_type_offset = response
+            .reply
+            .windows(2)
+            .position(|pair| pair == [0x04, 0x08])
+            .expect("DBackup-shaped 0x0401 read should include medium type");
+        assert_eq!(response.reply[medium_type_offset + 2], 0x80);
+        assert_eq!(
+            &response.reply[medium_type_offset + 3..medium_type_offset + 5],
+            &[0x00, 0x01]
+        );
+        assert_eq!(response.reply[medium_type_offset + 5], 0x68);
 
         let _ = write_shared_loaded_cartridge(&drive_id, None);
     }
@@ -2431,7 +2442,8 @@ mod tests {
             (0x020Bu16, 0x81u8),
             (0x020Cu16, 0x81u8),
             (0x020Du16, 0x81u8),
-            (0x0400u16, 0x81u8),
+            (0x0400u16, 0x01u8),
+            (0x0401u16, 0x01u8),
             (0x0404u16, 0x81u8),
             (0x0407u16, 0x80u8),
         ] {

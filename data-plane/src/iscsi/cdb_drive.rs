@@ -2240,12 +2240,12 @@ pub(crate) fn drive_mam_attributes(
         // Medium attributes
         ReadAttributeEntry {
             id: 0x0400,
-            format: 0x81,
+            format: 0x01,
             value: fixed_ascii_value(profile.vendor.trim(), 8),
         },
         ReadAttributeEntry {
             id: 0x0401,
-            format: 0x81,
+            format: 0x01,
             value: fixed_ascii_value(medium_serial, 32),
         },
         ReadAttributeEntry {
