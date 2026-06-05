@@ -15,9 +15,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RELEASE_DIR="${PROJECT_DIR}/release"
+HOST_IP="10.10.1.186"
 
 # ── Config ────────────────────────────────────────────────────────
-BUILD_HOST="${HOLO_BUILD_HOST:-lei@10.10.1.187}"
+BUILD_HOST="${HOLO_BUILD_HOST:-lei@${HOST_IP}}"
 BUILD_DIR="${HOLO_BUILD_DIR:-/home/lei/holo-build}"
 SSH_OPTS="${HOLO_BUILD_SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
 
@@ -112,6 +113,8 @@ set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR}"
 OUTPUT_DIR="${BUILD_DIR}/output"
+CACHE_DIR="\${HOLO_BUILD_CACHE:-\$HOME/.cache/holo-build}"
+mkdir -p "\${CACHE_DIR}/npm" "\${CACHE_DIR}/gomod"
 chmod -R u+rwX "\${OUTPUT_DIR}" 2>/dev/null || true
 rm -rf "\${OUTPUT_DIR}"
 mkdir -p "\${OUTPUT_DIR}"
@@ -121,6 +124,7 @@ trap 'rm -rf "\${BUILD_TMP}"' EXIT
 export PATH="/usr/local/go/bin:\$HOME/.cargo/bin:\$PATH"
 export GOPROXY=https://goproxy.cn,direct
 export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
+export GOMODCACHE="\${CACHE_DIR}/gomod"
 
 GO_VERSION="1.24.3"
 GO_TARBALL="go\${GO_VERSION}.linux-amd64.tar.gz"
@@ -138,6 +142,20 @@ download_verified() {
   local expected_sha="\$2"
   local output="\$3"
   shift 3
+
+  # Check persistent cache first
+  local cache_file="\${CACHE_DIR}/\$(basename "\${output}")"
+  if [[ -f "\${cache_file}" ]]; then
+    local cached_sha
+    cached_sha="\$(sha256sum "\${cache_file}" | awk '{print \$1}')"
+    if [[ "\${cached_sha}" == "\${expected_sha}" ]]; then
+      cp "\${cache_file}" "\${output}"
+      echo "  Cached \${name} sha256=\${expected_sha}"
+      return 0
+    fi
+    echo "  Cache stale for \${name}, re-downloading"
+    rm -f "\${cache_file}"
+  fi
 
   local url candidate actual
   for url in "\$@"; do
@@ -157,7 +175,8 @@ download_verified() {
       continue
     fi
     mv "\${candidate}" "\${output}"
-    echo "  Verified \${name} sha256=\${expected_sha}"
+    cp "\${output}" "\${cache_file}"
+    echo "  Verified \${name} sha256=\${expected_sha} (cached)"
     return 0
   done
 
@@ -292,45 +311,46 @@ build_tcmu_runner_rpms() {
       8|9|10) ;;
       *) echo "error: unsupported HOLO_TCMU_RUNNER_EL_TARGETS entry: \${el}" >&2; return 1 ;;
     esac
-    local build_image="almalinux:\${el}"
+
+    # Use cached builder image with dnf deps + tcmu-runner pre-installed
+    local rpm_builder="holo-rpm-builder-el\${el}:\${TCMU_RUNNER_IMAGE_TAG}"
+    if ! sudo docker inspect "\${rpm_builder}" >/dev/null 2>&1; then
+      echo "    EL\${el}: building cached RPM builder image (first time only)..."
+      sudo docker pull "almalinux:\${el}" -q 2>/dev/null || true
+      sudo docker build \
+        --build-arg EL_MAJOR="\${el}" \
+        --build-arg TCMU_RUNNER_GIT_REF="\${TCMU_RUNNER_GIT_REF}" \
+        -t "\${rpm_builder}" - <<'RPMBUILDEREOF'
+ARG EL_MAJOR
+ARG TCMU_RUNNER_GIT_REF
+FROM almalinux:\${EL_MAJOR}
+ARG EL_MAJOR
+ARG TCMU_RUNNER_GIT_REF
+RUN dnf install -y --nogpgcheck dnf-plugins-core epel-release \
+ && case "\${EL_MAJOR}" in \
+      8) dnf config-manager --set-enabled powertools || true ;; \
+      9) dnf config-manager --set-enabled crb || crb enable || true ;; \
+      10) dnf config-manager --set-enabled crb || crb enable || true ;; \
+    esac \
+ && dnf install -y --nogpgcheck git rpm-build redhat-rpm-config cmake make gcc \
+      libnl3-devel glib2-devel zlib-devel kmod-devel systemd-rpm-macros \
+ && dnf clean all \
+ && git clone --branch "\${TCMU_RUNNER_GIT_REF}" --depth 1 \
+      https://github.com/open-iscsi/tcmu-runner.git /tmp/tcmu-runner
+RPMBUILDEREOF
+    else
+      echo "    EL\${el}: using cached RPM builder image"
+    fi
 
     out_dir="\${OUTPUT_DIR}/packages/dnf/el\${el}"
     rm -rf "\${out_dir}"
     mkdir -p "\${out_dir}"
 
     echo "    EL\${el}: building tcmu-runner/libtcmu RPMs"
-    sudo docker pull "\${build_image}" -q 2>/dev/null || true
-    sudo docker run --rm -i \
-      -e EL_MAJOR="\${el}" \
-      -e TCMU_RUNNER_GIT_REF="\${TCMU_RUNNER_GIT_REF}" \
+    sudo docker run --rm \
       -v "\${out_dir}:/out" \
-      "\${build_image}" \
-      bash -s <<'TCMURPMEOF'
-set -euo pipefail
-
-dnf install -y --nogpgcheck dnf-plugins-core epel-release
-case "\${EL_MAJOR}" in
-  8) dnf config-manager --set-enabled powertools || true ;;
-  9) dnf config-manager --set-enabled crb || crb enable || true ;;
-  10) dnf config-manager --set-enabled crb || crb enable || true ;;
-esac
-dnf install -y --nogpgcheck git rpm-build redhat-rpm-config cmake make gcc \
-  libnl3-devel glib2-devel zlib-devel kmod-devel systemd-rpm-macros
-
-git clone --branch "\${TCMU_RUNNER_GIT_REF}" --depth 1 https://github.com/open-iscsi/tcmu-runner.git /tmp/tcmu-runner
-cd /tmp/tcmu-runner/extra
-./make_runnerrpms.sh \
-  --without rbd \
-  --without glfs \
-  --without qcow \
-  --without zbc \
-  --without tcmalloc
-
-find rpmbuild/RPMS -type f \( -name 'tcmu-runner-*.rpm' -o -name 'libtcmu-*.rpm' \) \
-  ! -name '*devel*' -exec cp -v {} /out/ \;
-test -n "\$(find /out -maxdepth 1 -type f -name 'tcmu-runner-*.rpm' -print -quit)"
-test -n "\$(find /out -maxdepth 1 -type f -name 'libtcmu-*.rpm' -print -quit)"
-TCMURPMEOF
+      "\${rpm_builder}" \
+      bash -c 'cd /tmp/tcmu-runner/extra && ./make_runnerrpms.sh --without rbd --without glfs --without qcow --without zbc --without tcmalloc && find rpmbuild/RPMS -type f \( -name "tcmu-runner-*.rpm" -o -name "libtcmu-*.rpm" \) ! -name "*devel*" -exec cp -v {} /out/ \; && test -n "\$(find /out -maxdepth 1 -type f -name "tcmu-runner-*.rpm" -print -quit)" && test -n "\$(find /out -maxdepth 1 -type f -name "libtcmu-*.rpm" -print -quit)"'
   done
 
   find "\${OUTPUT_DIR}/packages" -type f -name '*.rpm' -print | sort
@@ -342,7 +362,7 @@ build_tcmu_runner_rpms
 echo "  Building web-console..."
 cd "\${BUILD_DIR}/web-console"
 rm -rf dist
-npm ci
+npm ci --cache "\${CACHE_DIR}/npm"
 VITE_APP_VERSION="${VERSION}" npm run build
 
 # ── Copy web console + installer ──

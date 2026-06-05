@@ -283,7 +283,7 @@ impl TapeState {
             early_warning_window: 8,
             block_mode: BlockModeProfile::default(),
             buffered_mode: true,
-            data_compression_allowed: initial_data_compression_enabled(),
+            data_compression_allowed: true,
             data_compression_enabled: initial_data_compression_enabled(),
             select_data_compression_algorithm: true,
             command_counters: CommandCounters::default(),

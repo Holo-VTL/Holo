@@ -2896,8 +2896,14 @@ func profileAliasFor(modelToken string) string {
 		return "hp-esl-e-series"
 	case "hp-eml-e-series":
 		return "hp-eml-e-series"
-	case "hp-msl-g3-series", "hp-hpe-msl2024", "hp-hpe-msl4048", "hp-hpe-msl8096":
+	case "hp-msl-g3-series":
 		return "hp-msl-g3-series"
+	case "hp-hpe-msl2024", "hphpe-msl2024", "hphpe-hphpe-msl2024":
+		return "hp-msl2024"
+	case "hp-hpe-msl4048", "hphpe-msl4048", "hphpe-hphpe-msl4048":
+		return "hp-msl4048"
+	case "hp-hpe-msl8096", "hphpe-msl8096", "hphpe-hphpe-msl8096":
+		return "hp-msl8096"
 	case "hp-msl6000-series":
 		return "hp-msl6000-series"
 	case "hpe-msl3040":

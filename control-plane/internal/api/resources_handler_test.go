@@ -2363,6 +2363,7 @@ func TestNormalizeDeviceProfileMapsMarketedModels(t *testing.T) {
 	}{
 		{vendor: "IBM", model: "IBM TS2290", expected: "ibm-ult3580-td9"},
 		{vendor: "HP/HPE", model: "HPE StoreEver LTO-9 Ultrium 45000", expected: "hpe-ultrium-9-scsi"},
+		{vendor: "HP/HPE", model: "HP/HPE MSL8096", expected: "hp-msl8096"},
 		{vendor: "Quantum", model: "Quantum Scalar i500", expected: "adic-scalar-i500"},
 		{vendor: "Oracle / StorageTek", model: "StorageTek SL150", expected: "stk-sl150"},
 		{vendor: "Spectra Logic", model: "Spectra TFinity ExaScale", expected: "spectra-tfinity-exascale"},

@@ -275,6 +275,15 @@ pub fn resolve_changer_profile(name: &str) -> DeviceIdentityProfile {
         "library_type_vhp_mslseries" | "library-type-vhp-mslseries" | "hp-msl-g3-series" => {
             changer_profile("HP", "MSL G3 Series", "6.24", "HP", 10)
         }
+        "hp-msl2024" | "hp-hpe-msl2024" | "hphpe-msl2024" | "hphpe-hphpe-msl2024" => {
+            changer_profile("HP", "MSL2024", "6.24", "HP", 10)
+        }
+        "hp-msl4048" | "hp-hpe-msl4048" | "hphpe-msl4048" | "hphpe-hphpe-msl4048" => {
+            changer_profile("HP", "MSL4048", "6.24", "HP", 10)
+        }
+        "hp-msl8096" | "hp-hpe-msl8096" | "hphpe-msl8096" | "hphpe-hphpe-msl8096" => {
+            changer_profile("HP", "MSL8096", "6.24", "HP", 10)
+        }
         "library_type_vhp_msl6000" | "library-type-vhp-msl6000" | "hp-msl6000-series" => {
             changer_profile("HP", "MSL6000 Series", "6.24", "HP", 10)
         }
@@ -520,6 +529,8 @@ mod tests {
     fn resolves_master_list_changer_profiles() {
         let cases = [
             ("ibm-ts4300", "IBM", "TS4300"),
+            ("hp-msl8096", "HP", "MSL8096"),
+            ("hphpe-hphpe-msl8096", "HP", "MSL8096"),
             ("hpe-msl3040", "HPE", "MSL3040"),
             ("quantum-scalar-i6000", "QUANTUM", "Scalar i6000"),
             ("dell-tl4000", "DELL", "TL4000"),

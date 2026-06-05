@@ -47,6 +47,7 @@ pub(crate) fn dispatch_drive_discovery_cdb_with_context(
         0x5A => Some(mode_sense_10_drive(state, cdb, profile)),
         0x82 => Some(allow_overwrite_drive(state, cdb)),
         0xA0 => Some(report_luns_single_lun(cdb)),
+        0xA3 => Some(report_timestamp(cdb)),
         0x8C => Some(read_attribute_drive(state, cdb, profile)),
         0x8D => Some(write_attribute_drive(state, cdb, data_out, profile)),
         0x91 => Some(space_16_drive(state, cdb)),

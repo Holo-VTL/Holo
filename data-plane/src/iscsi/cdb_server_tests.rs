@@ -693,6 +693,31 @@ mod tests {
     }
 
     #[test]
+    fn test_changer_read_element_status_hpe_msl3040_voltag_includes_avoltag() {
+        let mut state = crate::scsi_tape::state::TapeState::new("changer-res-hpe-msl3040-avoltag");
+        let profile = crate::scsi_tape::profiles::resolve_changer_profile("hpe-msl3040");
+        let cdb = vec![
+            0xB8, 0x14, // DATA TRANSFER ELEMENT + VolTag (Veeam inventory pattern)
+            0x01, 0x00, // start = 0x0100
+            0x00, 0x01, // one element
+            0x00, // no DVCID
+            0x00, 0x01, 0x00, // alloc = 256
+            0x00, 0x00,
+        ];
+        let response = dispatch_changer_cdb(&mut state, &cdb, &[], profile);
+        assert_eq!(response.status, SCSI_STATUS_GOOD);
+        assert!(response.reply.len() >= 104);
+        assert_eq!(response.reply[8], 0x04);
+        assert_eq!(response.reply[9] & 0xC0, 0xC0);
+        let descriptor_len = u16::from_be_bytes([response.reply[10], response.reply[11]]) as usize;
+        assert_eq!(descriptor_len, 88);
+
+        // Alternate voltag starts after common descriptor(12) + primary voltag(36).
+        let avoltag_offset = 16 + 12 + 36;
+        assert_ne!(response.reply[avoltag_offset + 4], b' ');
+    }
+
+    #[test]
     fn test_changer_read_element_status_primary_voltag_has_no_leading_spaces() {
         let mut state = crate::scsi_tape::state::TapeState::new("changer-res-primary-voltag");
         state
@@ -1596,6 +1621,22 @@ mod tests {
     }
 
     #[test]
+    fn test_changer_report_timestamp_returns_spc_parameter_data() {
+        let mut state = crate::scsi_tape::state::TapeState::new("changer-report-timestamp");
+        let profile = crate::scsi_tape::profiles::resolve_changer_profile("hpe-msl3040");
+        let cdb = vec![
+            0xA3, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00,
+        ];
+        let response = dispatch_changer_cdb(&mut state, &cdb, &[], profile);
+
+        assert_eq!(response.status, SCSI_STATUS_GOOD);
+        assert_eq!(response.reply.len(), 12);
+        assert_eq!(&response.reply[0..2], &[0x00, 0x0A]);
+        assert_eq!(response.reply[3] & 0x07, 0x03);
+        assert!(response.reply[4..10].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn test_changer_unsupported_opcode_returns_deterministic_sense() {
         let mut state = crate::scsi_tape::state::TapeState::new("changer-unsup");
         let profile = crate::scsi_tape::profiles::resolve_changer_profile("ibm-03584l32");
@@ -1631,6 +1672,21 @@ mod tests {
         let min_block = u16::from_be_bytes([response.reply[4], response.reply[5]]) as u32;
         assert!(max_block >= 1024);
         assert!(min_block >= 1);
+    }
+
+    #[test]
+    fn test_drive_report_timestamp_returns_spc_parameter_data() {
+        let mut state = crate::scsi_tape::state::TapeState::new("drive-report-timestamp");
+        let cdb = vec![
+            0xA3, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00,
+        ];
+        let response = dispatch_raw_cdb(&mut state, &cdb, &[]);
+
+        assert_eq!(response.status, SCSI_STATUS_GOOD);
+        assert_eq!(response.reply.len(), 12);
+        assert_eq!(&response.reply[0..2], &[0x00, 0x0A]);
+        assert_eq!(response.reply[3] & 0x07, 0x03);
+        assert!(response.reply[4..10].iter().any(|byte| *byte != 0));
     }
 
     #[test]
@@ -1834,6 +1890,40 @@ mod tests {
             .position(|pair| pair == [0x0F, 0x0E])
             .expect("missing data compression page");
         assert_eq!(changeable.reply[changeable_idx + 2], 0x00);
+    }
+
+    #[test]
+    fn test_drive_mode_sense_6_reports_compression_capability_when_disabled() {
+        let mut state =
+            crate::scsi_tape::state::TapeState::new("drive-ms6-compression-disabled-capable");
+        state.data_compression_allowed = true;
+        state.data_compression_enabled = false;
+
+        let current = dispatch_raw_cdb(
+            &mut state,
+            &[0x1A, 0x00, 0x0F, 0x00, 0x40, 0x00],
+            &[],
+        );
+        assert_eq!(current.status, SCSI_STATUS_GOOD);
+        let current_idx = current
+            .reply
+            .windows(2)
+            .position(|pair| pair == [0x0F, 0x0E])
+            .expect("missing data compression page");
+        assert_eq!(current.reply[current_idx + 2], 0x40);
+
+        let changeable = dispatch_raw_cdb(
+            &mut state,
+            &[0x1A, 0x00, 0x4F, 0x00, 0x40, 0x00],
+            &[],
+        );
+        assert_eq!(changeable.status, SCSI_STATUS_GOOD);
+        let changeable_idx = changeable
+            .reply
+            .windows(2)
+            .position(|pair| pair == [0x0F, 0x0E])
+            .expect("missing data compression page");
+        assert_eq!(changeable.reply[changeable_idx + 2], 0x80);
     }
 
     #[test]

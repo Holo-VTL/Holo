@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, env, sync::OnceLock};
+use std::{
+    collections::BTreeMap,
+    env,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::iscsi::cdb_drive::{
     persistent_reserve_in_drive, persistent_reserve_out_drive_with_context, truncate_reply,
@@ -116,11 +121,13 @@ pub(crate) fn changer_drive_identifier_designator_for_seed(seed: &str) -> Vec<u8
     designator
 }
 
-pub(crate) fn changer_serial_as_avoltag_enabled() -> bool {
-    let profile = crate::scsi_tape::profiles::resolve_changer_profile_from_env();
+pub(crate) fn changer_serial_as_avoltag_enabled(
+    profile: &crate::scsi_tape::identity::DeviceIdentityProfile,
+) -> bool {
     let product = profile.product.to_ascii_uppercase();
-    profile.vendor.trim().eq_ignore_ascii_case("HP")
-        && (product.contains("ESL") || product.contains("EML"))
+    (profile.vendor.trim().eq_ignore_ascii_case("HP")
+        || profile.vendor.trim().eq_ignore_ascii_case("HPE"))
+        && (product.contains("ESL") || product.contains("EML") || product.contains("MSL"))
 }
 
 pub(crate) fn changer_volume_tag(
@@ -421,7 +428,11 @@ pub(crate) fn mode_sense_10_changer(state: &TapeState, cdb: &[u8]) -> CdbRespons
     CdbResponse::good(truncate_reply(out, allocation_length))
 }
 
-pub(crate) fn read_element_status_changer(state: &mut TapeState, cdb: &[u8]) -> CdbResponse {
+pub(crate) fn read_element_status_changer(
+    state: &mut TapeState,
+    cdb: &[u8],
+    profile: &crate::scsi_tape::identity::DeviceIdentityProfile,
+) -> CdbResponse {
     let Some(allocation_length) = try_read_be24(cdb, 7) else {
         return invalid_field_in_cdb_response();
     };
@@ -493,7 +504,8 @@ pub(crate) fn read_element_status_changer(state: &mut TapeState, cdb: &[u8]) -> 
 
         let include_voltag = voltag_requested || avoltag_requested;
         let include_avoltag = ty == 0x04
-            && (avoltag_requested || (include_voltag && changer_serial_as_avoltag_enabled()));
+            && (avoltag_requested
+                || (include_voltag && changer_serial_as_avoltag_enabled(profile)));
         let identifier_len = if ty == 0x04 && dvcid_requested {
             drive_designator.len()
         } else {
@@ -609,6 +621,27 @@ pub(crate) fn report_luns_single_lun(cdb: &[u8]) -> CdbResponse {
     let mut out = vec![0u8; 16];
     out[0..4].copy_from_slice(&8u32.to_be_bytes()); // one LUN entry
                                                     // bytes [8..16] remain 0x00 for LUN 0
+    CdbResponse::good(truncate_reply(out, allocation_length))
+}
+
+pub(crate) fn report_timestamp(cdb: &[u8]) -> CdbResponse {
+    if cdb.len() < 12 || (cdb[1] & 0x1F) != 0x0F {
+        return invalid_field_in_cdb_response();
+    }
+    let allocation_length = u32::from_be_bytes([cdb[6], cdb[7], cdb[8], cdb[9]]) as usize;
+    if allocation_length == 0 {
+        return CdbResponse::good(vec![]);
+    }
+
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(0xFFFF_FFFF_FFFF) as u64)
+        .unwrap_or(0);
+    let millis_bytes = millis.to_be_bytes();
+    let mut out = vec![0u8; 12];
+    out[0..2].copy_from_slice(&0x000A_u16.to_be_bytes());
+    out[3] = 0x03; // Timestamp initialized outside the SCSI SET TIMESTAMP command.
+    out[4..10].copy_from_slice(&millis_bytes[2..8]);
     CdbResponse::good(truncate_reply(out, allocation_length))
 }
 
@@ -833,9 +866,10 @@ pub(crate) fn dispatch_changer_cdb_with_context(
         0x5F => persistent_reserve_out_drive_with_context(state, cdb, data_out, context), // PERSISTENT RESERVE OUT
         0x5A => mode_sense_10_changer(state, cdb), // MODE SENSE(10)
         0xA0 => report_luns_single_lun(cdb),       // REPORT LUNS
+        0xA3 => report_timestamp(cdb),             // REPORT TIMESTAMP
         0xA5 => move_medium_changer(state, cdb),   // MOVE MEDIUM
         0xA6 => exchange_medium_changer(state, cdb), // EXCHANGE MEDIUM
-        0xB8 => read_element_status_changer(state, cdb), // READ ELEMENT STATUS
+        0xB8 => read_element_status_changer(state, cdb, &profile), // READ ELEMENT STATUS
         _ => changer_unsupported_response(opcode),
     }
 }
