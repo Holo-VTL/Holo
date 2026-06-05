@@ -44,6 +44,7 @@ docs/
 .github/
 VeeamLogs/
 DBackupLogs/
+Logs_from_Users/
 
 # Codex and Claude files
 AGENTS.md
