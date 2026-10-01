@@ -340,6 +340,7 @@ All profiles work on all major Linux distributions (RHEL, Rocky, Ubuntu, Debian,
 - **API key auth**: Optional but recommended for network-facing deployments
 - **Audit journal**: JSONL append-only log of all mutating operations
 - **Secret redaction**: Support bundles automatically redact API keys and sensitive data
+- **iSCSI security**: CHAP, mutual CHAP, and Initiator IQN access lists can be configured at Library, Drive, and Target scope. CHAP authenticates logins; it does not encrypt tape traffic.
 
 
 

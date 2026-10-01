@@ -51,8 +51,8 @@ func savePublicationTx(ctx context.Context, execer publicationExecContext, p *do
 INSERT INTO target_publications (
   publication_id, pool_id, library_id, drive_id, cartridge_id, target_iqn,
   device_role, device_profile, drive_profile, portal, state, last_error,
-  compression_enabled, dedup_enabled, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  compression_enabled, dedup_enabled, security_enforcement, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(publication_id) DO UPDATE SET
   pool_id=excluded.pool_id,
   library_id=excluded.library_id,
@@ -67,6 +67,7 @@ ON CONFLICT(publication_id) DO UPDATE SET
   last_error=excluded.last_error,
   compression_enabled=excluded.compression_enabled,
   dedup_enabled=excluded.dedup_enabled,
+  security_enforcement=excluded.security_enforcement,
   updated_at=excluded.updated_at`,
 		p.PublicationID,
 		p.PoolID,
@@ -82,6 +83,7 @@ ON CONFLICT(publication_id) DO UPDATE SET
 		p.LastError,
 		boolToInt(p.CompressionEnabled),
 		boolToInt(p.DedupEnabled),
+		p.SecurityEnforcement,
 		formatTime(p.CreatedAt),
 		formatTime(p.UpdatedAt),
 	)
@@ -123,7 +125,7 @@ func (r *TargetRuntimeRepo) FindPublication(ctx context.Context, publicationID s
 	row := r.db.QueryRowContext(ctx, `
 SELECT publication_id, pool_id, library_id, drive_id, cartridge_id, target_iqn,
        device_role, device_profile, drive_profile, portal, state, last_error,
-       compression_enabled, dedup_enabled, created_at, updated_at
+       compression_enabled, dedup_enabled, security_enforcement, created_at, updated_at
 FROM target_publications
 WHERE publication_id = ?`, publicationID)
 	return scanPublication(row)
@@ -133,7 +135,7 @@ func (r *TargetRuntimeRepo) ListPublications(ctx context.Context) []*domain.Targ
 	rows, err := r.db.QueryContext(ctx, `
 SELECT publication_id, pool_id, library_id, drive_id, cartridge_id, target_iqn,
        device_role, device_profile, drive_profile, portal, state, last_error,
-       compression_enabled, dedup_enabled, created_at, updated_at
+       compression_enabled, dedup_enabled, security_enforcement, created_at, updated_at
 FROM target_publications
 ORDER BY publication_id`)
 	if err != nil {
@@ -147,7 +149,7 @@ func (r *TargetRuntimeRepo) ListDiscoverablePublications(ctx context.Context) []
 	rows, err := r.db.QueryContext(ctx, `
 SELECT publication_id, pool_id, library_id, drive_id, cartridge_id, target_iqn,
        device_role, device_profile, drive_profile, portal, state, last_error,
-       compression_enabled, dedup_enabled, created_at, updated_at
+       compression_enabled, dedup_enabled, security_enforcement, created_at, updated_at
 FROM target_publications
 WHERE state = 'ready' AND target_iqn <> '' AND portal <> ''
 ORDER BY publication_id`)
@@ -162,7 +164,7 @@ func (r *TargetRuntimeRepo) FindPublicationByIQN(ctx context.Context, iqn string
 	row := r.db.QueryRowContext(ctx, `
 SELECT publication_id, pool_id, library_id, drive_id, cartridge_id, target_iqn,
        device_role, device_profile, drive_profile, portal, state, last_error,
-       compression_enabled, dedup_enabled, created_at, updated_at
+       compression_enabled, dedup_enabled, security_enforcement, created_at, updated_at
 FROM target_publications
 WHERE target_iqn = ? AND state IN ('creating', 'ready')
 ORDER BY publication_id
@@ -304,6 +306,7 @@ func scanPublication(row publicationScanner) (*domain.TargetPublication, error) 
 		createdAt, updatedAt string
 		compressionEnabled   int
 		dedupEnabled         int
+		securityEnforcement  string
 	)
 	err := row.Scan(
 		&p.PublicationID,
@@ -320,6 +323,7 @@ func scanPublication(row publicationScanner) (*domain.TargetPublication, error) 
 		&p.LastError,
 		&compressionEnabled,
 		&dedupEnabled,
+		&securityEnforcement,
 		&createdAt,
 		&updatedAt,
 	)
@@ -332,6 +336,7 @@ func scanPublication(row publicationScanner) (*domain.TargetPublication, error) 
 	p.State = domain.PublicationState(state)
 	p.CompressionEnabled = compressionEnabled != 0
 	p.DedupEnabled = dedupEnabled != 0
+	p.SecurityEnforcement = securityEnforcement
 	p.CreatedAt = parseTime(createdAt)
 	p.UpdatedAt = parseTime(updatedAt)
 	return &p, nil

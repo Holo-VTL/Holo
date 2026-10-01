@@ -100,8 +100,10 @@ export interface TargetPublication {
   targetIqn: string;
   deviceRole: "drive" | "changer" | string;
   deviceProfile?: string;
+  driveProfile?: string;
   portal: string;
   state: "creating" | "ready" | "failed" | "disabled" | string;
+  securityEnforcement?: "unprotected" | "simulated" | "enforcing" | "blocked" | "offline" | string;
   lastError?: string;
   compressionEnabled: boolean;
   dedupEnabled: boolean;
@@ -122,6 +124,7 @@ export interface LocalMountStatus {
   enabled: boolean;
   desiredIqns: string[];
   mountedIqns: string[];
+  skippedTargets?: Array<{ targetIqn: string; reason: string }>;
   lastSyncAt?: string;
   lastError?: string;
 }
@@ -141,29 +144,70 @@ export interface ValidationRun {
   finishedAt?: string;
 }
 
-export interface InitiatorRule {
-  ruleId: string;
-  publicationId: string;
-  initiator: string;
-  permission: "allow" | "deny";
-  priority: number;
-  createdAt: string;
-}
-
-export interface AuthorizationDecision {
-  publicationId: string;
-  initiator: string;
-  decision: "allow" | "deny";
-  reason: string;
-  matchedRuleId?: string;
-  evaluatedAt: string;
-}
-
 export interface DiscoverableTarget {
   publicationId: string;
   targetIqn: string;
   portal: string;
   state: string;
+}
+
+export type ISCSIAuthMode = "none" | "chap" | "mutual_chap";
+
+export interface ISCSIAuthenticationPolicy {
+  mode: ISCSIAuthMode;
+  credentialId?: string;
+  initiators?: string[];
+  restrictInitiators?: boolean;
+}
+
+export interface ISCSISecurityOrigin {
+  scope: string;
+  ownerId?: string;
+  generation?: number;
+}
+
+export interface ResolvedISCSISecurity {
+  auth: ISCSIAuthenticationPolicy;
+  authSource: ISCSISecurityOrigin;
+  effectiveRevision: string;
+}
+
+export interface ISCSISecurityBinding {
+  scope: "library" | "drive" | "target";
+  ownerId: string;
+  libraryId?: string;
+  driveId?: string;
+  targetIqn?: string;
+  deviceRole?: string;
+  auth?: ISCSIAuthenticationPolicy | null;
+  generation: number;
+  administrativeOffline?: boolean;
+}
+
+export interface ISCSISecurityTargetView {
+  binding: ISCSISecurityBinding;
+  resolved: ResolvedISCSISecurity;
+}
+
+export interface ISCSISecurityImpact {
+  targetIqn: string;
+  deviceRole: string;
+  administrativeOffline: boolean;
+  absent: boolean;
+  busy: boolean;
+  changed: boolean;
+  before: ResolvedISCSISecurity;
+  after: ResolvedISCSISecurity;
+}
+
+export interface ISCSICredentialMetadata {
+  credentialId: string;
+  label: string;
+  username: string;
+  mutualUsername?: string;
+  version: number;
+  createdAt: string;
+  secretPresent: boolean;
 }
 
 export interface AuditEvent {

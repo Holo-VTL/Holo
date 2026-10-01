@@ -17,6 +17,7 @@ import {
   LibraryBig,
   Moon,
   Sun,
+  ShieldCheck,
 } from "lucide-react";
 
 type NavItem = {
@@ -50,6 +51,7 @@ export function AppShell() {
     { to: "/storage", labelKey: "nav.storage", icon: HardDrive },
     { to: "/resources", labelKey: "nav.resources", icon: LibraryBig },
     { to: "/targets", labelKey: "nav.targets", icon: DatabaseBackup },
+    { to: "/security", labelKey: "nav.security", icon: ShieldCheck },
     { to: "/about", labelKey: "nav.about", icon: Info },
   ];
 

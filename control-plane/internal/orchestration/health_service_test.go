@@ -14,7 +14,7 @@ func TestDatabaseComponentAcceptsSQLitePathDSN(t *testing.T) {
 		t.Fatalf("write sqlite file: %v", err)
 	}
 
-	service := NewHealthServiceWithConfig(nil, nil, nil, nil, dbPath, "")
+	service := NewHealthServiceWithConfig(nil, nil, nil, dbPath, "")
 
 	component := service.databaseComponent()
 	if component.Status != "ok" {
@@ -28,7 +28,7 @@ func TestDatabaseComponentAcceptsSQLiteFileDSN(t *testing.T) {
 		t.Fatalf("write sqlite file: %v", err)
 	}
 
-	service := NewHealthServiceWithConfig(nil, nil, nil, nil, "file://"+dbPath, "")
+	service := NewHealthServiceWithConfig(nil, nil, nil, "file://"+dbPath, "")
 
 	component := service.databaseComponent()
 	if component.Status != "ok" {
@@ -38,7 +38,7 @@ func TestDatabaseComponentAcceptsSQLiteFileDSN(t *testing.T) {
 
 func TestDatabaseComponentReportsMissingSQLitePathDown(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "missing.db")
-	service := NewHealthServiceWithConfig(nil, nil, nil, nil, dbPath, "")
+	service := NewHealthServiceWithConfig(nil, nil, nil, dbPath, "")
 
 	component := service.databaseComponent()
 	if component.Status != "down" {
@@ -58,7 +58,7 @@ func TestDataPlaneComponentUsesConfiguredRunDir(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	service := NewHealthServiceWithConfig(nil, nil, nil, nil, "", "")
+	service := NewHealthServiceWithConfig(nil, nil, nil, "", "")
 	component := service.dataPlaneComponent()
 	if component.Status != "ok" {
 		t.Fatalf("expected data plane ok for configured run dir, got %+v", component)
@@ -72,7 +72,7 @@ func TestDataPlaneComponentRejectsStaleSocketPath(t *testing.T) {
 		t.Fatalf("write stale socket placeholder: %v", err)
 	}
 
-	service := NewHealthServiceWithConfig(nil, nil, nil, nil, "", "")
+	service := NewHealthServiceWithConfig(nil, nil, nil, "", "")
 	component := service.dataPlaneComponent()
 	if component.Status != "down" {
 		t.Fatalf("expected stale data plane socket to be down, got %+v", component)

@@ -370,6 +370,12 @@ echo "  Packaging..."
 mkdir -p "\${OUTPUT_DIR}/web-console"
 cp -a "\${BUILD_DIR}/web-console/dist" "\${OUTPUT_DIR}/web-console/dist"
 cp "\${BUILD_DIR}/infra/tcmu/handler_holo.c" "\${OUTPUT_DIR}/handler_holo.c"
+if [ ! -f "\${BUILD_DIR}/infra/iscsi/holo-iscsi-security-helper.py" ]; then
+  echo "Missing infra/iscsi/holo-iscsi-security-helper.py" >&2
+  exit 1
+fi
+cp "\${BUILD_DIR}/infra/iscsi/holo-iscsi-security-helper.py" "\${OUTPUT_DIR}/holo-iscsi-security-helper.py"
+
 
 # Use scripts/install.sh if it exists
 if [ -f "\${BUILD_DIR}/scripts/install.sh" ]; then
@@ -390,6 +396,7 @@ chmod -R u+rwX "\${PACKAGE_ROOT}" 2>/dev/null || true
 rm -rf "\${PACKAGE_ROOT}"
 mkdir -p "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}"
 cp -a control-plane holo-tcmu-handler handler_holo.so handler_holo.c \
+  holo-iscsi-security-helper.py \
   install-holo.sh install.sh web-console "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
 if [ -d packages ]; then
   cp -a packages "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
@@ -415,7 +422,7 @@ tar xzf "${RELEASE_DIR}/${TARBALL_NAME}" -C "${VERIFY_DIR}"
 
 # Check all required files exist
 VERIFY_ROOT="${VERIFY_DIR}/${PACKAGE_DIR_NAME}"
-for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c install-holo.sh web-console/dist/index.html; do
+for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c holo-iscsi-security-helper.py install-holo.sh web-console/dist/index.html; do
   if [[ ! -f "${VERIFY_ROOT}/${f}" && ! -d "${VERIFY_ROOT}/${f}" ]]; then
     echo "error: missing ${f} in tarball" >&2
     rm -rf "${VERIFY_DIR}"

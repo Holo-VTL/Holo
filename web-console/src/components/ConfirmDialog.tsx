@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useId, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 type ConfirmDialogProps = {
@@ -23,6 +23,7 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const { t } = useTranslation();
+  const titleId = useId();
   useEffect(() => {
     if (!open || busy) {
       return;
@@ -41,10 +42,10 @@ export function ConfirmDialog({
   }
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onCancel}>
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby={titleId} onClick={onCancel}>
       <div className="modal-card" onClick={(event) => event.stopPropagation()}>
         <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-          <h3 style={{ margin: 0 }}>{title}</h3>
+          <h3 id={titleId} style={{ margin: 0 }}>{title}</h3>
         </div>
         <div className="modal-notice" style={{ marginBottom: 12 }}>{message}</div>
         <div className="inline-actions">

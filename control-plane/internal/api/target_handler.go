@@ -12,16 +12,15 @@ import (
 
 type TargetHandler struct {
 	service    *orchestration.TargetRuntimeService
-	access     *TargetAccessHandler
 	localMount *orchestration.LocalMountService
 }
 
-func NewTargetHandler(service *orchestration.TargetRuntimeService, access *TargetAccessHandler) *TargetHandler {
-	return &TargetHandler{service: service, access: access}
+func NewTargetHandler(service *orchestration.TargetRuntimeService) *TargetHandler {
+	return &TargetHandler{service: service}
 }
 
-func NewTargetHandlerWithLocalMount(service *orchestration.TargetRuntimeService, access *TargetAccessHandler, localMount *orchestration.LocalMountService) *TargetHandler {
-	return &TargetHandler{service: service, access: access, localMount: localMount}
+func NewTargetHandlerWithLocalMount(service *orchestration.TargetRuntimeService, localMount *orchestration.LocalMountService) *TargetHandler {
+	return &TargetHandler{service: service, localMount: localMount}
 }
 
 type publishTargetRequest struct {
@@ -229,24 +228,6 @@ func (h *TargetHandler) handlePublicationSubresource(w http.ResponseWriter, r *h
 		h.handleRollback(w, r, publicationID)
 	case "validation-runs":
 		h.handleValidationRuns(w, r, publicationID)
-	case "access-rules":
-		if h.access == nil {
-			respondError(w, http.StatusNotFound, "not found", nil)
-			return
-		}
-		h.access.handleAccessRules(w, r, publicationID)
-	case "authorize":
-		if h.access == nil {
-			respondError(w, http.StatusNotFound, "not found", nil)
-			return
-		}
-		h.access.handleAuthorize(w, r, publicationID)
-	case "access-rollback":
-		if h.access == nil {
-			respondError(w, http.StatusNotFound, "not found", nil)
-			return
-		}
-		h.access.handleAccessRollback(w, r, publicationID)
 	default:
 		respondError(w, http.StatusNotFound, "not found", nil)
 	}

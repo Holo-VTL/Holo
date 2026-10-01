@@ -22,6 +22,7 @@ type Config struct {
 	TargetBackstoreDir   string
 	TargetBackstoreSize  int
 	TargetRuntimeUseSudo bool
+	ISCSISecretKeyPath   string
 	WebUIDistDir         string
 	TrustedProxyCIDRs    string
 }
@@ -51,6 +52,7 @@ func load(strict bool) (Config, error) {
 		TargetBackstoreDir:   getenv("HOLO_TARGET_BACKSTORE_DIR", "/var/lib/holo/targets"),
 		TargetBackstoreSize:  targetBackstoreSize,
 		TargetRuntimeUseSudo: targetRuntimeUseSudo,
+		ISCSISecretKeyPath:   getenv("HOLO_ISCSI_SECRET_KEY", "/etc/holo/iscsi-secrets.key"),
 		WebUIDistDir:         getenv("HOLO_WEB_UI_DIST", "./web-console/dist"),
 		TrustedProxyCIDRs:    getenv("HOLO_TRUSTED_PROXY_CIDRS", ""),
 	}, errors.Join(portalErr, backstoreErr, sudoErr)

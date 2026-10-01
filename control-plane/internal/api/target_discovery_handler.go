@@ -21,6 +21,11 @@ type discoverTargetsResponse struct {
 	Targets   []domain.DiscoverableTarget `json:"targets"`
 }
 
+type visibleTargetsResponse struct {
+	Initiator    string                      `json:"initiator"`
+	Publications []*domain.TargetPublication `json:"publications"`
+}
+
 func (h *TargetDiscoveryHandler) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
@@ -34,7 +39,7 @@ func (h *TargetDiscoveryHandler) handleDiscovery(w http.ResponseWriter, r *http.
 	}
 	results, err := h.service.Discover(r.Context(), req)
 	if err != nil {
-		respondAccessError(w, err)
+		respondResourceError(w, err)
 		return
 	}
 	respondJSON(w, http.StatusOK, discoverTargetsResponse{
@@ -42,4 +47,18 @@ func (h *TargetDiscoveryHandler) handleDiscovery(w http.ResponseWriter, r *http.
 		Portal:    req.Portal,
 		Targets:   results,
 	})
+}
+
+func (h *TargetDiscoveryHandler) handleVisible(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	initiator := r.URL.Query().Get("initiator")
+	publications, err := h.service.VisiblePublications(r.Context(), initiator, r.URL.Query().Get("actor"))
+	if err != nil {
+		respondResourceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, visibleTargetsResponse{Initiator: initiator, Publications: publications})
 }

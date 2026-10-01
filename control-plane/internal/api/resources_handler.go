@@ -2716,6 +2716,7 @@ func (h *ResourcesHandler) ensureLibraryAutoPublications(ctx context.Context, li
 				DeviceProfile: normalizeDeviceProfile(library.Vendor, library.LibraryType, "changer"),
 				DriveProfile:  driveProfile,
 				Actor:         "system",
+				Auto:          true,
 			}); err != nil && !errors.Is(err, domain.ErrConflict) {
 				return err
 			}
@@ -2742,6 +2743,7 @@ func (h *ResourcesHandler) ensureLibraryAutoPublications(ctx context.Context, li
 				DeviceProfile: driveProfile,
 				DriveProfile:  driveProfile,
 				Actor:         "system",
+				Auto:          true,
 			}); err != nil && !errors.Is(err, domain.ErrConflict) {
 				return err
 			}

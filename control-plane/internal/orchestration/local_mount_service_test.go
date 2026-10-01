@@ -100,6 +100,124 @@ func TestLocalMountSyncLogsInDesiredTargetsAndCleansStaleHoloNodes(t *testing.T)
 	}
 }
 
+func TestLocalMountSyncSkipsProtectedTargetsAndRemovesExistingLocalNode(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("HOLO_ISCSI_PRIVILEGED_HELPER", "/opt/holo/bin/holo-iscsi-helper")
+	iqn := "iqn.2026-04.cloud.backupnext.holo:drive-a"
+	targetRepo := memory.NewTargetRuntimeRepo()
+	publication, err := domain.NewTargetPublication("pub-secure", "pool-a", "lib-a", "drive-a", "cart-a", iqn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publication.MarkReady("127.0.0.1:3260"); err != nil {
+		t.Fatal(err)
+	}
+	if err := targetRepo.SavePublication(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	securityRepo := memory.NewISCSISecurityRepo()
+	if err := securityRepo.RegisterTarget(ctx, iqn, "lib-a", "drive-a", "drive"); err != nil {
+		t.Fatal(err)
+	}
+	credential := domain.ISCSICredential{CredentialID: "cred-a", Label: "backup", Username: "backup-user", EncryptedSecret: make([]byte, 64), Version: 1}
+	if err := securityRepo.CreateCredential(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := securityRepo.SaveBinding(ctx, domain.ISCSISecurityBinding{
+		Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
+		Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthCHAP, CredentialID: "cred-a", Initiators: []string{"iqn.1991-05.com.microsoft:backup"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{outputs: map[string]string{
+		"sudo -n /opt/holo/bin/holo-iscsi-helper nodes":    "127.0.0.1:3260,1 " + iqn + "\n",
+		"sudo -n /opt/holo/bin/holo-iscsi-helper sessions": "tcp: [1] 127.0.0.1:3260,1 " + iqn + "\n",
+	}}
+	mount := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260, UseSudo: true}, runner)
+	mount.SetISCSISecurityService(NewISCSISecurityService(securityRepo, nil, nil, nil))
+	status, err := mount.Sync(ctx, "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.SkippedTargets) != 1 || status.SkippedTargets[0] != (LocalMountSkip{TargetIQN: iqn, Reason: "protected-iscsi-target"}) {
+		t.Fatalf("protected target skip reason missing: %+v", status)
+	}
+	commands := runner.snapshotCommands()
+	for _, command := range commands {
+		if strings.Contains(command, " login ") || strings.Contains(command, "ensure-node") {
+			t.Fatalf("local mount attempted to bypass target protection: %s", command)
+		}
+	}
+	if !containsCommand(commands, "sudo -n /opt/holo/bin/holo-iscsi-helper delete "+iqn+" 127.0.0.1:3260") {
+		t.Fatalf("previous local node should be removed after policy changes: %v", commands)
+	}
+}
+
+func TestLocalMountSyncSkipsAclOnlyTargets(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("HOLO_ISCSI_PRIVILEGED_HELPER", "/opt/holo/bin/holo-iscsi-helper")
+	for _, testCase := range []struct {
+		name      string
+		configure func(*testing.T, *memory.ISCSISecurityRepo)
+	}{
+		{name: "acl-only", configure: func(t *testing.T, repository *memory.ISCSISecurityRepo) {
+			t.Helper()
+			if err := repository.SaveBinding(ctx, domain.ISCSISecurityBinding{
+				Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
+				Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthNone, RestrictInitiators: true},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			const iqn = "iqn.2026-04.cloud.backupnext.holo:drive-a"
+			targetRepo := memory.NewTargetRuntimeRepo()
+			publication, err := domain.NewTargetPublication("pub-secure", "pool-a", "lib-a", "drive-a", "cart-a", iqn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := publication.MarkReady("127.0.0.1:3260"); err != nil {
+				t.Fatal(err)
+			}
+			if err := targetRepo.SavePublication(ctx, publication); err != nil {
+				t.Fatal(err)
+			}
+			securityRepo := memory.NewISCSISecurityRepo()
+			if err := securityRepo.RegisterTarget(ctx, iqn, "lib-a", "drive-a", "drive"); err != nil {
+				t.Fatal(err)
+			}
+			testCase.configure(t, securityRepo)
+			runner := &recordingRunner{outputs: map[string]string{
+				"sudo -n /opt/holo/bin/holo-iscsi-helper nodes": "127.0.0.1:3260,1 " + iqn + "\n",
+			}}
+			mount := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260, UseSudo: true}, runner)
+			mount.SetISCSISecurityService(NewISCSISecurityService(securityRepo, nil, nil, nil))
+			status, err := mount.Sync(ctx, "tester")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(status.SkippedTargets) != 1 || status.SkippedTargets[0] != (LocalMountSkip{TargetIQN: iqn, Reason: "protected-iscsi-target"}) {
+				t.Fatalf("expected protected target skip, got %+v", status.SkippedTargets)
+			}
+			for _, command := range runner.snapshotCommands() {
+				if strings.Contains(command, " login ") || strings.Contains(command, "ensure-node") {
+					t.Fatalf("local mount attempted an iSCSI login bypass: %s", command)
+				}
+			}
+		})
+	}
+}
+
+func containsCommand(commands []string, want string) bool {
+	for _, command := range commands {
+		if command == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseISCSIADMNodes(t *testing.T) {
 	nodes := parseISCSIADMNodes("10.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:drive-a\n")
 	if len(nodes) != 1 || nodes[0].Portal != "10.0.0.1:3260" || nodes[0].IQN != "iqn.2026-04.cloud.backupnext.holo:drive-a" {

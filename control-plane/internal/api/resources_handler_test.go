@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
+	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
 	"github.com/Holo-VTL/Holo/control-plane/internal/storageutil"
 )
 
@@ -424,6 +425,53 @@ func TestResourcesAutoPublishLibraryAndDriveIQN(t *testing.T) {
 	}
 	if !strings.Contains(body, `"deviceRole":"changer"`) || !strings.Contains(body, `"deviceRole":"drive"`) {
 		t.Fatalf("expected changer and drive roles, got %s", body)
+	}
+}
+
+func TestAutoPublicationHonorsAdministrativelyOfflineTargetIntent(t *testing.T) {
+	srv := newTestServer(t)
+	requests := []struct {
+		path string
+		body string
+	}{
+		{"/v1/storage/pools", `{"poolId":"pool-auto-offline","name":"Pool Auto Offline"}`},
+		{"/v1/libraries", `{"libraryId":"lib-auto-offline","name":"Auto Offline","vendor":"IBM","libraryType":"03584L32","driveType":"ULT3580-TD6"}`},
+		{"/v1/drives", `{"driveId":"drive-auto-offline","libraryId":"lib-auto-offline","slot":1}`},
+		{"/v1/cartridges", `{"poolId":"pool-auto-offline","libraryId":"lib-auto-offline","capacityBytes":1073741824,"ltoGeneration":6}`},
+	}
+	for _, request := range requests {
+		response := httptest.NewRecorder()
+		srv.Router().ServeHTTP(response, newAuthedRequest(http.MethodPost, request.path, strings.NewReader(request.body)))
+		if response.Code < 200 || response.Code >= 300 {
+			t.Fatalf("setup request %s failed: status=%d body=%s", request.path, response.Code, response.Body.String())
+		}
+	}
+
+	const changerIQN = "iqn.2026-04.cloud.backupnext.holo:library-lib-auto-offline"
+	var changer *domain.TargetPublication
+	for _, publication := range srv.runtime.ListPublications(context.Background()) {
+		if publication.TargetIQN == changerIQN {
+			changer = publication
+		}
+	}
+	if changer == nil || changer.State != domain.PublicationReady {
+		t.Fatalf("expected auto-published changer target, got %+v", changer)
+	}
+	if _, err := srv.runtime.Unpublish(context.Background(), changer.PublicationID, "operator"); err != nil {
+		t.Fatalf("unpublish changer target: %v", err)
+	}
+	before := len(srv.runtime.ListPublications(context.Background()))
+	if err := srv.resources.ensureLibraryAutoPublications(context.Background(), "lib-auto-offline"); !errors.Is(err, orchestration.ErrISCSISecurityBusy) {
+		t.Fatalf("automatic publication should respect offline intent: %v", err)
+	}
+	publications := srv.runtime.ListPublications(context.Background())
+	if len(publications) != before {
+		t.Fatalf("automatic publication recreated a deliberately offline target: before=%d after=%d", before, len(publications))
+	}
+	for _, publication := range publications {
+		if publication.TargetIQN == changerIQN && publication.State != domain.PublicationDisabled {
+			t.Fatalf("offline changer changed state during auto-publication: %+v", publication)
+		}
 	}
 }
 

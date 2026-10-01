@@ -1,11 +1,13 @@
 import type {
   ApiError,
   AuditEvent,
-  AuthorizationDecision,
   CDBTraceStatus,
   DiscoverableTarget,
   HealthSummary,
-  InitiatorRule,
+  ISCSICredentialMetadata,
+  ISCSISecurityBinding,
+  ISCSISecurityImpact,
+  ISCSISecurityTargetView,
   LocalMountStatus,
   StorageManagedDisk,
   StoragePoolCapacitySnapshot,
@@ -19,7 +21,7 @@ import type {
 } from "./types";
 
 type RequestOptions = {
-  method?: "GET" | "POST" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
 };
 
@@ -338,6 +340,7 @@ export const api = {
       targetIqn: string;
       deviceRole?: string;
       deviceProfile?: string;
+      driveProfile?: string;
       actor?: string;
     }) => request<TargetPublication>("/v1/targets/publications", { method: "POST", body }),
     unpublish: (publicationId: string, actor = "web-console") =>
@@ -361,27 +364,6 @@ export const api = {
         `/v1/targets/publications/${encodeURIComponent(publicationId)}/validation-runs?actor=${encodeURIComponent(actor)}`,
         { method: "POST", body }
       ),
-    listAccessRules: async (publicationId: string) => {
-      const result = await request<{ publicationId: string; rules: InitiatorRule[] }>(
-        `/v1/targets/publications/${encodeURIComponent(publicationId)}/access-rules`
-      );
-      return result.rules;
-    },
-    replaceAccessRules: (publicationId: string, body: { actor?: string; rules: Array<Partial<InitiatorRule>> }) =>
-      request(`/v1/targets/publications/${encodeURIComponent(publicationId)}/access-rules`, {
-        method: "POST",
-        body,
-      }),
-    authorize: (publicationId: string, body: { initiator: string; actor?: string }) =>
-      request<AuthorizationDecision>(`/v1/targets/publications/${encodeURIComponent(publicationId)}/authorize`, {
-        method: "POST",
-        body,
-      }),
-    rollbackAccess: (publicationId: string, body: { actor?: string }) =>
-      request(`/v1/targets/publications/${encodeURIComponent(publicationId)}/access-rollback`, {
-        method: "POST",
-        body,
-      }),
     visible: async (params: { initiator: string; actor?: string }) => {
       const query = new URLSearchParams({ initiator: params.initiator, actor: params.actor || "web-console" });
       const result = await request<{ initiator: string; publications: TargetPublication[] }>(
@@ -400,21 +382,35 @@ export const api = {
       return result.targets;
     },
   },
-  policy: {
-    createAccessPolicy: (body: {
-      policyId: string;
-      scope: "global" | "library" | "drive";
-      subject: string;
-      permission: "allow" | "deny";
-      effectiveFrom: string;
-      effectiveTo?: string;
-    }) => request("/v1/access-policies", { method: "POST", body }),
-    createRetentionPolicy: (body: {
-      retentionId: string;
-      cartridgeId: string;
-      mode: "worm" | "governance";
-      lockUntil: string;
-      createdBy: string;
-    }) => request("/v1/retention-policies", { method: "POST", body }),
+  iscsiSecurity: {
+    getLibraryBinding: (libraryId: string) =>
+      request<{ binding: ISCSISecurityBinding; targets: ISCSISecurityTargetView[] }>(`/v1/libraries/${encodeURIComponent(libraryId)}/iscsi-security`),
+    putLibraryBinding: (libraryId: string, body: { generation: number; auth: object | null; actor?: string }) =>
+      request<{ binding: ISCSISecurityBinding }>(`/v1/libraries/${encodeURIComponent(libraryId)}/iscsi-security`, { method: "PUT", body }),
+    previewLibraryBinding: (libraryId: string, body: { generation: number; auth: object | null; actor?: string }) =>
+      request<{ targets: ISCSISecurityImpact[] }>(`/v1/libraries/${encodeURIComponent(libraryId)}/iscsi-security/preview`, { method: "POST", body }),
+    getDriveBinding: (driveId: string) =>
+      request<{ binding: ISCSISecurityBinding; targets: ISCSISecurityTargetView[] }>(`/v1/drives/${encodeURIComponent(driveId)}/iscsi-security`),
+    putDriveBinding: (driveId: string, body: { generation: number; auth: object | null; actor?: string }) =>
+      request<{ binding: ISCSISecurityBinding }>(`/v1/drives/${encodeURIComponent(driveId)}/iscsi-security`, { method: "PUT", body }),
+    previewDriveBinding: (driveId: string, body: { generation: number; auth: object | null; actor?: string }) =>
+      request<{ targets: ISCSISecurityImpact[] }>(`/v1/drives/${encodeURIComponent(driveId)}/iscsi-security/preview`, { method: "POST", body }),
+    listTargets: async () => {
+      const result = await request<{ targets: ISCSISecurityTargetView[] }>("/v1/iscsi-security/targets");
+      return result.targets;
+    },
+    getTargetBinding: (iqn: string) => request<ISCSISecurityTargetView>(`/v1/iscsi-security/targets/${encodeURIComponent(iqn)}`),
+    putTargetBinding: (iqn: string, body: { generation: number; auth: object | null; actor?: string }) =>
+      request<{ binding: ISCSISecurityBinding }>(`/v1/iscsi-security/targets/${encodeURIComponent(iqn)}`, { method: "PUT", body }),
+    previewTargetBinding: (iqn: string, body: { generation: number; auth: object | null; actor?: string }) =>
+      request<{ targets: ISCSISecurityImpact[] }>(`/v1/iscsi-security/targets/${encodeURIComponent(iqn)}/preview`, { method: "POST", body }),
+    listCredentials: async () => {
+      const result = await request<{ credentials: ISCSICredentialMetadata[] }>("/v1/iscsi-security/credentials");
+      return result.credentials;
+    },
+    createCredential: (body: { credentialId: string; label: string; forwardUsername: string; forwardSecret: string; reverseUsername?: string; reverseSecret?: string; actor?: string }) =>
+      request<ISCSICredentialMetadata>("/v1/iscsi-security/credentials", { method: "POST", body }),
+    deleteCredential: (credentialId: string) => request<void>(`/v1/iscsi-security/credentials/${encodeURIComponent(credentialId)}?actor=web-console`, { method: "DELETE" }),
+
   },
 };

@@ -601,6 +601,7 @@ build_package_plan() {
       die "internal error: package manager not detected"
       ;;
   esac
+
 }
 
 # ── Preflight ───────────────────────────────────────────────────────
@@ -889,7 +890,10 @@ ensure_user_and_dirs() {
   if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
     run_cmd useradd --system --gid "${SERVICE_GROUP}" --home-dir "${DATA_DIR}" --shell /sbin/nologin "${SERVICE_USER}"
   fi
-  run_cmd mkdir -p "${PREFIX}/bin" "${PREFIX}/web-console" "${CONFIG_DIR}" "${DATA_DIR}/storage-pools" "${DATA_DIR}/targets" "${DATA_DIR}/media-state" "${LOG_DIR}" "${PLUGIN_DIR}"
+  run_cmd mkdir -p "${PREFIX}/bin" "${PREFIX}/web-console" "${CONFIG_DIR}" "${CONFIG_DIR}/iscsi" "${DATA_DIR}/storage-pools" "${DATA_DIR}/targets" "${DATA_DIR}/media-state" "${LOG_DIR}" "${PLUGIN_DIR}"
+  run_cmd chown root:root "${CONFIG_DIR}/iscsi"
+  run_cmd chmod 0700 "${CONFIG_DIR}/iscsi"
+  run_cmd chown root:"${SERVICE_GROUP}" "${CONFIG_DIR}"
   run_cmd chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}" "${LOG_DIR}"
   run_cmd chmod 0750 "${CONFIG_DIR}"
 }
@@ -1175,7 +1179,13 @@ case "\${target_path}:\${action}" in
 esac
 
 bin="\$(targetcli_bin)"
-export TARGETCLI_HOME="/tmp/.holo-targetcli"
+targetcli_home="/run/holo-targetcli"
+mkdir -p "\${targetcli_home}"
+chown root:root "\${targetcli_home}"
+chmod 0700 "\${targetcli_home}"
+export TARGETCLI_HOME="\${targetcli_home}"
+"\${bin}" set global auto_save_on_exit=false >/dev/null 2>&1 || die "could not disable targetcli save-on-exit"
+chmod 0600 "\${targetcli_home}/prefs.bin"
 exec "\${bin}" "\${orig[@]}"
 EOF
   if [[ "${DRY_RUN}" == "1" ]]; then
@@ -1273,6 +1283,25 @@ EOF
   rm -f "${helper_tmp}"
 }
 
+write_iscsi_security_helper() {
+  log "Installing iSCSI security helper"
+  local source helper_tmp helper_path
+  source="${BUNDLE_DIR}/holo-iscsi-security-helper.py"
+  if [[ ! -f "${source}" ]]; then
+    source="${SCRIPT_DIR}/../infra/iscsi/holo-iscsi-security-helper.py"
+  fi
+  [[ -f "${source}" ]] || die "iSCSI security helper source is missing"
+  helper_tmp="$(mktemp)"
+  helper_path="${PREFIX}/bin/holo-iscsi-security-helper"
+  cp "${source}" "${helper_tmp}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] install -m 0750 -o root -g root ${helper_path}"
+  else
+    install -m 0750 -o root -g root "${helper_tmp}" "${helper_path}"
+  fi
+  rm -f "${helper_tmp}"
+}
+
 write_support_helper() {
   log "Writing support bundle privilege helper"
   local helper_tmp helper_path
@@ -1321,9 +1350,13 @@ valid_support_path() {
 run_targetcli() {
   local bin home
   bin="$(resolve_bin targetcli /usr/bin/targetcli /usr/sbin/targetcli /bin/targetcli)"
-  home="/run/holo/targetcli-home"
+  home="/run/holo-targetcli"
   mkdir -p "${home}"
+  chown root:root "${home}"
+  chmod 0700 "${home}"
   export TARGETCLI_HOME="${home}"
+  "${bin}" set global auto_save_on_exit=false >/dev/null 2>&1 || die "could not disable targetcli save-on-exit"
+  chmod 0600 "${home}/prefs.bin"
   exec "${bin}" "$@"
 }
 
@@ -1459,9 +1492,14 @@ build_tcmu_plugin() {
 
 detect_portal_host() {
   if [[ -n "${PORTAL_HOST}" ]]; then return 0; fi
-  local addresses
-  addresses="$(hostname -I 2>/dev/null || true)"
-  PORTAL_HOST="${addresses%% *}"
+  local route
+  route="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+  PORTAL_HOST="$(awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}' <<<"${route}")"
+  if [[ -z "${PORTAL_HOST}" ]]; then
+    local addresses
+    addresses="$(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4, address, "/"); print address[1]}')"
+    PORTAL_HOST="${addresses%%$'\n'*}"
+  fi
   if [[ -z "${PORTAL_HOST}" ]]; then
     PORTAL_HOST="127.0.0.1"
   fi
@@ -1541,6 +1579,8 @@ HOLO_TARGET_BACKSTORE_SIZE_MB=128
 HOLO_TARGET_RUNTIME_USE_SUDO=true
 HOLO_TARGETCLI_PRIVILEGED_HELPER=${PREFIX}/bin/holo-targetcli-helper
 HOLO_ISCSI_PRIVILEGED_HELPER=${PREFIX}/bin/holo-iscsi-helper
+HOLO_ISCSI_SECURITY_HELPER=${PREFIX}/bin/holo-iscsi-security-helper
+HOLO_ISCSI_SECRET_KEY=${CONFIG_DIR}/iscsi-secrets.key
 HOLO_STORAGE_PRIVILEGED_HELPER=${PREFIX}/bin/holo-storage-helper
 HOLO_SUPPORT_PRIVILEGED_HELPER=${PREFIX}/bin/holo-support-helper
 HOLO_STORAGE_POOL_ROOT_BASE=${DATA_DIR}/storage-pools
@@ -1608,9 +1648,11 @@ EOF
 cat >"${sudoers_tmp}" <<EOF
 Defaults:${SERVICE_USER} !requiretty
 Defaults:${SERVICE_USER} !pam_session
+Defaults!${PREFIX}/bin/holo-iscsi-security-helper !log_input, !log_output
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-storage-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-targetcli-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-iscsi-helper
+${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-iscsi-security-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-support-helper
 EOF
 
@@ -1922,6 +1964,7 @@ install_or_upgrade_holo() {
   write_storage_helper
   write_targetcli_helper
   write_iscsi_helper
+  write_iscsi_security_helper
   write_support_helper
   write_runtime_config
   write_systemd_units
@@ -1954,4 +1997,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -1,75 +1,70 @@
-import { screen } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "../test/renderWithProviders";
+import { api } from "../services/api";
 import { TargetsPage } from "./TargetsPage";
+
+const iscsiSecurityMock = vi.hoisted(() => ({
+  listTargets: vi.fn().mockResolvedValue([{ binding: { targetIqn: "iqn.2026-01.example:offline", ownerId: "iqn.2026-01.example:offline", scope: "target", deviceRole: "drive", generation: 1 }, resolved: { auth: { mode: "none" }, authSource: { scope: "default" }, effectiveRevision: "rev" } }]),
+  getTargetBinding: vi.fn().mockResolvedValue({ binding: { targetIqn: "iqn.2026-01.example:offline", ownerId: "iqn.2026-01.example:offline", scope: "target", deviceRole: "drive", generation: 1 }, resolved: { auth: { mode: "none" }, authSource: { scope: "default" }, effectiveRevision: "rev" } }),
+  listCredentials: vi.fn().mockResolvedValue([]),
+}));
 
 vi.mock("../services/api", () => ({
   api: {
     targets: {
-      listPublications: vi.fn().mockResolvedValue([
-        {
-          publicationId: "pub-a",
-          targetIqn: "iqn.a",
-          deviceRole: "drive",
-          portal: "10.0.0.1:3260",
-          state: "ready",
-          connectedHosts: {
-            available: true,
-            hostCount: 2,
-            sessionCount: 2,
-            initiators: ["iqn.1993-08.org.debian:01:init-a", "iqn.1991-05.com.microsoft:host-a"],
-          },
-        },
-        {
-          publicationId: "pub-empty",
-          targetIqn: "iqn.empty",
-          deviceRole: "drive",
-          portal: "10.0.0.1:3260",
-          state: "ready",
-          connectedHosts: { available: true, hostCount: 0, sessionCount: 0, initiators: [] },
-        },
-        {
-          publicationId: "pub-unknown",
-          targetIqn: "iqn.unknown",
-          deviceRole: "drive",
-          portal: "10.0.0.1:3260",
-          state: "ready",
-          connectedHosts: { available: false, hostCount: 0, sessionCount: 0, initiators: [], lastError: "session discovery unavailable" },
-        },
-        { publicationId: "pub-b", targetIqn: "iqn.b", deviceRole: "changer", portal: "10.0.0.1:3260", state: "disabled" },
-      ]),
-      localMountStatus: vi.fn().mockResolvedValue({ enabled: false, desiredIqns: [], mountedIqns: [] }),
-      setLocalMount: vi.fn(),
-      createPublication: vi.fn(),
-      unpublish: vi.fn(),
-      rollback: vi.fn(),
-      listValidationRuns: vi.fn().mockResolvedValue([]),
-      startValidationRun: vi.fn(),
+      listPublications: vi.fn().mockResolvedValue([]),
+      localMountStatus: vi.fn().mockResolvedValue({ enabled: false, desiredIqns: [], mountedIqns: [], skippedTargets: [{ targetIqn: "iqn.2026-01.example:offline", reason: "CHAP target" }] }),
+      unpublish: vi.fn().mockResolvedValue({}),
+      createPublication: vi.fn().mockResolvedValue({}),
     },
-    resources: {
-      listLibraries: vi.fn().mockResolvedValue([{ libraryId: "lib-a", name: "Lib A" }]),
-      listDrives: vi.fn().mockResolvedValue([{ driveId: "drive-a", libraryId: "lib-a", slot: 1 }]),
-      listCartridges: vi.fn().mockResolvedValue([{ cartridgeId: "car-a", poolId: "pool-a", libraryId: "lib-a", barcode: "VTA000L06", capacityBytes: 1000 }]),
-    },
+    iscsiSecurity: iscsiSecurityMock,
   },
 }));
 
-describe("TargetsPage", () => {
-  it("renders only active publication rows", async () => {
+describe("TargetsPage security inventory", () => {
+  it("keeps an offline stable target editable", async () => {
     renderWithProviders(<TargetsPage />);
-    expect(await screen.findByRole("heading", { name: "Target Publications", level: 1 })).toBeInTheDocument();
-    expect(await screen.findByRole("cell", { name: "iqn.a" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "Connected Hosts" })).toBeInTheDocument();
-    expect(screen.getAllByRole("cell", { name: "drive" })).toHaveLength(3);
-    expect(screen.getByText("2 hosts")).toBeInTheDocument();
-    expect(screen.queryByText(/iqn\.1993-08\.org\.debian:01:init-a/)).not.toBeInTheDocument();
-    expect(screen.getByText("2 hosts").closest(".connected-hosts-cell")).toHaveAttribute(
-      "title",
-      "iqn.1993-08.org.debian:01:init-a\niqn.1991-05.com.microsoft:host-a"
-    );
-    expect(screen.getByText("No sessions")).toBeInTheDocument();
-    expect(screen.getByText("Unavailable")).toBeInTheDocument();
-    expect(screen.queryByRole("cell", { name: "iqn.b" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Unpublish" })).not.toBeInTheDocument();
+    expect(await screen.findByText("iqn.2026-01.example:offline")).toBeInTheDocument();
+    expect(screen.queryByText("Protected targets skipped from local mounting")).not.toBeInTheDocument();
+    expect(screen.queryByText(/CHAP target/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Set protection" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Target connection protection" })).toBeInTheDocument();
+    expect(iscsiSecurityMock.getTargetBinding).toHaveBeenCalledWith("iqn.2026-01.example:offline");
+  });
+
+  it("requires confirmation before taking an active target offline", async () => {
+    vi.mocked(api.targets.listPublications).mockResolvedValue([{
+      publicationId: "pub-a", poolId: "pool-a", libraryId: "lib-a", driveId: "drive-a", cartridgeId: "cart-a",
+      targetIqn: "iqn.2026-01.example:offline", deviceRole: "drive", portal: "192.0.2.10:3260", state: "ready",
+      compressionEnabled: false, dedupEnabled: false, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    }]);
+    renderWithProviders(<TargetsPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "Take offline" }));
+    const dialog = await screen.findByRole("dialog", { name: "Take target offline?" });
+    expect(dialog).toHaveTextContent("disconnects any active backup-host sessions");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Take offline" }));
+
+    expect(api.targets.unpublish).toHaveBeenCalledWith("pub-a");
+  });
+
+  it("offers an explicit bring-online action for an offline target", async () => {
+    vi.mocked(api.targets.listPublications).mockResolvedValue([{
+      publicationId: "pub-a", poolId: "pool-a", libraryId: "lib-a", driveId: "drive-a", cartridgeId: "cart-a",
+      targetIqn: "iqn.2026-01.example:offline", deviceRole: "drive", portal: "192.0.2.10:3260", state: "disabled",
+      compressionEnabled: false, dedupEnabled: false, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    }]);
+    renderWithProviders(<TargetsPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "Bring online" }));
+    const dialog = await screen.findByRole("dialog", { name: "Bring target online?" });
+    expect(dialog).toHaveTextContent("without matching CHAP settings may not connect");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Bring online" }));
+
+    expect(api.targets.createPublication).toHaveBeenCalledWith(expect.objectContaining({
+      libraryId: "lib-a", driveId: "drive-a", cartridgeId: "cart-a", targetIqn: "iqn.2026-01.example:offline",
+      deviceRole: "drive", actor: "web-console",
+    }));
   });
 });

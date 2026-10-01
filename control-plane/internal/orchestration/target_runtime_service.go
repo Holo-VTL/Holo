@@ -168,8 +168,9 @@ func (r *osCommandRunner) Run(ctx context.Context, command string, args ...strin
 }
 
 type lioShellTargetRuntimeAdapter struct {
-	cfg    TargetRuntimeConfig
-	runner commandRunner
+	cfg            TargetRuntimeConfig
+	runner         commandRunner
+	securityHelper *ISCSISecurityHelper
 }
 
 func newLIOShellTargetRuntimeAdapter(cfg TargetRuntimeConfig, runner commandRunner) *lioShellTargetRuntimeAdapter {
@@ -177,8 +178,9 @@ func newLIOShellTargetRuntimeAdapter(cfg TargetRuntimeConfig, runner commandRunn
 		runner = &osCommandRunner{}
 	}
 	return &lioShellTargetRuntimeAdapter{
-		cfg:    normalizeTargetRuntimeConfig(cfg),
-		runner: runner,
+		cfg:            normalizeTargetRuntimeConfig(cfg),
+		runner:         runner,
+		securityHelper: NewDefaultISCSISecurityHelper(cfg.UseSudo),
 	}
 }
 
@@ -236,6 +238,49 @@ func (a *lioShellTargetRuntimeAdapter) Publish(ctx context.Context, publication 
 
 	portal := fmt.Sprintf("%s:%d", a.cfg.PortalHost, a.cfg.PortalPort)
 	return portal, nil
+}
+
+func (a *lioShellTargetRuntimeAdapter) PublishProtected(ctx context.Context, publication *domain.TargetPublication, security ISCSIResolvedPublicationSecurity) (string, error) {
+	if err := validateTargetPublicationForRuntime(publication); err != nil {
+		return "", err
+	}
+	backstoreDir, err := lioBackstoreDir(a.cfg, publication)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(backstoreDir, 0o755); err != nil {
+		return "", fmt.Errorf("create backstore directory: %w", err)
+	}
+	backstoreName := runtimeBackstoreName(publication)
+	backstorePath, err := runtimeBackstorePath(backstoreDir, backstoreName)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureBackstoreImage(backstorePath, a.cfg.BackstoreSizeMB); err != nil {
+		return "", err
+	}
+	if err := a.runTargetcli(ctx, "/backstores/fileio", "create",
+		"name="+backstoreName, "file_or_dev="+backstorePath,
+		fmt.Sprintf("size=%dM", a.cfg.BackstoreSizeMB),
+	); err != nil {
+		_ = os.Remove(backstorePath)
+		return "", fmt.Errorf("create protected fileio backstore: %w", err)
+	}
+	if err := runProtectedTargetHelper(ctx, a.securityHelper, publication, security, backstoreName, "fileio", a.cfg.PortalHost, a.cfg.PortalPort); err != nil {
+		cleanupErr := a.cleanupProtectedTarget(ctx, publication.TargetIQN, backstoreName, backstorePath)
+		return "", errors.Join(err, cleanupErr)
+	}
+	return fmt.Sprintf("%s:%d", a.cfg.PortalHost, a.cfg.PortalPort), nil
+}
+
+func (a *lioShellTargetRuntimeAdapter) cleanupProtectedTarget(ctx context.Context, targetIQN, backstoreName, backstorePath string) error {
+	_, targetErr := a.securityHelper.Call(ctx, map[string]any{"version": 1, "operation": "delete-owned-target", "targetIQN": targetIQN})
+	backstoreErr := a.deleteBackstore(ctx, backstoreName)
+	fileErr := os.Remove(backstorePath)
+	if errors.Is(fileErr, os.ErrNotExist) {
+		fileErr = nil
+	}
+	return errors.Join(targetErr, backstoreErr, fileErr)
 }
 
 func (a *lioShellTargetRuntimeAdapter) Unpublish(ctx context.Context, publication *domain.TargetPublication) error {
@@ -487,18 +532,21 @@ type PublishRequest struct {
 	DeviceProfile string `json:"deviceProfile,omitempty"`
 	DriveProfile  string `json:"driveProfile,omitempty"`
 	Actor         string `json:"actor"`
+	Auto          bool
 }
 
 type TargetRuntimeService struct {
-	coreRepo    CoreResourceReader
-	runtimeRepo TargetRuntimeRepository
-	adapter     TargetRuntimeAdapter
-	auditW      audit.Writer
-	cfg         TargetRuntimeConfig
-	metrics     *metrics.MetricsRegistry
-	storageWg   StorageWriteGuard
-	poolReader  StoragePoolReader
-	localMount  LocalMountSynchronizer
+	coreRepo      CoreResourceReader
+	runtimeRepo   TargetRuntimeRepository
+	adapter       TargetRuntimeAdapter
+	auditW        audit.Writer
+	cfg           TargetRuntimeConfig
+	metrics       *metrics.MetricsRegistry
+	storageWg     StorageWriteGuard
+	poolReader    StoragePoolReader
+	localMount    LocalMountSynchronizer
+	iscsiSecurity *ISCSISecurityService
+	securityMu    sync.Mutex
 
 	sessionMu       sync.Mutex
 	sessionCache    targetSessionCache
@@ -578,7 +626,43 @@ func (s *TargetRuntimeService) SetLocalMountSynchronizer(syncer LocalMountSynchr
 	s.localMount = syncer
 }
 
+func (s *TargetRuntimeService) SetISCSISecurityService(service *ISCSISecurityService) {
+	s.iscsiSecurity = service
+}
+
+func (s *TargetRuntimeService) WithISCSISecurityLock(_ context.Context, operation func() error) error {
+	s.securityMu.Lock()
+	defer s.securityMu.Unlock()
+	return operation()
+}
+
+func (s *TargetRuntimeService) TargetRuntimeAbsent(ctx context.Context, targetIQN string) (bool, error) {
+	publication, found := s.runtimeRepo.FindPublicationByIQN(ctx, targetIQN)
+	if found && publication != nil && publication.State != domain.PublicationDisabled {
+		return false, nil
+	}
+	if s.cfg.Mode == "in-memory" {
+		return true, nil
+	}
+	if domain.ValidateTargetIQN(targetIQN) != nil {
+		return false, domain.ErrInvalidInput
+	}
+	if _, err := os.Stat(s.cfg.IscsiConfigfsRoot); err != nil {
+		return false, err
+	}
+	_, err := os.Stat(filepath.Join(s.cfg.IscsiConfigfsRoot, targetIQN))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) (*domain.TargetPublication, error) {
+	s.securityMu.Lock()
+	defer s.securityMu.Unlock()
 	if req.LibraryID == "" || req.DriveID == "" || req.CartridgeID == "" {
 		return nil, domain.ErrInvalidInput
 	}
@@ -634,6 +718,15 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 	publication.CompressionEnabled = library.CompressionEnabled
 	publication.DedupEnabled = library.DedupEnabled
 	publication.SetDriveProfile(strings.TrimSpace(req.DriveProfile))
+	securityContext := ISCSIResolvedPublicationSecurity{}
+	if s.iscsiSecurity != nil {
+		var err error
+		securityContext, err = s.iscsiSecurity.ResolvePublicationLocked(ctx, publication, req.Auto)
+		if err != nil {
+			return nil, err
+		}
+	}
+	publication.SecurityEnforcement = pendingSecurityEnforcement(s.cfg.Mode, securityContext.Policy)
 	if err := s.runtimeRepo.SavePublicationIfIQNAvailable(ctx, publication); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
 			existing, _ := s.runtimeRepo.FindPublicationByIQN(ctx, req.TargetIQN)
@@ -647,11 +740,22 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 		return nil, err
 	}
 
-	portal, err := s.adapter.Publish(ctx, publication)
+	portal, err := s.publishWithSecurity(ctx, publication, securityContext)
 	if err != nil {
+		if s.metrics != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
+			s.metrics.RecordISCSISecurityApplyFailure()
+		}
 		_ = publication.MarkFailed(err.Error())
 		if saveErr := s.runtimeRepo.SavePublication(ctx, publication); saveErr != nil {
 			return nil, saveErr
+		}
+		if s.iscsiSecurity != nil {
+			if offlineErr := s.iscsiSecurity.SetTargetOfflineLocked(ctx, publication.TargetIQN, true, req.Actor); offlineErr != nil {
+				return nil, errors.Join(err, offlineErr)
+			}
+		}
+		if s.iscsiSecurity != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
+			publication.SecurityEnforcement = domain.SecurityEnforcementBlocked
 		}
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(req.Actor), "publish", publication.PublicationID, "failure", map[string]any{"error": err.Error(), "runtimeMode": s.cfg.Mode})
 		return publication, err
@@ -659,6 +763,9 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 
 	if err := publication.MarkReady(portal); err != nil {
 		return nil, err
+	}
+	if s.iscsiSecurity != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
+		publication.SecurityEnforcement = successfulSecurityEnforcement(s.cfg.Mode)
 	}
 	if err := s.runtimeRepo.SavePublication(ctx, publication); err != nil {
 		return nil, err
@@ -674,6 +781,8 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 }
 
 func (s *TargetRuntimeService) Unpublish(ctx context.Context, publicationID, actor string) (*domain.TargetPublication, error) {
+	s.securityMu.Lock()
+	defer s.securityMu.Unlock()
 	publication, err := s.runtimeRepo.FindPublication(ctx, publicationID)
 	if err != nil {
 		return nil, err
@@ -682,6 +791,11 @@ func (s *TargetRuntimeService) Unpublish(ctx context.Context, publicationID, act
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "success", map[string]any{"noop": true, "runtimeMode": s.cfg.Mode})
 		return publication, nil
 	}
+	if s.iscsiSecurity != nil {
+		if err := s.iscsiSecurity.SetTargetOfflineLocked(ctx, publication.TargetIQN, true, actor); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.adapter.Unpublish(ctx, publication); err != nil {
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "failure", map[string]any{"error": err.Error(), "runtimeMode": s.cfg.Mode})
 		return nil, err
@@ -689,6 +803,9 @@ func (s *TargetRuntimeService) Unpublish(ctx context.Context, publicationID, act
 	if err := publication.Disable(); err != nil {
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "failure", map[string]any{"error": err.Error(), "runtimeMode": s.cfg.Mode})
 		return nil, err
+	}
+	if publication.SecurityEnforcement != domain.SecurityEnforcementUnprotected {
+		publication.SecurityEnforcement = domain.SecurityEnforcementOffline
 	}
 	if err := s.runtimeRepo.SavePublication(ctx, publication); err != nil {
 		return nil, err
@@ -704,6 +821,8 @@ func (s *TargetRuntimeService) Unpublish(ctx context.Context, publicationID, act
 }
 
 func (s *TargetRuntimeService) Rollback(ctx context.Context, publicationID, actor string) (*domain.TargetPublication, error) {
+	s.securityMu.Lock()
+	defer s.securityMu.Unlock()
 	publication, err := s.runtimeRepo.FindPublication(ctx, publicationID)
 	if err != nil {
 		return nil, err
@@ -711,6 +830,14 @@ func (s *TargetRuntimeService) Rollback(ctx context.Context, publicationID, acto
 	if publication.State == domain.PublicationDisabled {
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "rollback", publicationID, "success", map[string]any{"noop": true})
 		return publication, nil
+	}
+	if s.iscsiSecurity != nil {
+		if err := s.iscsiSecurity.SetTargetOfflineLocked(ctx, publication.TargetIQN, true, actor); err != nil {
+			return nil, err
+		}
+		if err := s.adapter.Unpublish(ctx, publication); err != nil {
+			return nil, err
+		}
 	}
 	if publication.State == domain.PublicationCreating {
 		if err := publication.MarkFailed("rollback from creating state"); err != nil {
@@ -720,6 +847,9 @@ func (s *TargetRuntimeService) Rollback(ctx context.Context, publicationID, acto
 	if err := publication.Disable(); err != nil {
 		return nil, err
 	}
+	if publication.SecurityEnforcement != domain.SecurityEnforcementUnprotected {
+		publication.SecurityEnforcement = domain.SecurityEnforcementOffline
+	}
 	if err := s.runtimeRepo.SavePublication(ctx, publication); err != nil {
 		return nil, err
 	}
@@ -728,16 +858,57 @@ func (s *TargetRuntimeService) Rollback(ctx context.Context, publicationID, acto
 }
 
 func (s *TargetRuntimeService) RestoreReadyPublications(ctx context.Context) error {
+	s.securityMu.Lock()
+	defer s.securityMu.Unlock()
 	publications := s.runtimeRepo.ListPublications(ctx)
 	var firstErr error
 	for _, publication := range publications {
 		if publication.State != domain.PublicationReady {
 			continue
 		}
-		_ = s.adapter.Unpublish(ctx, publication)
-		portal, err := s.adapter.Publish(ctx, publication)
+		securityContext := ISCSIResolvedPublicationSecurity{}
+		var err error
+		if s.iscsiSecurity != nil {
+			securityContext, err = s.iscsiSecurity.ResolvePublicationLocked(ctx, publication, true)
+			if err != nil {
+				publication.SecurityEnforcement = domain.SecurityEnforcementBlocked
+				if cleanupErr := s.adapter.Unpublish(ctx, publication); cleanupErr != nil {
+					publication.MarkRuntimeFailed("iSCSI security unavailable; target cleanup is unverified")
+					if firstErr == nil {
+						firstErr = ErrISCSISecurityRuntimeUnknown
+					}
+				} else if errors.Is(err, ErrISCSISecurityBusy) {
+					_ = publication.Disable()
+					publication.SecurityEnforcement = domain.SecurityEnforcementOffline
+				} else {
+					publication.MarkRuntimeFailed("iSCSI security prerequisites are unavailable")
+				}
+				if saveErr := s.runtimeRepo.SavePublication(ctx, publication); saveErr != nil && firstErr == nil {
+					firstErr = saveErr
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+		}
+		if err := s.adapter.Unpublish(ctx, publication); err != nil {
+			publication.MarkRuntimeFailed("target cleanup before restore is unverified")
+			publication.SecurityEnforcement = domain.SecurityEnforcementBlocked
+			if saveErr := s.runtimeRepo.SavePublication(ctx, publication); saveErr != nil && firstErr == nil {
+				firstErr = saveErr
+			}
+			if firstErr == nil {
+				firstErr = ErrISCSISecurityRuntimeUnknown
+			}
+			continue
+		}
+		portal, err := s.publishWithSecurity(ctx, publication, securityContext)
 		if err != nil {
 			publication.MarkRuntimeFailed(err.Error())
+			if s.iscsiSecurity != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
+				publication.SecurityEnforcement = domain.SecurityEnforcementBlocked
+			}
 			if saveErr := s.runtimeRepo.SavePublication(ctx, publication); saveErr != nil && firstErr == nil {
 				firstErr = saveErr
 			}
@@ -749,6 +920,10 @@ func (s *TargetRuntimeService) RestoreReadyPublications(ctx context.Context) err
 		}
 		publication.Portal = portal
 		publication.LastError = ""
+		publication.SecurityEnforcement = successfulSecurityEnforcement(s.cfg.Mode)
+		if s.iscsiSecurity == nil || !resolvedPolicyRequiresProtection(securityContext.Policy) {
+			publication.SecurityEnforcement = domain.SecurityEnforcementUnprotected
+		}
 		publication.UpdatedAt = time.Now().UTC()
 		if err := s.runtimeRepo.SavePublication(ctx, publication); err != nil {
 			if firstErr == nil {
@@ -762,10 +937,43 @@ func (s *TargetRuntimeService) RestoreReadyPublications(ctx context.Context) err
 	return firstErr
 }
 
+func (s *TargetRuntimeService) publishWithSecurity(ctx context.Context, publication *domain.TargetPublication, security ISCSIResolvedPublicationSecurity) (string, error) {
+	if s.iscsiSecurity == nil || !resolvedPolicyRequiresProtection(security.Policy) {
+		return s.adapter.Publish(ctx, publication)
+	}
+	if s.cfg.Mode == "in-memory" {
+		return s.adapter.Publish(ctx, publication)
+	}
+	protectedAdapter, ok := s.adapter.(ProtectedTargetRuntimeAdapter)
+	if !ok {
+		return "", ErrISCSISecurityHelperUnavailable
+	}
+	return protectedAdapter.PublishProtected(ctx, publication, security)
+}
+
+func pendingSecurityEnforcement(mode string, policy domain.ResolvedISCSISecurity) string {
+	if !resolvedPolicyRequiresProtection(policy) {
+		return domain.SecurityEnforcementUnprotected
+	}
+	if mode == "in-memory" {
+		return domain.SecurityEnforcementSimulated
+	}
+	return domain.SecurityEnforcementBlocked
+}
+
+func successfulSecurityEnforcement(mode string) string {
+	if mode == "in-memory" {
+		return domain.SecurityEnforcementSimulated
+	}
+	return domain.SecurityEnforcementEnforcing
+}
+
 func (s *TargetRuntimeService) Shutdown(ctx context.Context) error {
 	if s == nil || s.runtimeRepo == nil || s.adapter == nil {
 		return nil
 	}
+	s.securityMu.Lock()
+	defer s.securityMu.Unlock()
 	publications := s.runtimeRepo.ListPublications(ctx)
 	var firstErr error
 	for _, publication := range publications {

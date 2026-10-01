@@ -19,6 +19,7 @@ func TestMetricsHandler_ResponseFormat(t *testing.T) {
 	registry.RecordCompressionRatio(2.35)
 	registry.RecordAPIRequestDuration(7 * time.Millisecond)
 	registry.RecordAuditJournalStats(128, time.Now().UTC().Add(-30*time.Second))
+	registry.RecordISCSISecurityApplyFailure()
 
 	handler := NewMetricsHandler(registry)
 	req := httptest.NewRequest("GET", "/metrics", nil)
@@ -33,6 +34,9 @@ func TestMetricsHandler_ResponseFormat(t *testing.T) {
 	}
 	if !strings.Contains(out, "holo_scsi_sense_errors_total 42") {
 		t.Errorf("Missing holo_scsi_sense_errors_total")
+	}
+	if !strings.Contains(out, "holo_iscsi_security_apply_failures_total 1") {
+		t.Errorf("Missing iSCSI security metrics %s", out)
 	}
 	if !strings.Contains(out, "holo_compression_ratio_avg 2.350000") {
 		t.Errorf("Missing holo_compression_ratio_avg %s", out)

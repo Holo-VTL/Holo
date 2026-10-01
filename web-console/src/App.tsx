@@ -6,6 +6,7 @@ import { ResourcesPage } from "./pages/ResourcesPage";
 import { ResourceManagePage } from "./pages/ResourceManagePage";
 import { TargetsPage } from "./pages/TargetsPage";
 import { AboutPage } from "./pages/AboutPage";
+import { SecurityPage } from "./pages/SecurityPage";
 
 export function App() {
   return (
@@ -16,6 +17,7 @@ export function App() {
         <Route path="resources" element={<ResourcesPage />} />
         <Route path="resources/:libraryId/manage" element={<ResourceManagePage />} />
         <Route path="targets" element={<TargetsPage />} />
+        <Route path="security" element={<SecurityPage />} />
         <Route path="about" element={<AboutPage />} />
         <Route path="audit" element={<Navigate to="/" replace />} />
       </Route>

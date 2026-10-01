@@ -98,10 +98,11 @@ func cloneTcmuSession(in *TcmuHandlerSession) *TcmuHandlerSession {
 // TcmuAdapter implements TargetRuntimeAdapter using TCMU user:holo backstores.
 // It replaces the fileio image approach with direct CDB dispatch to the data-plane.
 type TcmuAdapter struct {
-	cfg      TargetRuntimeConfig
-	runner   commandRunner
-	registry *tcmuRegistry
-	auditW   audit.Writer
+	cfg            TargetRuntimeConfig
+	runner         commandRunner
+	registry       *tcmuRegistry
+	auditW         audit.Writer
+	securityHelper *ISCSISecurityHelper
 }
 
 type tcmuBackstorePlan struct {
@@ -119,11 +120,71 @@ func newTcmuAdapter(cfg TargetRuntimeConfig, runner commandRunner, auditW audit.
 		runner = &osCommandRunner{}
 	}
 	return &TcmuAdapter{
-		cfg:      normalizeTargetRuntimeConfig(cfg),
-		runner:   runner,
-		registry: newTcmuRegistry(),
-		auditW:   auditW,
+		cfg:            normalizeTargetRuntimeConfig(cfg),
+		runner:         runner,
+		registry:       newTcmuRegistry(),
+		auditW:         auditW,
+		securityHelper: NewDefaultISCSISecurityHelper(cfg.UseSudo),
 	}
+}
+
+func (a *TcmuAdapter) PublishProtected(ctx context.Context, publication *domain.TargetPublication, security ISCSIResolvedPublicationSecurity) (string, error) {
+	if err := validateTargetPublicationForRuntime(publication); err != nil {
+		return "", err
+	}
+	backstoreName := runtimeBackstoreName(publication)
+	socketPath := tcmuSocketPath(publication.PublicationID)
+	plan, err := a.buildBackstorePlan(ctx, backstoreName, socketPath)
+	if err != nil {
+		return "", err
+	}
+	if plan.Subtype != "holo" {
+		return "", ErrISCSISecurityHelperUnavailable
+	}
+	pid := 0
+	if plan.UseHandler {
+		pid, err = a.spawnHandler(ctx, publication, socketPath)
+		if err != nil {
+			return "", fmt.Errorf("spawn tcmu handler: %w", err)
+		}
+	}
+	if err := a.runTargetcli(ctx, "/backstores/user:"+plan.Subtype, "create",
+		"name="+backstoreName, plan.SizeArg, "cfgstring="+plan.CfgString); err != nil {
+		a.killHandler(pid)
+		if plan.CleanupPath != "" {
+			_ = os.Remove(plan.CleanupPath)
+		}
+		return "", fmt.Errorf("create protected TCMU backstore: %w", err)
+	}
+	if err := runProtectedTargetHelper(ctx, a.securityHelper, publication, security, backstoreName, "user:holo", a.cfg.PortalHost, a.cfg.PortalPort); err != nil {
+		cleanupErr := a.cleanupProtectedTarget(ctx, publication, &plan, backstoreName, pid)
+		return "", errors.Join(err, cleanupErr)
+	}
+	a.registry.save(&TcmuHandlerSession{
+		PublicationID: publication.PublicationID, SocketPath: socketPath, PID: pid,
+		ProcessStartToken: processStartToken(pid), BackstoreName: backstoreName,
+		BackstoreSubtype: plan.Subtype, BackstoreConfigPath: plan.CleanupPath,
+	})
+	portal := fmt.Sprintf("%s:%d", a.cfg.PortalHost, a.cfg.PortalPort)
+	audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_publish", publication.PublicationID, "success",
+		map[string]any{"runtimeMode": "tcmu", "backstoreName": backstoreName, "portal": portal, "backstoreType": plan.Subtype, "protected": true})
+	return portal, nil
+}
+
+func (a *TcmuAdapter) cleanupProtectedTarget(ctx context.Context, publication *domain.TargetPublication, plan *tcmuBackstorePlan, backstoreName string, pid int) error {
+	_, targetErr := a.securityHelper.Call(ctx, map[string]any{"version": 1, "operation": "delete-owned-target", "targetIQN": publication.TargetIQN})
+	backstoreErr := a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
+	if pid > 0 {
+		a.killHandler(pid)
+	}
+	var fileErr error
+	if plan.CleanupPath != "" {
+		fileErr = os.Remove(plan.CleanupPath)
+		if errors.Is(fileErr, os.ErrNotExist) {
+			fileErr = nil
+		}
+	}
+	return errors.Join(targetErr, backstoreErr, fileErr)
 }
 
 // Publish creates a user:holo TCMU backstore for the publication and brings

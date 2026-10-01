@@ -14,11 +14,10 @@ import (
 	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
-	"github.com/Holo-VTL/Holo/control-plane/internal/auth"
 	"github.com/Holo-VTL/Holo/control-plane/internal/config"
+	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 	"github.com/Holo-VTL/Holo/control-plane/internal/metrics"
 	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
-	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 	sqliterepo "github.com/Holo-VTL/Holo/control-plane/internal/repo/sqlite"
 	"github.com/Holo-VTL/Holo/control-plane/internal/storageutil"
 	"github.com/Holo-VTL/Holo/control-plane/internal/tracing"
@@ -29,13 +28,12 @@ type Server struct {
 	uiDistDir  string
 	resources  *ResourcesHandler
 	storage    *StorageHandler
-	policy     *PolicyHandler
 	ops        *OpsHandler
 	targets    *TargetHandler
-	access     *TargetAccessHandler
 	discovery  *TargetDiscoveryHandler
 	metricsHD  *MetricsHandler
 	auditHD    *AuditHandler
+	security   *iscsiSecurityHandler
 	runtime    *orchestration.TargetRuntimeService
 	apiKey     string
 	metadataDB *sql.DB
@@ -67,10 +65,6 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 	storageRepo := sqliterepo.NewStoragePoolRepo(metadataDB)
 	targetRepo := sqliterepo.NewTargetRuntimeRepo(metadataDB)
 	localMountRepo := sqliterepo.NewLocalMountRepo(metadataDB)
-	accessRepo := memory.NewTargetAccessRepo()
-	accessPolicyRepo := sqliterepo.NewAccessPolicyRepo(metadataDB)
-	retentionPolicyRepo := sqliterepo.NewRetentionPolicyRepo(metadataDB)
-
 	registry := metrics.NewMetricsRegistry()
 	memW := audit.NewMemoryWriter()
 	auditPath := filepath.Join(nonEmptyString(cfg.LogDir, "/var/log/holo"), "audit.jsonl")
@@ -97,7 +91,6 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 	storageSvc := orchestration.NewStorageManagementService(storageRepo, auditWriter, nil)
 
 	query := audit.NewQueryService(memW)
-	evaluator := auth.NewAccessEvaluator()
 	targetRuntime := orchestration.NewTargetRuntimeServiceWithConfig(coreRepo, targetRepo, auditWriter, registry, orchestration.TargetRuntimeConfig{
 		Mode:            cfg.TargetRuntimeMode,
 		PortalHost:      cfg.TargetPortalHost,
@@ -106,18 +99,37 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		BackstoreSizeMB: cfg.TargetBackstoreSize,
 		UseSudo:         cfg.TargetRuntimeUseSudo,
 	})
+	securityKeyPath := strings.TrimSpace(cfg.ISCSISecretKeyPath)
+	if securityKeyPath == "" {
+		securityKeyPath = "/etc/holo/iscsi-secrets.key"
+	}
+	secretStore, err := orchestration.NewISCSISecretStore(securityKeyPath)
+	if err != nil {
+		_ = metadataDB.Close()
+		return nil, err
+	}
+	securityService := orchestration.NewISCSISecurityService(sqliterepo.NewISCSISecurityRepo(metadataDB), secretStore, targetRuntime, auditWriter)
+	securityHelper := orchestration.NewDefaultISCSISecurityHelper(cfg.TargetRuntimeUseSudo)
+	securityService.SetSecretKeyProvisioner(securityHelper)
+	targetRuntime.SetISCSISecurityService(securityService)
+	securityHandler := newISCSISecurityHandler(securityService, coreRepo)
 	localMount := orchestration.NewLocalMountService(localMountRepo, targetRepo, auditWriter, orchestration.TargetRuntimeConfig{
 		Mode:       cfg.TargetRuntimeMode,
 		PortalHost: cfg.TargetPortalHost,
 		PortalPort: cfg.TargetPortalPort,
 		UseSudo:    cfg.TargetRuntimeUseSudo,
 	})
+	localMount.SetISCSISecurityService(securityService)
 	targetRuntime.SetLocalMountSynchronizer(localMount)
 	if strings.TrimSpace(strings.ToLower(cfg.TargetRuntimeMode)) != "in-memory" {
 		targetRuntime.SetStorageWriteGuard(storageSvc)
 	}
 	targetRuntime.SetStoragePoolReader(storageSvc)
 	if strings.TrimSpace(strings.ToLower(cfg.TargetRuntimeMode)) != "in-memory" {
+		if err := securityHelper.StartupCheck(ctx); err != nil {
+			_ = metadataDB.Close()
+			return nil, orchestration.ErrISCSISecurityHelperUnavailable
+		}
 		if err := storageSvc.EnsureAttachedPoolsMounted(ctx); err != nil {
 			tracing.LogError(context.Background(), "storage", "restore attached pool mounts failed", err)
 		}
@@ -125,9 +137,8 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 			tracing.LogError(context.Background(), "target-runtime", "restore ready publications failed", err)
 		}
 	}
-	targetAccess := orchestration.NewTargetAccessService(targetRepo, accessRepo, evaluator, auditWriter)
-	accessHandler := NewTargetAccessHandler(targetAccess)
-	targetDiscovery := orchestration.NewTargetDiscoveryService(targetRepo, accessRepo, evaluator, auditWriter)
+	targetDiscovery := orchestration.NewTargetDiscoveryService(targetRepo, auditWriter)
+	targetDiscovery.SetISCSISecurityService(securityService)
 	discoveryHandler := NewTargetDiscoveryHandler(targetDiscovery)
 	resourcesHandler := NewResourcesHandlerWithAudit(coreRepo, storageSvc, targetRuntime, auditWriter)
 	if strings.TrimSpace(strings.ToLower(cfg.TargetRuntimeMode)) != "in-memory" {
@@ -137,7 +148,6 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 	}
 	health := orchestration.NewHealthServiceWithConfig(
 		targetRuntime,
-		targetAccess,
 		targetDiscovery,
 		registry,
 		cfg.MetadataDSN,
@@ -149,13 +159,12 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		uiDistDir:  strings.TrimSpace(cfg.WebUIDistDir),
 		resources:  resourcesHandler,
 		storage:    NewStorageHandler(storageSvc, resourcesHandler),
-		policy:     NewPolicyHandler(accessPolicyRepo, retentionPolicyRepo),
 		ops:        NewOpsHandler(health, query, cfg.TargetPortalPort, registry),
-		access:     accessHandler,
 		discovery:  discoveryHandler,
-		targets:    NewTargetHandlerWithLocalMount(targetRuntime, accessHandler, localMount),
+		targets:    NewTargetHandlerWithLocalMount(targetRuntime, localMount),
 		metricsHD:  NewMetricsHandler(registry, storageutil.ResolvePoolStorageBaseDir()),
 		auditHD:    NewAuditHandler(query, auditWriter),
+		security:   securityHandler,
 		runtime:    targetRuntime,
 		apiKey:     strings.TrimSpace(cfg.APIKey),
 		metadataDB: metadataDB,
@@ -220,6 +229,13 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) registerRoutes() {
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleUIRoot(w, r)
+	})
 	s.mux.HandleFunc("/healthz", s.ops.handleHealth)
 	s.mux.HandleFunc("/ui", s.handleUIRoot)
 	s.mux.HandleFunc("/ui/", s.handleUIAssets)
@@ -229,17 +245,28 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/storage/pools/", s.storage.handlePoolSubresource)
 	s.mux.HandleFunc("/v1/libraries", s.resources.handleLibraries)
 	s.mux.HandleFunc("/v1/libraries/", s.resources.handleLibraryByID)
+	s.mux.HandleFunc("/v1/libraries/{id}/iscsi-security", s.security.handleLibraryBinding)
+	s.mux.HandleFunc("/v1/libraries/{id}/iscsi-security/preview", func(w http.ResponseWriter, r *http.Request) {
+		s.security.handleScopedPreview(w, r, domain.SecurityScopeLibrary)
+	})
 	s.mux.HandleFunc("/v1/drives", s.resources.handleDrives)
 	s.mux.HandleFunc("/v1/drives/", s.resources.handleDriveByID)
+	s.mux.HandleFunc("/v1/drives/{id}/iscsi-security", s.security.handleDriveBinding)
+	s.mux.HandleFunc("/v1/drives/{id}/iscsi-security/preview", func(w http.ResponseWriter, r *http.Request) {
+		s.security.handleScopedPreview(w, r, domain.SecurityScopeDrive)
+	})
+	s.mux.HandleFunc("/v1/iscsi-security/targets", s.security.handleTargets)
+	s.mux.HandleFunc("/v1/iscsi-security/targets/{iqn}/preview", s.security.handleTargetPreview)
+	s.mux.HandleFunc("/v1/iscsi-security/targets/{iqn}", s.security.handleTarget)
+	s.mux.HandleFunc("/v1/iscsi-security/credentials", s.security.handleCredentials)
+	s.mux.HandleFunc("/v1/iscsi-security/credentials/{id}", s.security.handleCredential)
 	s.mux.HandleFunc("/v1/cartridges", s.resources.handleCartridges)
 	s.mux.HandleFunc("/v1/cartridges/", s.resources.handleCartridgeByID)
 	s.mux.HandleFunc("/v1/resources/chain", s.resources.handleCreateChain)
-	s.mux.HandleFunc("/v1/access-policies", s.policy.handleCreateAccessPolicy)
-	s.mux.HandleFunc("/v1/retention-policies", s.policy.handleCreateRetentionPolicy)
 	s.mux.HandleFunc("/v1/targets/publications", s.targets.handlePublications)
 	s.mux.HandleFunc("/v1/targets/publications/", s.targets.handlePublicationSubresource)
 	s.mux.HandleFunc("/v1/targets/local-mount", s.targets.handleLocalMount)
-	s.mux.HandleFunc("/v1/targets/visible", s.access.handleVisible)
+	s.mux.HandleFunc("/v1/targets/visible", s.discovery.handleVisible)
 	s.mux.HandleFunc("/v1/targets/discovery", s.discovery.handleDiscovery)
 	s.mux.HandleFunc("/v1/audit/events", s.ops.handleAuditEvents)
 	s.mux.HandleFunc("/v1/system/overview", s.ops.handleSystemOverview)

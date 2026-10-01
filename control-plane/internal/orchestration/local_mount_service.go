@@ -20,11 +20,17 @@ type LocalMountSettingsRepository interface {
 }
 
 type LocalMountStatus struct {
-	Enabled     bool       `json:"enabled"`
-	DesiredIQNs []string   `json:"desiredIqns"`
-	MountedIQNs []string   `json:"mountedIqns"`
-	LastSyncAt  *time.Time `json:"lastSyncAt,omitempty"`
-	LastError   string     `json:"lastError,omitempty"`
+	Enabled        bool             `json:"enabled"`
+	DesiredIQNs    []string         `json:"desiredIqns"`
+	MountedIQNs    []string         `json:"mountedIqns"`
+	SkippedTargets []LocalMountSkip `json:"skippedTargets,omitempty"`
+	LastSyncAt     *time.Time       `json:"lastSyncAt,omitempty"`
+	LastError      string           `json:"lastError,omitempty"`
+}
+
+type LocalMountSkip struct {
+	TargetIQN string `json:"targetIqn"`
+	Reason    string `json:"reason"`
 }
 
 type iscsiNode struct {
@@ -38,6 +44,7 @@ type LocalMountService struct {
 	runner     commandRunner
 	auditW     audit.Writer
 	cfg        TargetRuntimeConfig
+	security   *ISCSISecurityService
 	syncMu     sync.Mutex
 	lastMu     sync.RWMutex
 	last       LocalMountStatus
@@ -71,8 +78,14 @@ func (s *LocalMountService) Status(ctx context.Context) (LocalMountStatus, error
 	}
 	status := s.getLast()
 	status.Enabled = enabled
-	status.DesiredIQNs = nodeIQNs(desiredNodes(s.targets.ListPublications(ctx), s.cfg))
+	desired := desiredNodes(s.targets.ListPublications(ctx), s.cfg)
+	status.DesiredIQNs = nodeIQNs(desired)
+	_, status.SkippedTargets = s.filterProtected(ctx, desired)
 	return status, nil
+}
+
+func (s *LocalMountService) SetISCSISecurityService(service *ISCSISecurityService) {
+	s.security = service
 }
 
 func (s *LocalMountService) SetEnabled(ctx context.Context, enabled bool, actor string) (LocalMountStatus, error) {
@@ -96,11 +109,13 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 	}
 	publications := s.targets.ListPublications(ctx)
 	desired := desiredNodes(publications, s.cfg)
+	mountDesired, skipped := s.filterProtected(ctx, desired)
 	now := time.Now().UTC()
 	status := LocalMountStatus{
-		Enabled:     enabled,
-		DesiredIQNs: nodeIQNs(desired),
-		LastSyncAt:  &now,
+		Enabled:        enabled,
+		DesiredIQNs:    nodeIQNs(desired),
+		SkippedTargets: skipped,
+		LastSyncAt:     &now,
 	}
 	if strings.EqualFold(s.cfg.Mode, "in-memory") {
 		s.setLast(status)
@@ -110,7 +125,7 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 
 	var syncErr error
 	if enabled {
-		for _, node := range desired {
+		for _, node := range mountDesired {
 			if err := s.loginNode(ctx, node); err != nil && syncErr == nil {
 				syncErr = err
 			}
@@ -121,7 +136,7 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 		syncErr = listErr
 	}
 	desiredSet := make(map[string]bool, len(desired))
-	for _, node := range desired {
+	for _, node := range mountDesired {
 		desiredSet[node.IQN] = enabled && samePortal(node.Portal, localMountPortal(s.cfg))
 	}
 	for _, node := range existing {
@@ -149,6 +164,28 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 	}
 	s.setLast(status)
 	return status, nil
+}
+
+func (s *LocalMountService) filterProtected(ctx context.Context, desired []iscsiNode) ([]iscsiNode, []LocalMountSkip) {
+	if s.security == nil {
+		return desired, nil
+	}
+	allowed := make([]iscsiNode, 0, len(desired))
+	skipped := make([]LocalMountSkip, 0)
+	for _, node := range desired {
+		view, err := s.security.ResolveTarget(ctx, node.IQN)
+		if err != nil {
+			skipped = append(skipped, LocalMountSkip{TargetIQN: node.IQN, Reason: "security-policy-unavailable"})
+			continue
+		}
+		policy := view.Resolved
+		if policy.Authentication.Mode != domain.ISCSIAuthNone || policy.Authentication.RestrictInitiators || len(policy.Authentication.Initiators) > 0 {
+			skipped = append(skipped, LocalMountSkip{TargetIQN: node.IQN, Reason: "protected-iscsi-target"})
+			continue
+		}
+		allowed = append(allowed, node)
+	}
+	return allowed, skipped
 }
 
 func (s *LocalMountService) SyncAsync(actor string) {
@@ -299,8 +336,21 @@ func nodeIQNs(nodes []iscsiNode) []string {
 func localMountStatusChanged(previous, current LocalMountStatus) bool {
 	return previous.Enabled != current.Enabled ||
 		previous.LastError != current.LastError ||
+		!sameLocalMountSkips(previous.SkippedTargets, current.SkippedTargets) ||
 		!sameStringSet(previous.DesiredIQNs, current.DesiredIQNs) ||
 		!sameStringSet(previous.MountedIQNs, current.MountedIQNs)
+}
+
+func sameLocalMountSkips(left, right []LocalMountSkip) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sameStringSet(left, right []string) bool {

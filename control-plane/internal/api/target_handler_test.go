@@ -2,12 +2,26 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
+	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
+	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
+	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 )
+
+type apiLocalMountSettings struct{ enabled bool }
+
+func (s *apiLocalMountSettings) Enabled(context.Context) (bool, error) { return s.enabled, nil }
+func (s *apiLocalMountSettings) SetEnabled(_ context.Context, enabled bool) error {
+	s.enabled = enabled
+	return nil
+}
 
 func TestTargetPublicationEndpoints(t *testing.T) {
 	srv := newTestServer(t)
@@ -240,5 +254,43 @@ func TestTargetLocalMountEndpointsPersistToggle(t *testing.T) {
 	}
 	if enabled, _ := enabledPayload["enabled"].(bool); !enabled {
 		t.Fatalf("expected local mount enabled: %s", postResp.Body.String())
+	}
+}
+
+func TestTargetLocalMountStatusReportsProtectedTargetSkipReason(t *testing.T) {
+	ctx := context.Background()
+	const iqn = "iqn.2026-04.cloud.backupnext.holo:drive-local-skip"
+	targetRepo := memory.NewTargetRuntimeRepo()
+	publication, err := domain.NewTargetPublication("pub-local-skip", "pool-a", "lib-a", "drive-a", "cart-a", iqn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publication.MarkReady("192.0.2.10:3260"); err != nil {
+		t.Fatal(err)
+	}
+	if err := targetRepo.SavePublication(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	securityRepo := memory.NewISCSISecurityRepo()
+	if err := securityRepo.RegisterTarget(ctx, iqn, "lib-a", "drive-a", "drive"); err != nil {
+		t.Fatal(err)
+	}
+	credential := domain.ISCSICredential{CredentialID: "cred-local-skip", Label: "Backup", Username: "backup-user", EncryptedSecret: make([]byte, 64), Version: 1}
+	if err := securityRepo.CreateCredential(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := securityRepo.SaveBinding(ctx, domain.ISCSISecurityBinding{
+		Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
+		Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthCHAP, CredentialID: credential.CredentialID, Initiators: []string{"iqn.1991-05.com.microsoft:backup"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	localMount := orchestration.NewLocalMountService(&apiLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), orchestration.TargetRuntimeConfig{Mode: "tcmu", PortalHost: "192.0.2.10", PortalPort: 3260})
+	localMount.SetISCSISecurityService(orchestration.NewISCSISecurityService(securityRepo, nil, nil, nil))
+	handler := NewTargetHandlerWithLocalMount(nil, localMount)
+	response := httptest.NewRecorder()
+	handler.handleLocalMount(response, httptest.NewRequest(http.MethodGet, "/v1/targets/local-mount", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"reason":"protected-iscsi-target"`) || !strings.Contains(response.Body.String(), iqn) {
+		t.Fatalf("local mount API omitted the protected target skip reason: status=%d body=%s", response.Code, response.Body.String())
 	}
 }

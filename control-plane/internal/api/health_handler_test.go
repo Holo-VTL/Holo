@@ -13,7 +13,7 @@ import (
 
 func TestHealthHandler_AllHealthy_Returns200(t *testing.T) {
 	registry := metrics.NewMetricsRegistry()
-	h := orchestration.NewHealthServiceWithConfig(nil, nil, nil, registry, "", "in-memory")
+	h := orchestration.NewHealthServiceWithConfig(nil, nil, registry, "", "in-memory")
 	ops := NewOpsHandler(h, nil, 3260)
 
 	req := httptest.NewRequest("GET", "/healthz", nil)
@@ -45,7 +45,6 @@ func TestHealthHandler_DatabaseDown_Returns503(t *testing.T) {
 	h := orchestration.NewHealthServiceWithConfig(
 		nil,
 		nil,
-		nil,
 		registry,
 		"postgres://127.0.0.1:1/holo?sslmode=disable",
 		"in-memory",
@@ -68,7 +67,7 @@ func TestHealthHandler_DatabaseDown_Returns503(t *testing.T) {
 func TestHealthHandler_AuditJournalFailureReturns503(t *testing.T) {
 	registry := metrics.NewMetricsRegistry()
 	registry.RecordAuditWriteFailure()
-	h := orchestration.NewHealthServiceWithConfig(nil, nil, nil, registry, "", "in-memory")
+	h := orchestration.NewHealthServiceWithConfig(nil, nil, registry, "", "in-memory")
 	ops := NewOpsHandler(h, nil, 3260)
 
 	req := httptest.NewRequest("GET", "/healthz", nil)

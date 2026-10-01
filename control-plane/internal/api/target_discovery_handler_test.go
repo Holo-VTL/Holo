@@ -2,11 +2,14 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 )
 
 func TestTargetDiscoveryEndpoints(t *testing.T) {
@@ -19,14 +22,13 @@ func TestTargetDiscoveryEndpoints(t *testing.T) {
 		t.Fatalf("expected chain create 201, got %d", chainResp.Code)
 	}
 
+	initiator := "iqn.1993-08.org.debian:01:init-a"
+	prepareSecurityTarget(t, srv, "iqn.2026-04.ai.holo:discover-a", []string{initiator})
+	prepareSecurityTarget(t, srv, "iqn.2026-04.ai.holo:discover-b", nil)
 	publishAResp := publishTargetForDiscoveryTest(t, srv, "iqn.2026-04.ai.holo:discover-a")
-	publishBResp := publishTargetForDiscoveryTest(t, srv, "iqn.2026-04.ai.holo:discover-b")
+	publishTargetForDiscoveryTest(t, srv, "iqn.2026-04.ai.holo:discover-b")
 
 	publicationA := decodePublicationID(t, publishAResp)
-	publicationB := decodePublicationID(t, publishBResp)
-
-	setRulesForDiscoveryTest(t, srv, publicationA, `{"actor":"tester","rules":[{"initiator":"iqn.1993-08.org.debian:01:init-a","permission":"allow","priority":100}]}`)
-	setRulesForDiscoveryTest(t, srv, publicationB, `{"actor":"tester","rules":[{"initiator":"iqn.1993-08.org.debian:01:init-a","permission":"deny","priority":100}]}`)
 
 	discoverReq := newAuthedRequest(http.MethodGet, "/v1/targets/discovery?initiator=iqn.1993-08.org.debian:01:init-a&actor=tester", nil)
 	discoverResp := httptest.NewRecorder()
@@ -37,7 +39,7 @@ func TestTargetDiscoveryEndpoints(t *testing.T) {
 	if !strings.Contains(discoverResp.Body.String(), publicationA) {
 		t.Fatalf("expected discovery to contain publicationA, got %s", discoverResp.Body.String())
 	}
-	if strings.Contains(discoverResp.Body.String(), publicationB) {
+	if strings.Contains(discoverResp.Body.String(), "discover-b") {
 		t.Fatalf("expected discovery to exclude publicationB, got %s", discoverResp.Body.String())
 	}
 
@@ -121,12 +123,23 @@ func decodePublicationID(t *testing.T, resp *httptest.ResponseRecorder) string {
 	return id
 }
 
-func setRulesForDiscoveryTest(t *testing.T, srv *Server, publicationID, body string) {
+func prepareSecurityTarget(t *testing.T, srv *Server, targetIQN string, initiators []string) {
 	t.Helper()
-	req := newAuthedRequest(http.MethodPost, "/v1/targets/publications/"+publicationID+"/access-rules", bytes.NewBufferString(body))
-	resp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("expected set access rules 200, got %d body=%s", resp.Code, resp.Body.String())
+	ctx := context.Background()
+	service := srv.security.service
+	if err := service.RegisterTarget(ctx, targetIQN, "lib-1", "drive-1", "drive"); err != nil {
+		t.Fatalf("register target security identity: %v", err)
+	}
+	if err := service.SetTargetOffline(ctx, targetIQN, true, "tester"); err != nil {
+		t.Fatalf("mark target offline: %v", err)
+	}
+	binding, err := service.GetBinding(ctx, domain.SecurityScopeTarget, targetIQN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.Generation++
+	binding.Authentication = &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthNone, Initiators: append([]string(nil), initiators...), RestrictInitiators: len(initiators) == 0}
+	if err := service.PutBinding(ctx, binding, "tester"); err != nil {
+		t.Fatalf("save target initiator allowlist: %v", err)
 	}
 }
