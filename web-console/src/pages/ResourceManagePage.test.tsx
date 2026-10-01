@@ -71,10 +71,10 @@ describe("ResourceManagePage", () => {
     expect(api.resources.addLibrarySlots).toHaveBeenCalledWith("lib-a", { count: 1, actor: "web-console" });
   });
 
-  it("shows Library iSCSI policy alongside resource management", async () => {
+  it("opens Library CHAP settings from resource management", async () => {
     renderManagePage();
-    expect(await screen.findByText("Library connection protection")).toBeInTheDocument();
-    expect(await screen.findByText("No registered targets yet.")).toBeInTheDocument();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Config CHAP" }))[0]);
+    expect(await screen.findByRole("dialog", { name: "Configure CHAP" })).toBeInTheDocument();
   });
 
   it("shows erase actions and destroy wording for selected cartridge", async () => {

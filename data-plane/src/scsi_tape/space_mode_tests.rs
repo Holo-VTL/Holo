@@ -68,7 +68,7 @@ fn space_branches_and_early_warning_are_deterministic() {
     assert_eq!(state.current_position, 8);
     execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 })
         .expect("space filemarks -1 should pass");
-    assert_eq!(state.current_position, 4);
+    assert_eq!(state.current_position, 0);
 
     execute(&mut state, CoreCommand::SpaceEndOfData { count: 1 }).expect("space eod should pass");
     assert_eq!(state.current_position, 16);
@@ -88,6 +88,43 @@ fn space_branches_and_early_warning_are_deterministic() {
         CoreResponse::Position(report) => assert!(!report.early_warning),
         _ => panic!("unexpected response type"),
     }
+
+    cleanup(&state);
+}
+
+#[test]
+fn reverse_space_filemarks_positions_at_previous_files_last_record() {
+    let mut state = new_state("space-filemarks-backward");
+
+    execute(
+        &mut state,
+        CoreCommand::Load {
+            cartridge_id: "cart-space-filemarks-backward".to_string(),
+        },
+    )
+    .expect("load should pass");
+    execute(&mut state, CoreCommand::SetBlockModeFixed { block_size: 4 })
+        .expect("fixed mode");
+    for payload in [b"AAAA".to_vec(), b"BBBB".to_vec()] {
+        execute(&mut state, CoreCommand::WriteData { payload })
+            .expect("write first file record");
+    }
+    execute(&mut state, CoreCommand::WriteFilemarks { count: 1 })
+        .expect("write filemark");
+    execute(
+        &mut state,
+        CoreCommand::WriteData {
+            payload: b"CCCC".to_vec(),
+        },
+    )
+    .expect("write next file record");
+
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 })
+        .expect("backspace one filemark");
+    assert_eq!(state.current_position, 4);
+    let previous_file_last_record =
+        execute(&mut state, CoreCommand::ReadData).expect("read previous file's last record");
+    assert_eq!(previous_file_last_record, CoreResponse::Data(b"BBBB".to_vec()));
 
     cleanup(&state);
 }

@@ -119,6 +119,7 @@ test_ubuntu_plan() {
   assert_contains "${out}" "[dry-run][support-helper]   sg-map-i)"
   assert_contains "${out}" "[dry-run][support-helper]     valid_support_path \"\$1\" || die \"invalid support path\""
   assert_contains "${out}" "[dry-run][sudoers] Defaults:holo !pam_session"
+  assert_contains "${out}" "[dry-run][sudoers] Defaults:holo env_keep += \"HOLO_CONFIG_DIR\""
   assert_contains "${out}" "[dry-run][sudoers] Defaults!/opt/holo/bin/holo-iscsi-security-helper !log_input, !log_output"
   assert_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /opt/holo/bin/holo-storage-helper"
   assert_contains "${out}" "[dry-run][sudoers] holo ALL=(root) NOPASSWD: /opt/holo/bin/holo-targetcli-helper"

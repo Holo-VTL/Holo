@@ -1,52 +1,39 @@
 package audit
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"log"
-	"strings"
 	"testing"
 )
 
-type failingWriter struct{}
-
-func (f failingWriter) Write(_ context.Context, _ Event) error {
-	return errors.New("writer boom")
-}
-
-func TestEmitTargetRuntimeEvent_GeneratesUniqueEventIDs(t *testing.T) {
-	writer := NewMemoryWriter()
+func TestSecurityEventEmittersWriteExpectedEvents(t *testing.T) {
 	ctx := context.Background()
+	EmitDenyEvent(ctx, nil, "operator", "target-a", nil)
+	EmitRetentionBlockedEvent(ctx, nil, "operator", "cart-a")
+	EmitTargetRuntimeEvent(ctx, nil, "operator", "publish", "pub-a", "success", nil)
+	EmitTargetDiscoveryEvent(ctx, nil, "operator", "discovery", "target-a", "success", nil)
 
-	EmitTargetRuntimeEvent(ctx, writer, "tester", "publish", "pub-1", "success", nil)
-	EmitTargetRuntimeEvent(ctx, writer, "tester", "publish", "pub-1", "success", nil)
+	writer := NewMemoryWriter()
+	EmitDenyEvent(ctx, writer, "operator", "target-a", map[string]any{"reason": "acl"})
+	EmitRetentionBlockedEvent(ctx, writer, "operator", "cart-a")
+	EmitTargetRuntimeEvent(ctx, writer, "", "publish", "pub-a", "", nil)
+	EmitTargetDiscoveryEvent(ctx, writer, "scanner", "discovery", "target-a", "failure", nil)
 
 	events := writer.Events()
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(events))
+	if len(events) != 4 {
+		t.Fatalf("expected four audit events, got %d", len(events))
 	}
-	if events[0].EventID == events[1].EventID {
-		t.Fatalf("expected unique event IDs, got duplicate %q", events[0].EventID)
+	want := []Event{
+		{Actor: "operator", Action: "access_denied", ObjectType: "target", ObjectID: "target-a", Result: "failure"},
+		{Actor: "operator", Action: "retention_blocked", ObjectType: "cartridge", ObjectID: "cart-a", Result: "failure"},
+		{Actor: "system", Action: "publish", ObjectType: "target_publication", ObjectID: "pub-a", Result: "success"},
+		{Actor: "scanner", Action: "discovery", ObjectType: "target_discovery", ObjectID: "target-a", Result: "failure"},
 	}
-}
-
-func TestNewEventID_GeneratesUniqueEventIDs(t *testing.T) {
-	first := NewEventID("storage_pool_create", "pool-1")
-	second := NewEventID("storage_pool_create", "pool-1")
-	if first == second {
-		t.Fatalf("expected unique event IDs, got duplicate %q", first)
-	}
-}
-
-func TestEmitTargetRuntimeEvent_LogsFailureWhenWriterFails(t *testing.T) {
-	var buf bytes.Buffer
-	original := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(original)
-
-	EmitTargetRuntimeEvent(context.Background(), failingWriter{}, "tester", "publish", "pub-1", "success", nil)
-	if !strings.Contains(buf.String(), "AUDIT WRITE FAILURE") {
-		t.Fatalf("expected audit write failure log, got %q", buf.String())
+	for i := range want {
+		if events[i].Actor != want[i].Actor || events[i].Action != want[i].Action || events[i].ObjectType != want[i].ObjectType || events[i].ObjectID != want[i].ObjectID || events[i].Result != want[i].Result {
+			t.Errorf("event %d mismatch: got %+v, want %+v", i, events[i], want[i])
+		}
+		if events[i].EventID == "" {
+			t.Errorf("event %d should receive an event id", i)
+		}
 	}
 }

@@ -3,9 +3,12 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrUnsupportedSchemaVersion = errors.New("database schema version is newer than supported")
 
 type migration struct {
 	version int
@@ -277,6 +280,12 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	applied, err := appliedVersions(ctx, db)
 	if err != nil {
 		return err
+	}
+	maxVersion := migrations[len(migrations)-1].version
+	for version := range applied {
+		if version > maxVersion {
+			return fmt.Errorf("%w: database version %d, supported maximum %d", ErrUnsupportedSchemaVersion, version, maxVersion)
+		}
 	}
 	for _, m := range migrations {
 		if applied[m.version] {

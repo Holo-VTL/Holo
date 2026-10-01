@@ -14,7 +14,8 @@ IQN_RE = re.compile(r"^iqn\.[0-9]{4}-[0-9]{2}\.[A-Za-z0-9.-]+:[A-Za-z0-9._:-]+$"
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 TARGETCLI_SAVE_CONFIG_PATH = "/etc/target/saveconfig.json"
-HOLO_ENV_PATH = "/etc/holo/holo.env"
+HOLO_CONFIG_DIR = os.environ.get("HOLO_CONFIG_DIR", "/etc/holo")
+HOLO_ENV_PATH = os.path.join(HOLO_CONFIG_DIR, "holo.env")
 DEFAULT_METADATA_PATH = "/var/lib/holo/holo.db"
 DEFAULT_SECRET_KEY_PATH = "/etc/holo/iscsi-secrets.key"
 
@@ -105,7 +106,7 @@ def _endpoint(address, port):
 
 
 def _configured_target_port():
-    path = HOLO_ENV_PATH
+    path = _holo_env_path()
     try:
         _root_file(path, 0o640)
     except FileNotFoundError:
@@ -118,6 +119,13 @@ def _configured_target_port():
                     return int(value)
                 raise InvalidRequest("invalid_target_port")
     return 3260
+
+
+def _holo_env_path():
+    config_dir = os.environ.get("HOLO_CONFIG_DIR")
+    if config_dir:
+        return os.path.join(config_dir, "holo.env")
+    return HOLO_ENV_PATH
 
 
 def _validate_auth(auth, initiators):
@@ -338,7 +346,7 @@ def _check_saved_target_config():
 
 
 def _provision_empty_vault_key():
-    env_path = HOLO_ENV_PATH
+    env_path = _holo_env_path()
     _root_file(env_path, 0o640)
     config = {}
     with open(env_path, "r", encoding="utf-8") as env_file:

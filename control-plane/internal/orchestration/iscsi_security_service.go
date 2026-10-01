@@ -39,12 +39,14 @@ type ProtectedTargetRuntimeAdapter interface {
 }
 
 type ISCSISecurityService struct {
-	repo            repo.ISCSISecurityRepository
-	secretStore     *ISCSISecretStore
-	keyProvisioner  ISCSISecretKeyProvisioner
-	runtime         ISCSISecurityRuntimeCoordinator
-	auditW          audit.Writer
-	mu              sync.Mutex
+	repo           repo.ISCSISecurityRepository
+	secretStore    *ISCSISecretStore
+	keyProvisioner ISCSISecretKeyProvisioner
+	runtime        ISCSISecurityRuntimeCoordinator
+	auditW         audit.Writer
+	// mu is acquired only after TargetRuntimeService.securityMu when both are
+	// needed. Service code must not call a runtime-locking method while holding mu.
+	mu sync.Mutex
 }
 
 type ISCSICredentialInput struct {
@@ -152,7 +154,7 @@ func (s *ISCSISecurityService) PutBinding(ctx context.Context, binding domain.IS
 		return err
 	}
 	mutate := func() error {
-		return s.putBindingLocked(ctx, binding, actor)
+		return s.putBindingSerialized(ctx, binding, actor)
 	}
 	if s.runtime == nil {
 		return mutate()
@@ -160,7 +162,7 @@ func (s *ISCSISecurityService) PutBinding(ctx context.Context, binding domain.IS
 	return s.runtime.WithISCSISecurityLock(ctx, mutate)
 }
 
-func (s *ISCSISecurityService) putBindingLocked(ctx context.Context, binding domain.ISCSISecurityBinding, actor string) error {
+func (s *ISCSISecurityService) putBindingSerialized(ctx context.Context, binding domain.ISCSISecurityBinding, actor string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	targets, err := s.affectedTargets(ctx, binding)
@@ -236,7 +238,7 @@ func (s *ISCSISecurityService) PreviewBinding(ctx context.Context, binding domai
 
 func (s *ISCSISecurityService) RegisterTarget(ctx context.Context, targetIQN, libraryID, driveID, role string) error {
 	mutate := func() error {
-		return s.RegisterTargetLocked(ctx, targetIQN, libraryID, driveID, role)
+		return s.RegisterTargetUnderRuntimeLock(ctx, targetIQN, libraryID, driveID, role)
 	}
 	if s.runtime == nil {
 		return mutate()
@@ -244,7 +246,7 @@ func (s *ISCSISecurityService) RegisterTarget(ctx context.Context, targetIQN, li
 	return s.runtime.WithISCSISecurityLock(ctx, mutate)
 }
 
-func (s *ISCSISecurityService) RegisterTargetLocked(ctx context.Context, targetIQN, libraryID, driveID, role string) error {
+func (s *ISCSISecurityService) RegisterTargetUnderRuntimeLock(ctx context.Context, targetIQN, libraryID, driveID, role string) error {
 	if role == "changer" {
 		driveID = ""
 	}
@@ -253,7 +255,7 @@ func (s *ISCSISecurityService) RegisterTargetLocked(ctx context.Context, targetI
 
 func (s *ISCSISecurityService) SetTargetOffline(ctx context.Context, targetIQN string, offline bool, actor string) error {
 	mutate := func() error {
-		return s.SetTargetOfflineLocked(ctx, targetIQN, offline, actor)
+		return s.SetTargetOfflineUnderRuntimeLock(ctx, targetIQN, offline, actor)
 	}
 	if s.runtime == nil {
 		return mutate()
@@ -261,7 +263,7 @@ func (s *ISCSISecurityService) SetTargetOffline(ctx context.Context, targetIQN s
 	return s.runtime.WithISCSISecurityLock(ctx, mutate)
 }
 
-func (s *ISCSISecurityService) SetTargetOfflineLocked(ctx context.Context, targetIQN string, offline bool, actor string) error {
+func (s *ISCSISecurityService) SetTargetOfflineUnderRuntimeLock(ctx context.Context, targetIQN string, offline bool, actor string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.repo.SetTargetOffline(ctx, targetIQN, offline); err != nil {
@@ -270,12 +272,12 @@ func (s *ISCSISecurityService) SetTargetOfflineLocked(ctx context.Context, targe
 	return s.writeAudit(ctx, actor, "target_offline_intent_changed", "target", targetIQN, "success", map[string]any{"offline": offline})
 }
 
-func (s *ISCSISecurityService) PreparePublicationLocked(ctx context.Context, publication *domain.TargetPublication, automatic bool) error {
-	_, err := s.ResolvePublicationLocked(ctx, publication, automatic)
+func (s *ISCSISecurityService) PreparePublicationUnderRuntimeLock(ctx context.Context, publication *domain.TargetPublication, automatic bool) error {
+	_, err := s.ResolvePublicationUnderRuntimeLock(ctx, publication, automatic)
 	return err
 }
 
-func (s *ISCSISecurityService) ResolvePublicationLocked(ctx context.Context, publication *domain.TargetPublication, automatic bool) (ISCSIResolvedPublicationSecurity, error) {
+func (s *ISCSISecurityService) ResolvePublicationUnderRuntimeLock(ctx context.Context, publication *domain.TargetPublication, automatic bool) (ISCSIResolvedPublicationSecurity, error) {
 	if publication == nil {
 		return ISCSIResolvedPublicationSecurity{}, domain.ErrInvalidInput
 	}
@@ -283,7 +285,7 @@ func (s *ISCSISecurityService) ResolvePublicationLocked(ctx context.Context, pub
 	if publication.DeviceRole == "changer" {
 		driveID = ""
 	}
-	if err := s.RegisterTargetLocked(ctx, publication.TargetIQN, publication.LibraryID, driveID, publication.DeviceRole); err != nil {
+	if err := s.RegisterTargetUnderRuntimeLock(ctx, publication.TargetIQN, publication.LibraryID, driveID, publication.DeviceRole); err != nil {
 		return ISCSIResolvedPublicationSecurity{}, err
 	}
 	target, err := s.repo.FindTarget(ctx, publication.TargetIQN)
@@ -385,8 +387,12 @@ func (s *ISCSISecurityService) OpenCredential(ctx context.Context, credentialID 
 
 func (s *ISCSISecurityService) validateReferences(ctx context.Context, binding domain.ISCSISecurityBinding) error {
 	if binding.Authentication != nil && binding.Authentication.CredentialID != "" {
-		if _, err := s.repo.FindCredential(ctx, binding.Authentication.CredentialID); err != nil {
+		credential, err := s.repo.FindCredential(ctx, binding.Authentication.CredentialID)
+		if err != nil {
 			return err
+		}
+		if binding.Authentication.Mode == domain.ISCSIAuthMutualCHAP && credential.MutualUsername == "" {
+			return domain.ErrInvalidInput
 		}
 	}
 	return nil

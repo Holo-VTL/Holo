@@ -3,6 +3,8 @@ package orchestration
 import (
 	"context"
 	"net"
+	"os"
+	"strings"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 )
@@ -10,7 +12,11 @@ import (
 const defaultISCSISecurityHelperPath = "/opt/holo/bin/holo-iscsi-security-helper"
 
 func NewDefaultISCSISecurityHelper(useSudo bool) *ISCSISecurityHelper {
-	return NewISCSISecurityHelper(defaultISCSISecurityHelperPath, useSudo)
+	path := strings.TrimSpace(os.Getenv("HOLO_ISCSI_SECURITY_HELPER"))
+	if path == "" {
+		path = defaultISCSISecurityHelperPath
+	}
+	return NewISCSISecurityHelper(path, useSudo)
 }
 
 func protectedTargetRequest(publication *domain.TargetPublication, security ISCSIResolvedPublicationSecurity, backstoreName, backstoreType, address string, port int) (map[string]any, error) {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
 	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
@@ -45,7 +46,8 @@ func TestISCSISecurityBindingAPIUsesOfflineGuardAndReturnsSources(t *testing.T) 
 		t.Fatal(err)
 	}
 	runtime := &apiISCSISecurityRuntime{present: map[string]bool{}}
-	service := orchestration.NewISCSISecurityService(securityRepo, nil, runtime, nil)
+	auditWriter := audit.NewMemoryWriter()
+	service := orchestration.NewISCSISecurityService(securityRepo, nil, runtime, auditWriter)
 	handler := newISCSISecurityHandler(service, core)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/libraries/{id}/iscsi-security", handler.handleLibraryBinding)
@@ -65,6 +67,20 @@ func TestISCSISecurityBindingAPIUsesOfflineGuardAndReturnsSources(t *testing.T) 
 	if binding["generation"] != float64(1) || binding["auth"].(map[string]any)["mode"] != "chap" {
 		t.Fatalf("unexpected binding response: %#v", body)
 	}
+	events := auditWriter.Events()
+	if len(events) != 1 || events[0].Actor != "self-asserted:operator" {
+		t.Fatalf("expected audit event to mark the request actor as self-asserted, got %+v", events)
+	}
+	invalidActor := `{"generation":2,"auth":{"mode":"none"},"actor":"operator\nforged"}`
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/v1/libraries/lib-a/iscsi-security", strings.NewReader(invalidActor)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("control characters in actor claims should be rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	stored, err := service.GetBinding(ctx, domain.SecurityScopeLibrary, "lib-a")
+	if err != nil || stored.Generation != 1 || stored.Authentication.Mode != domain.ISCSIAuthCHAP {
+		t.Fatalf("rejected actor claim changed stored policy: %+v, %v", stored, err)
+	}
 	stale := `{"generation":1,"auth":{"mode":"chap","credentialId":"cred-a","initiators":["iqn.1991-05.com.microsoft:backup"]}}`
 	response = httptest.NewRecorder()
 	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/v1/libraries/lib-a/iscsi-security", strings.NewReader(stale)))
@@ -78,7 +94,7 @@ func TestISCSISecurityBindingAPIUsesOfflineGuardAndReturnsSources(t *testing.T) 
 	if response.Code != http.StatusConflict || strings.Contains(response.Body.String(), "target") {
 		t.Fatalf("live target weakening should return a generic conflict: status=%d body=%q", response.Code, response.Body.String())
 	}
-	stored, err := service.GetBinding(ctx, domain.SecurityScopeLibrary, "lib-a")
+	stored, err = service.GetBinding(ctx, domain.SecurityScopeLibrary, "lib-a")
 	if err != nil || stored.Generation != 1 || stored.Authentication.Mode != domain.ISCSIAuthCHAP {
 		t.Fatalf("rejected edit changed stored policy: %+v, %v", stored, err)
 	}

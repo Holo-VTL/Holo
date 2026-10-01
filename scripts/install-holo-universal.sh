@@ -1648,6 +1648,7 @@ EOF
 cat >"${sudoers_tmp}" <<EOF
 Defaults:${SERVICE_USER} !requiretty
 Defaults:${SERVICE_USER} !pam_session
+Defaults:${SERVICE_USER} env_keep += "HOLO_CONFIG_DIR"
 Defaults!${PREFIX}/bin/holo-iscsi-security-helper !log_input, !log_output
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-storage-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-targetcli-helper

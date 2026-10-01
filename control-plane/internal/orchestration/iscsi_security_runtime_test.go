@@ -19,6 +19,16 @@ type fakeProtectedHelperRunner struct {
 	reply []byte
 }
 
+func TestNewDefaultISCSISecurityHelperUsesConfiguredPath(t *testing.T) {
+	const customPath = "/opt/holo-custom/bin/holo-iscsi-security-helper"
+	t.Setenv("HOLO_ISCSI_SECURITY_HELPER", customPath)
+
+	helper := NewDefaultISCSISecurityHelper(false)
+	if helper.binaryPath != customPath {
+		t.Fatalf("expected configured security helper path %q, got %q", customPath, helper.binaryPath)
+	}
+}
+
 func (r *fakeProtectedHelperRunner) Run(_ context.Context, path string, input []byte) ([]byte, error) {
 	r.path = path
 	r.input = append([]byte(nil), input...)

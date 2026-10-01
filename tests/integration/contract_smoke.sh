@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 printf '[integration] control-plane contract smoke\n'
 (
   cd "$ROOT_DIR/control-plane"
-  go test ./internal/api -run 'TestAuthMiddleware_ProtectsManagementRoutes|TestPolicyHandler_AccessPolicyRejectsNilBody' -count=1
+  go test ./internal/api -run 'TestAuthMiddleware_ProtectsManagementRoutes|TestISCSISecurityBindingAPIUsesOfflineGuardAndReturnsSources' -count=1
 )
 
 printf '[integration] data-plane contract smoke\n'

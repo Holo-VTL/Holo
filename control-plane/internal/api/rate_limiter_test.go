@@ -38,8 +38,8 @@ func TestClientIDFromRequestUsesForwardedHeadersOnlyFromTrustedProxy(t *testing.
 	req := httptest.NewRequest(http.MethodGet, "/v1/support/bundle", nil)
 	req.RemoteAddr = "192.0.2.10:54321"
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 198.51.100.8")
-	if got := limiter.clientIDFromRequest(req); got != "203.0.113.7" {
-		t.Fatalf("expected first forwarded client IP, got %q", got)
+	if got := limiter.clientIDFromRequest(req); got != "198.51.100.8" {
+		t.Fatalf("expected the nearest untrusted forwarded client IP, got %q", got)
 	}
 
 	req.Header.Del("X-Forwarded-For")
@@ -51,6 +51,16 @@ func TestClientIDFromRequestUsesForwardedHeadersOnlyFromTrustedProxy(t *testing.
 	untrusted := newRateLimiter("")
 	if got := untrusted.clientIDFromRequest(req); got != "192.0.2.10" {
 		t.Fatalf("expected untrusted proxy headers to be ignored, got %q", got)
+	}
+}
+
+func TestClientIDFromRequestWalksTrustedProxyChainFromRight(t *testing.T) {
+	limiter := newRateLimiter("10.0.0.0/8")
+	req := httptest.NewRequest(http.MethodGet, "/v1/support/bundle", nil)
+	req.RemoteAddr = "10.0.0.2:443"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7, 198.51.100.8, 10.0.0.1")
+	if got := limiter.clientIDFromRequest(req); got != "198.51.100.8" {
+		t.Fatalf("expected the nearest untrusted hop after trusted proxies, got %q", got)
 	}
 }
 

@@ -74,7 +74,7 @@ describe("IscsiSecurityForm", () => {
   it("shows inherited authentication sources and saves after confirmation", async () => {
     renderWithProviders(<IscsiSecurityForm scope="library" ownerId="lib-a" title="Library policy" />);
     await openEditor();
-    expect(await screen.findByText(/The preview lists affected targets/)).toBeInTheDocument();
+    expect(await screen.findByText("Current settings on affected targets (1)")).toBeInTheDocument();
     await userEvent.click(screen.getByText("Current settings on affected targets (1)"));
     expect(await screen.findByText(/Login check: CHAP off \(System default\)/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -120,7 +120,7 @@ describe("IscsiSecurityForm", () => {
     await openEditor();
     await chooseOption("Login check", "CHAP");
     await chooseOption("CHAP login credentials", "Backup host · backup");
-    await userEvent.type(screen.getByLabelText(/Backup host IQNs/), "iqn.1991-05.com.microsoft:backup-host");
+    await userEvent.type(screen.getByLabelText(/Allowed backup host IQNs/), "iqn.1991-05.com.microsoft:backup-host");
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText(/Saving briefly disconnects affected targets/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Save and bring online" }));
@@ -159,7 +159,7 @@ describe("IscsiSecurityForm", () => {
     await openEditor();
     await chooseOption("Login check", "CHAP");
     await chooseOption("CHAP login credentials", "Backup host · backup");
-    await userEvent.type(screen.getByLabelText(/Backup host IQNs/), "iqn.1991-05.com.microsoft:backup-host");
+    await userEvent.type(screen.getByLabelText(/Allowed backup host IQNs/), "iqn.1991-05.com.microsoft:backup-host");
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await userEvent.click(await screen.findByRole("button", { name: "Save and bring online" }));
 
@@ -208,7 +208,7 @@ describe("IscsiSecurityForm", () => {
     await screen.findByRole("dialog", { name: "Library policy" });
     await chooseOption("Login check", "CHAP");
     await chooseOption("CHAP login credentials", "CHAP A · target");
-    await userEvent.type(screen.getByLabelText(/Backup host IQNs \(one per line\)/), "not-an-iqn");
+    await userEvent.type(screen.getByLabelText(/Allowed backup host IQNs \(one per line\)/), "not-an-iqn");
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(await screen.findByText("Check the IQN format, for example iqn.1991-05.com.microsoft:backup-host.")).toBeInTheDocument();
@@ -267,7 +267,7 @@ describe("IscsiSecurityForm", () => {
     await openEditor();
     await screen.findByRole("dialog", { name: "Library policy" });
     await chooseOption("Login check", "Do not use CHAP");
-    await userEvent.type(screen.getByLabelText(/Backup host IQNs \(one per line\)/), "iqn.1991-05.com.microsoft:unsaved");
+    await userEvent.type(screen.getByLabelText(/Allowed backup host IQNs \(one per line\)/), "iqn.1991-05.com.microsoft:unsaved");
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -316,7 +316,7 @@ describe("IscsiSecurityForm", () => {
     await screen.findByRole("dialog", { name: "Target policy" });
     await chooseOption("Login check", "CHAP");
     await chooseOption("CHAP login credentials", "CHAP A · backup");
-    await userEvent.type(screen.getByLabelText(/Backup host IQNs \(one per line\)/), "iqn.1991-05.com.microsoft:backup");
+    await userEvent.type(screen.getByLabelText(/Allowed backup host IQNs \(one per line\)/), "iqn.1991-05.com.microsoft:backup");
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText(/Saving briefly disconnects affected targets/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Save and bring online" }));

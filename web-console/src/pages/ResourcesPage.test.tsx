@@ -63,7 +63,7 @@ describe("ResourcesPage", () => {
     await user.click(await screen.findByRole("option", { name: "One-way CHAP" }));
     await user.click(screen.getByRole("button", { name: "CHAP login credentials" }));
     await user.click(await screen.findByRole("option", { name: "Backup host · backup" }));
-    await user.type(screen.getByLabelText("Backup host IQNs (one per line)"), "iqn.1991-05.com.microsoft:backup-host");
+    await user.type(screen.getByLabelText("Allowed backup host IQNs (one per line)"), "iqn.1991-05.com.microsoft:backup-host");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(screen.getByRole("dialog", { name: "Create Virtual Library" })).toBeInTheDocument();
@@ -93,7 +93,7 @@ describe("ResourcesPage", () => {
     await screen.findByRole("dialog", { name: "Configure CHAP" });
     await user.click(screen.getByRole("button", { name: "Login check" }));
     await user.click(await screen.findByRole("option", { name: "One-way CHAP" }));
-    await user.type(screen.getByLabelText("Backup host IQNs (one per line)"), "iqn.1991-05.com.microsoft:backup-host");
+    await user.type(screen.getByLabelText("Allowed backup host IQNs (one per line)"), "iqn.1991-05.com.microsoft:backup-host");
     await user.click(screen.getByRole("button", { name: "Save" }));
     await user.click(screen.getByRole("button", { name: "Create" }));
 
@@ -115,7 +115,7 @@ describe("ResourcesPage", () => {
     await user.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(screen.getByRole("dialog", { name: "Create Virtual Library" })).toBeInTheDocument();
-    expect(screen.getAllByText("Not configured")).toHaveLength(2);
+    expect(screen.getAllByText("Not configured")).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Config CHAP" }));
     expect(screen.getByRole("button", { name: "Login check" })).toHaveTextContent("Do not use CHAP");
   });

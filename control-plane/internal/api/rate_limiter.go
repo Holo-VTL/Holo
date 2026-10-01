@@ -103,10 +103,13 @@ func (l *rateLimiter) clientIDFromRequest(r *http.Request) string {
 		return remote
 	}
 	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		for _, part := range strings.Split(forwarded, ",") {
-			if client := normalizeClientID(part); client != "unknown" {
-				return client
+		parts := strings.Split(forwarded, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			client := normalizeClientID(parts[i])
+			if client == "unknown" || l.trusts(client) {
+				continue
 			}
+			return client
 		}
 	}
 	if realIP := normalizeClientID(r.Header.Get("X-Real-IP")); realIP != "unknown" {

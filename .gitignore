@@ -42,6 +42,11 @@ Thumbs.db
 specs/
 docs/
 .github/
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/ci.yml
 VeeamLogs/
 DBackupLogs/
 Logs_from_Users/

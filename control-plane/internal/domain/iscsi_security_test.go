@@ -3,6 +3,7 @@ package domain
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func validSecurityCredential() *ISCSISecret {
@@ -11,6 +12,48 @@ func validSecurityCredential() *ISCSISecret {
 		Secret:         "0123456789abcdef",
 		MutualUsername: "holo-a",
 		MutualSecret:   "fedcba9876543210",
+	}
+}
+
+func TestISCSICredentialAndSnapshotValidation(t *testing.T) {
+	validCredential := ISCSICredential{
+		CredentialID: "cred-a", Label: "Backup", Username: "backup-user",
+		EncryptedSecret: make([]byte, 33), Version: 1, CreatedAt: time.Now().UTC(),
+	}
+	if err := validCredential.Validate(); err != nil {
+		t.Fatalf("valid credential rejected: %v", err)
+	}
+	invalidCredentials := []ISCSICredential{
+		{Label: "Backup", Username: "backup-user", EncryptedSecret: make([]byte, 33), Version: 1},
+		{CredentialID: "cred-a", Username: "backup-user", EncryptedSecret: make([]byte, 33), Version: 1},
+		{CredentialID: "cred-a", Label: "Backup", Username: "backup-user", EncryptedSecret: make([]byte, 32), Version: 1},
+		{CredentialID: "cred-a", Label: "Backup", Username: "backup-user", EncryptedSecret: make([]byte, 33)},
+		{CredentialID: "cred-a", Label: "Backup", Username: "NULL-user", EncryptedSecret: make([]byte, 33), Version: 1},
+		{CredentialID: "cred-a", Label: strings.Repeat("l", 129), Username: "backup-user", EncryptedSecret: make([]byte, 33), Version: 1},
+	}
+	for i, credential := range invalidCredentials {
+		if err := credential.Validate(); err != ErrInvalidInput {
+			t.Errorf("invalid credential case %d returned %v", i, err)
+		}
+	}
+
+	validSnapshot := ISCSISecuritySnapshot{
+		SnapshotID: "snapshot-a", Scope: string(SecurityScopeLibrary), OwnerID: "lib-a",
+		Version: 1, Payload: []byte("{}"), CreatedBy: "operator", CreatedAt: time.Now().UTC(),
+	}
+	if err := validSnapshot.Validate(); err != nil {
+		t.Fatalf("valid snapshot rejected: %v", err)
+	}
+	invalidSnapshots := []ISCSISecuritySnapshot{
+		{SnapshotID: "snapshot-a", Scope: "invalid", OwnerID: "lib-a", Version: 1, Payload: []byte("{}")},
+		{SnapshotID: "snapshot-a", Scope: string(SecurityScopeDrive), OwnerID: "lib-a", Version: 0, Payload: []byte("{}")},
+		{SnapshotID: "snapshot-a", Scope: string(SecurityScopeTarget), OwnerID: "lib-a", Version: 1},
+		{SnapshotID: "snapshot-a", Scope: string(SecurityScopeLibrary), OwnerID: "lib-a", Version: 1, Payload: make([]byte, maxISCSISecurityBlobBytes+1)},
+	}
+	for i, snapshot := range invalidSnapshots {
+		if err := snapshot.Validate(); err != ErrInvalidInput {
+			t.Errorf("invalid snapshot case %d returned %v", i, err)
+		}
 	}
 }
 

@@ -1,6 +1,6 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "../test/renderWithProviders";
 import { api } from "../services/api";
 import { TargetsPage } from "./TargetsPage";
@@ -23,15 +23,18 @@ vi.mock("../services/api", () => ({
   },
 }));
 
+afterEach(() => cleanup());
+
 describe("TargetsPage security inventory", () => {
   it("keeps an offline stable target editable", async () => {
     renderWithProviders(<TargetsPage />);
     expect(await screen.findByText("iqn.2026-01.example:offline")).toBeInTheDocument();
     expect(screen.queryByText("Protected targets skipped from local mounting")).not.toBeInTheDocument();
     expect(screen.queryByText(/CHAP target/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Set protection" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Actions for iqn.2026-01.example:offline" }));
+    await userEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: "Set CHAP" }));
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "Target connection protection" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Configure CHAP" })).toBeInTheDocument();
     expect(iscsiSecurityMock.getTargetBinding).toHaveBeenCalledWith("iqn.2026-01.example:offline");
   });
 
@@ -42,7 +45,10 @@ describe("TargetsPage security inventory", () => {
       compressionEnabled: false, dedupEnabled: false, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
     }]);
     renderWithProviders(<TargetsPage />);
-    await userEvent.click(await screen.findByRole("button", { name: "Take offline" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Actions for iqn.2026-01.example:offline" }));
+    const takeOffline = within(screen.getByRole("menu")).getByRole("menuitem", { name: "Take offline" });
+    await waitFor(() => expect(takeOffline).toBeEnabled());
+    await userEvent.click(takeOffline);
     const dialog = await screen.findByRole("dialog", { name: "Take target offline?" });
     expect(dialog).toHaveTextContent("disconnects any active backup-host sessions");
     await userEvent.click(within(dialog).getByRole("button", { name: "Take offline" }));
@@ -57,7 +63,10 @@ describe("TargetsPage security inventory", () => {
       compressionEnabled: false, dedupEnabled: false, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
     }]);
     renderWithProviders(<TargetsPage />);
-    await userEvent.click(await screen.findByRole("button", { name: "Bring online" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Actions for iqn.2026-01.example:offline" }));
+    const bringOnline = within(screen.getByRole("menu")).getByRole("menuitem", { name: "Bring online" });
+    await waitFor(() => expect(bringOnline).toBeEnabled());
+    await userEvent.click(bringOnline);
     const dialog = await screen.findByRole("dialog", { name: "Bring target online?" });
     expect(dialog).toHaveTextContent("without matching CHAP settings may not connect");
     await userEvent.click(within(dialog).getByRole("button", { name: "Bring online" }));

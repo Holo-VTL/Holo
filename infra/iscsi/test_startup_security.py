@@ -43,6 +43,13 @@ class SavedTargetConfigTests(unittest.TestCase):
         self.legacy_port_patch.start()
         self.addCleanup(self.legacy_port_patch.stop)
 
+    def test_config_directory_selects_its_runtime_environment_file(self):
+        self.legacy_port_patch.stop()
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "holo.env").write_text("HOLO_TARGET_PORTAL_PORT=3267\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HOLO_CONFIG_DIR": directory}), mock.patch.object(helper, "_root_file", return_value=None):
+                self.assertEqual(3267, helper._configured_target_port())
+
     def write_config(self, targets):
         with open(self.path, "w", encoding="utf-8") as config_file:
             json.dump({"targets": targets}, config_file)

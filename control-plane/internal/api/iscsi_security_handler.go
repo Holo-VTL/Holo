@@ -99,7 +99,12 @@ func (h *iscsiSecurityHandler) handleScopedBinding(w http.ResponseWriter, r *htt
 		if scope == domain.SecurityScopeLibrary {
 			binding.LibraryID = ""
 		}
-		if err := h.service.PutBinding(r.Context(), binding, req.Actor); err != nil {
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondSecurityError(w, err)
+			return
+		}
+		if err := h.service.PutBinding(r.Context(), binding, actor); err != nil {
 			respondSecurityError(w, err)
 			return
 		}
@@ -192,7 +197,12 @@ func (h *iscsiSecurityHandler) handleTarget(w http.ResponseWriter, r *http.Reque
 		binding := existing.Binding
 		binding.Generation = req.Generation
 		binding.Authentication = authPolicy
-		if err := h.service.PutBinding(r.Context(), binding, req.Actor); err != nil {
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondSecurityError(w, err)
+			return
+		}
+		if err := h.service.PutBinding(r.Context(), binding, actor); err != nil {
 			respondSecurityError(w, err)
 			return
 		}
@@ -298,10 +308,15 @@ func (h *iscsiSecurityHandler) handleCredentials(w http.ResponseWriter, r *http.
 			respondSecurityError(w, domain.ErrInvalidInput)
 			return
 		}
+		actor, err := selfAssertedAuditActor(values["actor"])
+		if err != nil {
+			respondSecurityError(w, err)
+			return
+		}
 		metadata, err := h.service.CreateCredential(r.Context(), orchestration.ISCSICredentialInput{
 			CredentialID: values["credentialId"], Label: values["label"],
 			Secret: domain.ISCSISecret{Username: values["forwardUsername"], Secret: values["forwardSecret"], MutualUsername: values["reverseUsername"], MutualSecret: values["reverseSecret"]},
-		}, values["actor"])
+		}, actor)
 		if err != nil {
 			respondSecurityError(w, err)
 			return
@@ -317,7 +332,12 @@ func (h *iscsiSecurityHandler) handleCredential(w http.ResponseWriter, r *http.R
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	if err := h.service.DeleteCredential(r.Context(), r.PathValue("id"), strings.TrimSpace(r.URL.Query().Get("actor"))); err != nil {
+	actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+	if err != nil {
+		respondSecurityError(w, err)
+		return
+	}
+	if err := h.service.DeleteCredential(r.Context(), r.PathValue("id"), actor); err != nil {
 		respondSecurityError(w, err)
 		return
 	}

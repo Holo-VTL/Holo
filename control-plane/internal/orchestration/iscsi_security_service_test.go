@@ -68,6 +68,40 @@ func TestISCSISecurityServiceRequiresOfflineAndRuntimeAbsenceForEffectiveChanges
 	}
 }
 
+func TestISCSISecurityServiceRejectsMutualCHAPWithoutMutualCredential(t *testing.T) {
+	ctx := context.Background()
+	repository := memory.NewISCSISecurityRepo()
+	credential := domain.ISCSICredential{
+		CredentialID: "one-way", Label: "backup", Username: "backup-user",
+		EncryptedSecret: make([]byte, 64), Version: 1,
+	}
+	if err := repository.CreateCredential(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	service := NewISCSISecurityService(repository, nil, nil, nil)
+	existing := domain.ISCSISecurityBinding{
+		Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
+		Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthNone},
+	}
+	if err := service.PutBinding(ctx, existing, "operator"); err != nil {
+		t.Fatalf("seed existing policy: %v", err)
+	}
+	binding := domain.ISCSISecurityBinding{
+		Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 2,
+		Authentication: &domain.ISCSIAuthenticationPolicy{
+			Mode: domain.ISCSIAuthMutualCHAP, CredentialID: credential.CredentialID,
+			Initiators: []string{"iqn.1991-05.com.microsoft:backup"},
+		},
+	}
+	if err := service.PutBinding(ctx, binding, "operator"); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected mutual CHAP to reject a one-way credential, got %v", err)
+	}
+	stored, err := service.GetBinding(ctx, domain.SecurityScopeLibrary, "lib-a")
+	if err != nil || stored.Generation != 1 || stored.Authentication.Mode != domain.ISCSIAuthNone {
+		t.Fatalf("rejected policy changed the existing binding: %+v, %v", stored, err)
+	}
+}
+
 func TestISCSISecurityServiceCreatesWriteOnlyEncryptedCredential(t *testing.T) {
 	ctx := context.Background()
 	repository := memory.NewISCSISecurityRepo()

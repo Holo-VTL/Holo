@@ -1036,15 +1036,24 @@ pub fn space(state: &mut TapeState, branch: SpaceBranch, count: i64) -> Result<(
                 }
             } else {
                 for _ in 0..(-count) {
-                    let mark = marks
+                    let mark_index = marks
                         .iter()
-                        .copied()
-                        .rev()
-                        .find(|point| *point < position)
+                        .rposition(|point| *point < position)
                         .ok_or_else(|| {
                             TapeError::OutOfRange("SPACE filemarks before BOT".to_string())
                         })?;
-                    position = mark;
+                    let mark = marks[mark_index];
+                    let file_start = marks[..mark_index]
+                        .last()
+                        .map(|previous_mark| previous_mark.saturating_add(step))
+                        .unwrap_or(0);
+                    position = state
+                        .block_starts
+                        .iter()
+                        .copied()
+                        .filter(|block_start| *block_start >= file_start && *block_start < mark)
+                        .max()
+                        .unwrap_or(file_start);
                 }
             }
             state.current_position = position;
@@ -1220,11 +1229,23 @@ fn enforce_worm_erase_allowed(state: &TapeState) -> Result<(), TapeError> {
 }
 
 fn record_block(state: &mut TapeState, start: u64, length: u32) {
-    if !state.block_lengths.contains_key(&start) {
-        state.block_starts.push(start);
-        state.block_starts.sort_unstable();
+    match state.block_lengths.entry(start) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            let append = match state.block_starts.last() {
+                None => true,
+                Some(last) => start > *last,
+            };
+            if append {
+                state.block_starts.push(start);
+            } else if let Err(index) = state.block_starts.binary_search(&start) {
+                state.block_starts.insert(index, start);
+            }
+            entry.insert(length);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            entry.insert(length);
+        }
     }
-    state.block_lengths.insert(start, length);
 }
 
 fn next_point(points: &[u64], current: u64) -> Option<u64> {
@@ -1260,6 +1281,24 @@ fn active_partition_capacity_limit(state: &TapeState) -> Option<u64> {
         (Some(capacity), configured) => Some(capacity.min(configured)),
         (None, 0) => None,
         (None, configured) => Some(configured),
+    }
+}
+
+#[cfg(test)]
+mod block_index_tests {
+    use super::record_block;
+    use crate::scsi_tape::state::TapeState;
+
+    #[test]
+    fn record_block_keeps_append_and_out_of_order_indexes_sorted_and_unique() {
+        let mut state = TapeState::new("record-block-index-test".to_string());
+        for start in [0, 8, 16, 4, 8] {
+            record_block(&mut state, start, 4);
+        }
+
+        assert_eq!(state.block_starts, vec![0, 4, 8, 16]);
+        assert_eq!(state.block_lengths.len(), 4);
+        assert_eq!(state.block_lengths.get(&8), Some(&4));
     }
 }
 

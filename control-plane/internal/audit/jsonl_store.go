@@ -8,7 +8,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +19,7 @@ import (
 type JournalStore struct {
 	path        string
 	maxBytes    int64
+	maxArchives int
 	parseErrors int64
 	mu          sync.Mutex
 	file        *os.File
@@ -32,11 +35,17 @@ func NewJournalStore(path string) (*JournalStore, error) {
 		return nil, fmt.Errorf("open audit jsonl: %w", err)
 	}
 
-	return &JournalStore{
-		path:     path,
-		maxBytes: loadAuditMaxBytes(),
-		file:     f,
-	}, nil
+	store := &JournalStore{
+		path:        path,
+		maxBytes:    loadAuditMaxBytes(),
+		maxArchives: loadAuditMaxArchives(),
+		file:        f,
+	}
+	if err := store.pruneArchives(); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("prune audit archives: %w", err)
+	}
+	return store, nil
 }
 
 func (s *JournalStore) Append(event Event) error {
@@ -175,7 +184,62 @@ func (s *JournalStore) rotateIfNeeded(nextWriteBytes int64) error {
 		return errors.Join(fmt.Errorf("open rotated audit file: %w", err), restoreErr, reopenErr)
 	}
 	s.file = f
+	if err := s.pruneArchives(); err != nil {
+		return fmt.Errorf("prune audit archives: %w", err)
+	}
 	return nil
+}
+
+func (s *JournalStore) pruneArchives() error {
+	if s.maxArchives <= 0 {
+		return nil
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	prefix := filepath.Base(s.path) + "."
+	type archive struct {
+		path      string
+		createdAt int64
+	}
+	archives := make([]archive, 0)
+	for _, entry := range entries {
+		if entry.IsDir() || !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		createdAt, ok := parseAuditArchiveTime(strings.TrimPrefix(entry.Name(), prefix))
+		if !ok {
+			continue
+		}
+		archives = append(archives, archive{
+			path:      filepath.Join(filepath.Dir(s.path), entry.Name()),
+			createdAt: createdAt,
+		})
+	}
+	sort.Slice(archives, func(i, j int) bool {
+		return archives[i].createdAt < archives[j].createdAt
+	})
+	for len(archives) > s.maxArchives {
+		if err := os.Remove(archives[0].path); err != nil {
+			return err
+		}
+		archives = archives[1:]
+	}
+	return nil
+}
+
+func parseAuditArchiveTime(name string) (int64, bool) {
+	dot := strings.LastIndexByte(name, '.')
+	if dot <= 0 {
+		return 0, false
+	}
+	if _, err := time.Parse("20060102T150405Z", name[:dot]); err != nil {
+		return 0, false
+	}
+	createdAt, err := strconv.ParseInt(name[dot+1:], 10, 64)
+	return createdAt, err == nil && createdAt > 0
 }
 
 func (s *JournalStore) reopenAppend() error {
@@ -196,6 +260,19 @@ func loadAuditMaxBytes() int64 {
 	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || n <= 0 {
 		return defaultMaxBytes
+	}
+	return n
+}
+
+func loadAuditMaxArchives() int {
+	const defaultMaxArchives = 10
+	raw := os.Getenv("HOLO_AUDIT_MAX_ARCHIVES")
+	if raw == "" {
+		return defaultMaxArchives
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultMaxArchives
 	}
 	return n
 }
