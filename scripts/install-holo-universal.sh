@@ -902,6 +902,8 @@ ensure_user_and_dirs() {
   run_cmd mkdir -p "${DATA_DIR}/local-loopback"
   run_cmd chown root:root "${DATA_DIR}/local-loopback"
   run_cmd chmod 0700 "${DATA_DIR}/local-loopback"
+  run_cmd find "${DATA_DIR}/local-loopback" -maxdepth 1 -type f -name '*.json' -exec chown root:root {} +
+  run_cmd find "${DATA_DIR}/local-loopback" -maxdepth 1 -type f -name '*.json' -exec chmod 0600 {} +
   run_cmd chmod 0750 "${CONFIG_DIR}"
 }
 
