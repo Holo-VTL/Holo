@@ -375,6 +375,11 @@ if [ ! -f "\${BUILD_DIR}/infra/iscsi/holo-iscsi-security-helper.py" ]; then
   exit 1
 fi
 cp "\${BUILD_DIR}/infra/iscsi/holo-iscsi-security-helper.py" "\${OUTPUT_DIR}/holo-iscsi-security-helper.py"
+if [ ! -f "\${BUILD_DIR}/infra/iscsi/holo-local-loopback-helper.py" ]; then
+  echo "Missing infra/iscsi/holo-local-loopback-helper.py" >&2
+  exit 1
+fi
+cp "\${BUILD_DIR}/infra/iscsi/holo-local-loopback-helper.py" "\${OUTPUT_DIR}/holo-local-loopback-helper.py"
 
 
 # Use scripts/install.sh if it exists
@@ -398,6 +403,7 @@ mkdir -p "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}"
 cp -a control-plane holo-tcmu-handler handler_holo.so handler_holo.c \
   holo-iscsi-security-helper.py \
   install-holo.sh install.sh web-console "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
+cp "\${OUTPUT_DIR}/holo-local-loopback-helper.py" "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/holo-local-loopback-helper.py"
 if [ -d packages ]; then
   cp -a packages "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
 fi
@@ -422,7 +428,7 @@ tar xzf "${RELEASE_DIR}/${TARBALL_NAME}" -C "${VERIFY_DIR}"
 
 # Check all required files exist
 VERIFY_ROOT="${VERIFY_DIR}/${PACKAGE_DIR_NAME}"
-for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c holo-iscsi-security-helper.py install-holo.sh web-console/dist/index.html; do
+for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c holo-iscsi-security-helper.py holo-local-loopback-helper.py install-holo.sh web-console/dist/index.html; do
   if [[ ! -f "${VERIFY_ROOT}/${f}" && ! -d "${VERIFY_ROOT}/${f}" ]]; then
     echo "error: missing ${f} in tarball" >&2
     rm -rf "${VERIFY_DIR}"

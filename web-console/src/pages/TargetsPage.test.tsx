@@ -15,7 +15,8 @@ vi.mock("../services/api", () => ({
   api: {
     targets: {
       listPublications: vi.fn().mockResolvedValue([]),
-      localMountStatus: vi.fn().mockResolvedValue({ enabled: false, desiredIqns: [], mountedIqns: [], skippedTargets: [{ targetIqn: "iqn.2026-01.example:offline", reason: "CHAP target" }] }),
+      localMountStatus: vi.fn().mockResolvedValue({ enabled: false, state: "disabled", desiredDeviceCount: 0, connectedDeviceCount: 0, residualDeviceCount: 0, devices: [] }),
+      setLocalMount: vi.fn().mockResolvedValue({ enabled: true, state: "connecting", desiredDeviceCount: 3, connectedDeviceCount: 0, residualDeviceCount: 0, devices: [] }),
       unpublish: vi.fn().mockResolvedValue({}),
       createPublication: vi.fn().mockResolvedValue({}),
     },
@@ -36,6 +37,19 @@ describe("TargetsPage security inventory", () => {
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Configure CHAP" })).toBeInTheDocument();
     expect(iscsiSecurityMock.getTargetBinding).toHaveBeenCalledWith("iqn.2026-01.example:offline");
+  });
+
+  it("does not show the number of locally mounted devices", async () => {
+    vi.mocked(api.targets.localMountStatus).mockResolvedValue({
+      enabled: true, state: "partial", desiredDeviceCount: 3, connectedDeviceCount: 2, residualDeviceCount: 0,
+      devices: [{
+        deviceKey: "drive:drive-c", kind: "drive", libraryId: "lib-a", driveId: "drive-c",
+        displayName: "Library A / drive-c", state: "not_ready", observedPaths: [], reasonCode: "pool_unavailable",
+      }],
+    });
+    renderWithProviders(<TargetsPage />);
+    await screen.findByText("iqn.2026-01.example:offline");
+    expect(screen.queryByRole("button", { name: /Connected 2\/3/ })).not.toBeInTheDocument();
   });
 
   it("requires confirmation before taking an active target offline", async () => {

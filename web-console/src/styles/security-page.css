@@ -1,6 +1,6 @@
 .security-page {
-  width: min(100%, 1184px);
-  margin: 0 auto;
+  width: 100%;
+  margin: 0;
   color: var(--text-body);
 }
 

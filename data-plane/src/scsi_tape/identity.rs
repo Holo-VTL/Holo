@@ -17,6 +17,41 @@ impl DeviceType {
     }
 }
 
+/// Returns a deterministic serial seed for a device, preserving a verified
+/// legacy seed when one is supplied. This helper does not select or migrate
+/// production identities by itself; callers must only pass a legacy seed
+/// after verifying it against the device's existing VPD identity.
+pub fn stable_identity_seed(
+    device_type: DeviceType,
+    stable_id: &str,
+    verified_legacy_seed: Option<&str>,
+) -> Result<String, TapeError> {
+    if let Some(seed) = verified_legacy_seed
+        .map(str::trim)
+        .filter(|seed| !seed.is_empty())
+    {
+        return Ok(seed.to_string());
+    }
+
+    let stable_id = stable_id.trim();
+    let normalized_id = stable_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    if normalized_id.is_empty() {
+        return Err(TapeError::InvalidProfile(
+            "stable device identity must contain an ASCII letter or digit".to_string(),
+        ));
+    }
+
+    let role_prefix = match device_type {
+        DeviceType::Changer => "CHG_",
+        DeviceType::Drive => "DRV_",
+    };
+    let stable_suffix = stable_seed_hash16(stable_id.as_bytes());
+    Ok(format!("{role_prefix}{normalized_id}_{stable_suffix:04X}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceIdentityProfile {
     pub device_type: DeviceType,

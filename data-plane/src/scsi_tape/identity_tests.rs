@@ -1,6 +1,7 @@
 use super::commands_core::{execute, CoreCommand, CoreResponse};
 use super::identity::{
-    element_status_entries, standard_inquiry_bytes, vpd_page_bytes, ElementAddressProfile,
+    element_status_entries, stable_identity_seed, standard_inquiry_bytes, vpd_page_bytes,
+    DeviceType, ElementAddressProfile,
 };
 use super::profiles::{resolve_changer_profile, resolve_drive_profile};
 use super::state::TapeState;
@@ -133,4 +134,35 @@ fn serial_truncation_keeps_drive_identity_unique() {
     assert_eq!(serial_a.len(), profile.serial_len as usize);
     assert_eq!(serial_b.len(), profile.serial_len as usize);
     assert_ne!(serial_a, serial_b, "drive serials must stay unique");
+}
+
+#[test]
+fn stable_identity_seed_separates_roles_and_preserves_verified_legacy_seed() {
+    let changer = stable_identity_seed(DeviceType::Changer, "library-a", None)
+        .expect("changer identity seed should be generated");
+    let drive = stable_identity_seed(DeviceType::Drive, "library-a", None)
+        .expect("drive identity seed should be generated");
+    assert_ne!(changer, drive, "changer and drive identity namespaces must differ");
+
+    let legacy = stable_identity_seed(DeviceType::Drive, "drive-a", Some("legacy-serial-01"))
+        .expect("verified legacy seed should be preserved");
+    assert_eq!(legacy, "legacy-serial-01");
+}
+
+#[test]
+fn stable_identity_seed_rejects_empty_fallback_identity() {
+    assert!(stable_identity_seed(DeviceType::Changer, "", None).is_err());
+}
+
+#[test]
+fn stable_identity_seed_is_deterministic_and_distinguishes_sanitized_ids() {
+    let first = stable_identity_seed(DeviceType::Drive, "drive-a", None)
+        .expect("first stable identity should be generated");
+    let same = stable_identity_seed(DeviceType::Drive, "drive-a", None)
+        .expect("repeated stable identity should be generated");
+    let punctuation_variant = stable_identity_seed(DeviceType::Drive, "drivea", None)
+        .expect("punctuation variant should be generated");
+
+    assert_eq!(first, same);
+    assert_ne!(first, punctuation_variant);
 }

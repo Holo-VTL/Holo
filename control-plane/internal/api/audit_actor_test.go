@@ -17,7 +17,7 @@ func TestSelfAssertedAuditActorLabelsClaimsAndRejectsUnsafeValues(t *testing.T) 
 	if err != nil || got != "self-asserted:unspecified" {
 		t.Fatalf("expected unspecified external actor label, got %q, %v", got, err)
 	}
-	for _, actor := range []string{"operator\nforged", "operator\rforged", strings.Repeat("a", maxClaimedAuditActorLength+1)} {
+	for _, actor := range []string{"operator\nforged", "operator\rforged", strings.Repeat("a", 129)} {
 		if _, err := selfAssertedAuditActor(actor); !errors.Is(err, domain.ErrInvalidInput) {
 			t.Fatalf("expected unsafe actor %q to be rejected, got %v", actor, err)
 		}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -122,16 +123,19 @@ type PublishRequest struct {
 }
 
 type TargetRuntimeService struct {
-	coreRepo      CoreResourceReader
-	runtimeRepo   TargetRuntimeRepository
-	adapter       TargetRuntimeAdapter
-	auditW        audit.Writer
-	cfg           TargetRuntimeConfig
-	metrics       *metrics.MetricsRegistry
-	storageWg     StorageWriteGuard
-	poolReader    StoragePoolReader
-	localMount    LocalMountSynchronizer
-	iscsiSecurity *ISCSISecurityService
+	coreRepo       CoreResourceReader
+	runtimeRepo    TargetRuntimeRepository
+	adapter        TargetRuntimeAdapter
+	auditW         audit.Writer
+	cfg            TargetRuntimeConfig
+	metrics        *metrics.MetricsRegistry
+	storageWg      StorageWriteGuard
+	poolReader     StoragePoolReader
+	localMount     LocalMountSynchronizer
+	localMountRepo LocalMountRepository
+	deviceLocksMu  sync.Mutex
+	deviceLocks    map[string]*sync.Mutex
+	iscsiSecurity  *ISCSISecurityService
 	// securityMu is the outer lock for iSCSI security mutations. When both
 	// locks are needed, acquire securityMu before ISCSISecurityService.mu.
 	// Never acquire securityMu while holding the security service mutex.
@@ -213,6 +217,92 @@ func (s *TargetRuntimeService) SetStoragePoolReader(reader StoragePoolReader) {
 
 func (s *TargetRuntimeService) SetLocalMountSynchronizer(syncer LocalMountSynchronizer) {
 	s.localMount = syncer
+}
+
+func (s *TargetRuntimeService) SyncLocalMountAsync(actor string) {
+	s.syncLocalMount(context.Background(), actor)
+}
+
+func (s *TargetRuntimeService) SetLocalMountRepository(repository LocalMountRepository) {
+	s.localMountRepo = repository
+	if adapter, ok := s.adapter.(*TcmuAdapter); ok {
+		adapter.SetLocalMountRepository(repository)
+	}
+}
+
+func (s *TargetRuntimeService) EnsureLocalMountBackend(ctx context.Context, descriptor domain.VTLDeviceDescriptor) error {
+	if s.cfg.Mode == "in-memory" {
+		return nil
+	}
+	if adapter, ok := s.adapter.(*TcmuAdapter); ok {
+		return adapter.EnsureLocalMountBackend(ctx, descriptor)
+	}
+	return ErrLocalLoopbackHelperUnavailable
+}
+
+func (s *TargetRuntimeService) ResolveLocalMountIdentity(ctx context.Context, descriptor domain.VTLDeviceDescriptor, publication *domain.TargetPublication) (string, error) {
+	if s.cfg.Mode == "in-memory" {
+		return descriptor.IdentityRef, nil
+	}
+	if adapter, ok := s.adapter.(*TcmuAdapter); ok {
+		return adapter.ResolveLocalMountIdentity(ctx, descriptor, publication)
+	}
+	return "", ErrLocalLoopbackHelperUnavailable
+}
+
+func (s *TargetRuntimeService) WithLocalMountDeviceLocks(ctx context.Context, deviceKeys []string, operation func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	keys := append([]string(nil), deviceKeys...)
+	sort.Strings(keys)
+	unique := keys[:0]
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" || len(unique) > 0 && unique[len(unique)-1] == key {
+			continue
+		}
+		unique = append(unique, key)
+	}
+	locks := make([]*sync.Mutex, len(unique))
+	s.deviceLocksMu.Lock()
+	if s.deviceLocks == nil {
+		s.deviceLocks = make(map[string]*sync.Mutex)
+	}
+	for i, key := range unique {
+		lock := s.deviceLocks[key]
+		if lock == nil {
+			lock = &sync.Mutex{}
+			s.deviceLocks[key] = lock
+		}
+		locks[i] = lock
+	}
+	s.deviceLocksMu.Unlock()
+	for _, lock := range locks {
+		lock.Lock()
+	}
+	defer func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].Unlock()
+		}
+	}()
+	return operation()
+}
+
+func (s *TargetRuntimeService) ReleaseLocalMountBackend(ctx context.Context, mapping domain.LocalLoopbackDeviceMapping) error {
+	return s.WithLocalMountDeviceLocks(ctx, []string{mapping.DeviceKey}, func() error {
+		for _, publication := range s.runtimeRepo.ListPublications(ctx) {
+			if publication != nil && publication.State != domain.PublicationDisabled && publicationDeviceKey(publication) == mapping.DeviceKey {
+				return nil
+			}
+		}
+		if s.cfg.Mode == "in-memory" {
+			return nil
+		}
+		if adapter, ok := s.adapter.(*TcmuAdapter); ok {
+			return adapter.ReleaseLocalMountBackend(ctx, mapping)
+		}
+		return ErrLocalLoopbackHelperUnavailable
+	})
 }
 
 func (s *TargetRuntimeService) SetISCSISecurityService(service *ISCSISecurityService) {
@@ -329,8 +419,25 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 		return nil, err
 	}
 
-	portal, err := s.publishWithSecurity(ctx, publication, securityContext)
+	portal := ""
+	err = s.WithLocalMountDeviceLocks(ctx, []string{publicationDeviceKey(publication)}, func() error {
+		var publishErr error
+		portal, publishErr = s.publishWithSecurity(ctx, publication, securityContext)
+		if publishErr != nil {
+			return publishErr
+		}
+		if markErr := publication.MarkReady(portal); markErr != nil {
+			return markErr
+		}
+		if s.iscsiSecurity != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
+			publication.SecurityEnforcement = successfulSecurityEnforcement(s.cfg.Mode)
+		}
+		return s.runtimeRepo.SavePublication(ctx, publication)
+	})
 	if err != nil {
+		if publication.State != domain.PublicationCreating {
+			return publication, err
+		}
 		if s.metrics != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
 			s.metrics.RecordISCSISecurityApplyFailure()
 		}
@@ -350,15 +457,6 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 		return publication, err
 	}
 
-	if err := publication.MarkReady(portal); err != nil {
-		return nil, err
-	}
-	if s.iscsiSecurity != nil && resolvedPolicyRequiresProtection(securityContext.Policy) {
-		publication.SecurityEnforcement = successfulSecurityEnforcement(s.cfg.Mode)
-	}
-	if err := s.runtimeRepo.SavePublication(ctx, publication); err != nil {
-		return nil, err
-	}
 	audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(req.Actor), "publish", publication.PublicationID, "success", map[string]any{"targetIqn": publication.TargetIQN, "portal": publication.Portal, "runtimeMode": s.cfg.Mode})
 
 	if s.metrics != nil {
@@ -380,23 +478,25 @@ func (s *TargetRuntimeService) Unpublish(ctx context.Context, publicationID, act
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "success", map[string]any{"noop": true, "runtimeMode": s.cfg.Mode})
 		return publication, nil
 	}
-	if s.iscsiSecurity != nil {
-		if err := s.iscsiSecurity.SetTargetOfflineUnderRuntimeLock(ctx, publication.TargetIQN, true, actor); err != nil {
-			return nil, err
+	err = s.WithLocalMountDeviceLocks(ctx, []string{publicationDeviceKey(publication)}, func() error {
+		if s.iscsiSecurity != nil {
+			if err := s.iscsiSecurity.SetTargetOfflineUnderRuntimeLock(ctx, publication.TargetIQN, true, actor); err != nil {
+				return err
+			}
 		}
-	}
-	if err := s.adapter.Unpublish(ctx, publication); err != nil {
+		if err := s.adapter.Unpublish(ctx, publication); err != nil {
+			return err
+		}
+		if err := publication.Disable(); err != nil {
+			return err
+		}
+		if publication.SecurityEnforcement != domain.SecurityEnforcementUnprotected {
+			publication.SecurityEnforcement = domain.SecurityEnforcementOffline
+		}
+		return s.runtimeRepo.SavePublication(ctx, publication)
+	})
+	if err != nil {
 		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "failure", map[string]any{"error": err.Error(), "runtimeMode": s.cfg.Mode})
-		return nil, err
-	}
-	if err := publication.Disable(); err != nil {
-		audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "failure", map[string]any{"error": err.Error(), "runtimeMode": s.cfg.Mode})
-		return nil, err
-	}
-	if publication.SecurityEnforcement != domain.SecurityEnforcementUnprotected {
-		publication.SecurityEnforcement = domain.SecurityEnforcementOffline
-	}
-	if err := s.runtimeRepo.SavePublication(ctx, publication); err != nil {
 		return nil, err
 	}
 	audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "unpublish", publicationID, "success", map[string]any{"state": publication.State, "noop": false, "runtimeMode": s.cfg.Mode})
@@ -615,10 +715,7 @@ func (s *TargetRuntimeService) HealthSnapshot() TargetRuntimeHealth {
 }
 
 func safeActor(actor string) string {
-	if actor == "" {
-		return "system"
-	}
-	return actor
+	return audit.NormalizeServiceActor(actor)
 }
 
 var targetcliTokenPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)

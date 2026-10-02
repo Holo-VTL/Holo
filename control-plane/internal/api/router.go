@@ -119,7 +119,10 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		PortalPort: cfg.TargetPortalPort,
 		UseSudo:    cfg.TargetRuntimeUseSudo,
 	})
-	localMount.SetISCSISecurityService(securityService)
+	localMount.SetRuntime(coreRepo, storageSvc, localMountRepo, orchestration.NewComposedLocalMountRuntime(
+		orchestration.NewLocalLoopbackAdapter("", cfg.TargetRuntimeUseSudo), targetRuntime,
+	))
+	targetRuntime.SetLocalMountRepository(localMountRepo)
 	targetRuntime.SetLocalMountSynchronizer(localMount)
 	if strings.TrimSpace(strings.ToLower(cfg.TargetRuntimeMode)) != "in-memory" {
 		targetRuntime.SetStorageWriteGuard(storageSvc)

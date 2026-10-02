@@ -2,344 +2,394 @@ package orchestration
 
 import (
 	"context"
-	"strings"
-	"sync"
+	"errors"
 	"testing"
-	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 )
 
-type fakeLocalMountSettings struct {
-	enabled bool
-}
+type fakeLocalMountSettings struct{ enabled bool }
 
-func (s *fakeLocalMountSettings) Enabled(context.Context) (bool, error) {
-	return s.enabled, nil
-}
-
+func (s *fakeLocalMountSettings) Enabled(context.Context) (bool, error) { return s.enabled, nil }
 func (s *fakeLocalMountSettings) SetEnabled(_ context.Context, enabled bool) error {
 	s.enabled = enabled
 	return nil
 }
 
-type recordingRunner struct {
-	mu       sync.Mutex
-	outputs  map[string]string
-	commands []string
+type fakeLocalMountRuntime struct {
+	available   bool
+	probeErr    error
+	owners      []LocalLoopbackOwner
+	observed    map[string]LocalLoopbackDeviceObservation
+	ensureCalls [][]domain.LocalLoopbackDeviceMapping
+	removeCalls [][]domain.LocalLoopbackDeviceMapping
+	released    []string
+	ensureErr   error
+	removeErr   error
 }
 
-func (r *recordingRunner) Run(_ context.Context, command string, args ...string) (string, error) {
-	line := command + " " + strings.Join(args, " ")
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.commands = append(r.commands, line)
-	if out, ok := r.outputs[line]; ok {
-		return out, nil
+type fakeLocalMountIdentityRuntime struct {
+	*fakeLocalMountRuntime
+	identities map[string]string
+}
+
+func (r *fakeLocalMountIdentityRuntime) ResolveLocalMountIdentity(_ context.Context, descriptor domain.VTLDeviceDescriptor, _ *domain.TargetPublication) (string, error) {
+	if identity := r.identities[descriptor.DeviceKey]; identity != "" {
+		return identity, nil
 	}
-	return "", nil
+	return descriptor.IdentityRef, nil
 }
 
-func (r *recordingRunner) snapshotCommands() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]string(nil), r.commands...)
+func (r *fakeLocalMountRuntime) Probe(context.Context) (bool, domain.LocalMountReasonCode, error) {
+	return r.available, "", r.probeErr
+}
+func (r *fakeLocalMountRuntime) ListOwned(context.Context) ([]LocalLoopbackOwner, error) {
+	return append([]LocalLoopbackOwner(nil), r.owners...), nil
+}
+func (r *fakeLocalMountRuntime) Ensure(_ context.Context, _ domain.LocalLoopbackLibraryMapping, mappings []domain.LocalLoopbackDeviceMapping, _ []domain.VTLDeviceDescriptor) ([]LocalLoopbackDeviceObservation, error) {
+	r.ensureCalls = append(r.ensureCalls, append([]domain.LocalLoopbackDeviceMapping(nil), mappings...))
+	if r.ensureErr != nil {
+		return failedLocalMountObservations(mappings, r.ensureErr), r.ensureErr
+	}
+	result := make([]LocalLoopbackDeviceObservation, 0, len(mappings))
+	owned := LocalLoopbackOwner{LibraryID: mappings[0].LibraryID, Present: true}
+	for _, mapping := range mappings {
+		observation, ok := r.observed[mapping.DeviceKey]
+		if !ok {
+			observation = LocalLoopbackDeviceObservation{DeviceKey: mapping.DeviceKey, State: domain.LocalMountDeviceStateConnected, ObservedPaths: []string{"/dev/sg0"}}
+		}
+		result = append(result, observation)
+		owned.Devices = append(owned.Devices, LocalLoopbackOwnedDevice{DeviceKey: mapping.DeviceKey, Kind: mapping.Kind, DriveID: mapping.DriveID, LUN: mapping.LUNIndex, IdentityRef: mapping.IdentityRef, BackendRef: mapping.BackendRef, State: mapping.State})
+	}
+	r.owners = []LocalLoopbackOwner{owned}
+	return result, nil
+}
+func (r *fakeLocalMountRuntime) Remove(_ context.Context, library domain.LocalLoopbackLibraryMapping, mappings []domain.LocalLoopbackDeviceMapping) ([]LocalLoopbackDeviceObservation, error) {
+	r.removeCalls = append(r.removeCalls, append([]domain.LocalLoopbackDeviceMapping(nil), mappings...))
+	if r.removeErr != nil {
+		return failedLocalMountObservations(mappings, r.removeErr), r.removeErr
+	}
+	active := make([]LocalLoopbackOwnedDevice, 0)
+	for _, mapping := range mappings {
+		if mapping.State == domain.LocalMappingStateActive {
+			active = append(active, LocalLoopbackOwnedDevice{DeviceKey: mapping.DeviceKey, Kind: mapping.Kind, DriveID: mapping.DriveID, LUN: mapping.LUNIndex, IdentityRef: mapping.IdentityRef, BackendRef: mapping.BackendRef, State: mapping.State})
+		}
+	}
+	if len(active) == 0 {
+		r.owners = nil
+	} else {
+		r.owners = []LocalLoopbackOwner{{LibraryID: library.LibraryID, Present: true, Devices: active}}
+	}
+	return []LocalLoopbackDeviceObservation{}, nil
+}
+func (r *fakeLocalMountRuntime) ReleaseBackend(_ context.Context, mapping domain.LocalLoopbackDeviceMapping) error {
+	r.released = append(r.released, mapping.DeviceKey)
+	return nil
 }
 
-func TestLocalMountSyncLogsInDesiredTargetsAndCleansStaleHoloNodes(t *testing.T) {
+func TestLocalMountSyncUsesWholeLibraryInventoryWithoutPublicationOrCHAPFilter(t *testing.T) {
 	ctx := context.Background()
-	t.Setenv("HOLO_ISCSI_PRIVILEGED_HELPER", "/opt/holo/bin/holo-iscsi-helper")
-	targetRepo := memory.NewTargetRuntimeRepo()
-	pub, err := domain.NewTargetPublication("pub-a", "pool-a", "lib-a", "drive-a", "cart-a", "iqn.2026-04.cloud.backupnext.holo:drive-a")
+	resources := newLocalMountServiceResources(t)
+	settings := &fakeLocalMountSettings{}
+	mappings := memory.NewLocalMountRepo()
+	runtime := &fakeLocalMountRuntime{available: true, observed: map[string]LocalLoopbackDeviceObservation{}}
+	targets := memory.NewTargetRuntimeRepo()
+	service := NewLocalMountService(settings, targets, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(resources, nil, mappings, runtime)
+
+	if err := settings.SetEnabled(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.Sync(ctx, "tester")
 	if err != nil {
-		t.Fatalf("new publication: %v", err)
+		t.Fatalf("enable local mount: %v", err)
 	}
-	if err := pub.MarkReady("127.0.0.1:3260"); err != nil {
-		t.Fatalf("mark ready: %v", err)
+	if status.State != domain.LocalMountStateConnected || status.DesiredDeviceCount != 3 || status.ConnectedDeviceCount != 3 {
+		t.Fatalf("expected changer and both drives to connect without network publications, got %+v", status)
 	}
-	if err := targetRepo.SavePublication(ctx, pub); err != nil {
-		t.Fatalf("save publication: %v", err)
+	if len(runtime.ensureCalls) != 1 || len(runtime.ensureCalls[0]) != 3 {
+		t.Fatalf("expected one library loopback mapping with all three devices, got %+v", runtime.ensureCalls)
 	}
-	runner := &recordingRunner{outputs: map[string]string{
-		"sudo -n /opt/holo/bin/holo-iscsi-helper nodes":    "127.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:stale\n10.0.0.2:3260,1 iqn.2026-04.cloud.backupnext.holo:remote\n",
-		"sudo -n /opt/holo/bin/holo-iscsi-helper sessions": "tcp: [1] 127.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:drive-a\ntcp: [2] 10.0.0.2:3260,1 iqn.2026-04.cloud.backupnext.holo:remote\n",
-	}}
-	service := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260, UseSudo: true}, runner)
+	if _, err := mappings.ListLibraryMappings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := mappings.ListDeviceMappings(ctx, "lib-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 3 {
+		t.Fatalf("expected persistent mappings for every configured device, got %+v", stored)
+	}
+	for _, device := range stored {
+		if device.Kind == domain.LocalDeviceKindDrive && device.LUNIndex < 1 {
+			t.Fatalf("drive got invalid LUN: %+v", device)
+		}
+	}
+}
+
+func TestLocalMountRetainsNotReadyLoadedDriveInDesiredCount(t *testing.T) {
+	ctx := context.Background()
+	resources := newLocalMountServiceResources(t)
+	drive, _ := domain.NewVirtualDrive("drive-c", "lib-a", 3)
+	if err := drive.Mount("cart-missing-pool"); err != nil {
+		t.Fatal(err)
+	}
+	if err := resources.CreateDrive(ctx, drive); err != nil {
+		t.Fatal(err)
+	}
+	if err := resources.CreateCartridge(ctx, domain.NewVirtualCartridge("cart-missing-pool", "missing-pool", "lib-a", "TAPE999", 1<<30)); err != nil {
+		t.Fatal(err)
+	}
+	settings := &fakeLocalMountSettings{enabled: true}
+	mappings := memory.NewLocalMountRepo()
+	runtime := &fakeLocalMountRuntime{available: true, observed: map[string]LocalLoopbackDeviceObservation{}}
+	service := NewLocalMountService(settings, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(resources, failingPoolReader{}, mappings, runtime)
 
 	status, err := service.Sync(ctx, "tester")
 	if err != nil {
-		t.Fatalf("sync failed: %v", err)
+		t.Fatalf("pool not-ready state should be reported per-device: %v", err)
 	}
-	if len(status.DesiredIQNs) != 1 || status.DesiredIQNs[0] != pub.TargetIQN {
-		t.Fatalf("unexpected desired iqns: %+v", status.DesiredIQNs)
+	if status.DesiredDeviceCount != 4 || status.ConnectedDeviceCount != 3 || status.State != domain.LocalMountStatePartial {
+		t.Fatalf("pool-failed drive must remain in denominator: %+v", status)
 	}
-	for _, want := range []string{
-		"sudo -n /opt/holo/bin/holo-iscsi-helper ensure-node iqn.2026-04.cloud.backupnext.holo:drive-a 127.0.0.1:3260",
-		"sudo -n /opt/holo/bin/holo-iscsi-helper login iqn.2026-04.cloud.backupnext.holo:drive-a 127.0.0.1:3260",
-		"sudo -n /opt/holo/bin/holo-iscsi-helper logout iqn.2026-04.cloud.backupnext.holo:stale 127.0.0.1:3260",
-		"sudo -n /opt/holo/bin/holo-iscsi-helper delete iqn.2026-04.cloud.backupnext.holo:stale 127.0.0.1:3260",
-	} {
-		commands := runner.snapshotCommands()
-		if !hasLocalMountCommand(commands, want) {
-			t.Fatalf("missing command %q in:\n%s", want, strings.Join(commands, "\n"))
+	var notReady bool
+	for _, device := range status.Devices {
+		if device.DeviceKey == "drive:drive-c" && device.State == domain.LocalMountDeviceStateNotReady && device.ReasonCode == domain.LocalMountReasonPoolUnavailable {
+			notReady = true
 		}
 	}
-	for _, unwanted := range []string{
-		"sudo -n /opt/holo/bin/holo-iscsi-helper logout iqn.2026-04.cloud.backupnext.holo:remote 10.0.0.2:3260",
-		"sudo -n /opt/holo/bin/holo-iscsi-helper delete iqn.2026-04.cloud.backupnext.holo:remote 10.0.0.2:3260",
-	} {
-		commands := runner.snapshotCommands()
-		if hasLocalMountCommand(commands, unwanted) {
-			t.Fatalf("unexpected cross-portal cleanup command %q in:\n%s", unwanted, strings.Join(commands, "\n"))
-		}
-	}
-	if len(status.MountedIQNs) != 1 || status.MountedIQNs[0] != pub.TargetIQN {
-		t.Fatalf("unexpected mounted iqns: %+v", status.MountedIQNs)
+	if !notReady {
+		t.Fatalf("expected loaded drive to report pool unavailable: %+v", status.Devices)
 	}
 }
 
-func TestLocalMountSyncSkipsProtectedTargetsAndRemovesExistingLocalNode(t *testing.T) {
+func TestLocalMountProbeFailureCannotMasqueradeAsZeroDeviceSuccess(t *testing.T) {
 	ctx := context.Background()
-	t.Setenv("HOLO_ISCSI_PRIVILEGED_HELPER", "/opt/holo/bin/holo-iscsi-helper")
-	iqn := "iqn.2026-04.cloud.backupnext.holo:drive-a"
-	targetRepo := memory.NewTargetRuntimeRepo()
-	publication, err := domain.NewTargetPublication("pub-secure", "pool-a", "lib-a", "drive-a", "cart-a", iqn)
+	resources := newLocalMountServiceResources(t)
+	settings := &fakeLocalMountSettings{enabled: true}
+	runtime := &fakeLocalMountRuntime{available: false, probeErr: errors.New("loopback unavailable")}
+	service := NewLocalMountService(settings, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(resources, nil, memory.NewLocalMountRepo(), runtime)
+
+	status, err := service.Sync(ctx, "tester")
+	if err == nil || status.State != domain.LocalMountStateFailed || status.Enabled != true {
+		t.Fatalf("probe failure was not reported as failed intent: status=%+v err=%v", status, err)
+	}
+}
+
+func TestLocalMountDisableDoesNotHideUnknownOwnedResidual(t *testing.T) {
+	ctx := context.Background()
+	settings := &fakeLocalMountSettings{enabled: false}
+	runtime := &fakeLocalMountRuntime{available: true, owners: []LocalLoopbackOwner{{LibraryID: "lib-orphan", Present: true, Devices: []LocalLoopbackOwnedDevice{{DeviceKey: "changer:lib-orphan", Kind: domain.LocalDeviceKindChanger}}}}}
+	service := NewLocalMountService(settings, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(newLocalMountServiceResources(t), nil, memory.NewLocalMountRepo(), runtime)
+
+	status, err := service.Sync(ctx, "tester")
+	if err == nil || status.State != domain.LocalMountStateFailed || status.ResidualDeviceCount != 1 {
+		t.Fatalf("unknown owned mapping was incorrectly reported as disabled: status=%+v err=%v", status, err)
+	}
+}
+
+func TestLocalMountDisableRemovesOnlyOwnedLocalMappingsAndReleasesBackends(t *testing.T) {
+	ctx := context.Background()
+	resources := newLocalMountServiceResources(t)
+	settings := &fakeLocalMountSettings{}
+	mappings := memory.NewLocalMountRepo()
+	runtime := &fakeLocalMountRuntime{available: true, observed: map[string]LocalLoopbackDeviceObservation{}}
+	service := NewLocalMountService(settings, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(resources, nil, mappings, runtime)
+
+	if err := settings.SetEnabled(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Sync(ctx, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.SetEnabled(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.Sync(ctx, "tester")
+	if err != nil {
+		t.Fatalf("disable local mount: %v", err)
+	}
+	if status.State != domain.LocalMountStateDisabled || status.ResidualDeviceCount != 0 {
+		t.Fatalf("expected confirmed clean disable, got %+v", status)
+	}
+	if len(runtime.removeCalls) != 1 || len(runtime.removeCalls[0]) != 3 {
+		t.Fatalf("expected removal of the three owned devices: %+v", runtime.removeCalls)
+	}
+	if len(runtime.released) != 3 {
+		t.Fatalf("expected shared backend releases after detach, got %v", runtime.released)
+	}
+	libraries, err := mappings.ListLibraryMappings(ctx)
+	if err != nil || len(libraries) != 1 {
+		t.Fatalf("expected stable library mapping retained while disabled, libraries=%+v err=%v", libraries, err)
+	}
+	stored, err := mappings.ListDeviceMappings(ctx, "lib-a")
+	if err != nil || len(stored) != 3 {
+		t.Fatalf("expected stable device/LUN mappings retained while disabled, mappings=%+v err=%v", stored, err)
+	}
+	for _, mapping := range stored {
+		if mapping.State != domain.LocalMappingStateInactive {
+			t.Fatalf("expected detached mappings to be inactive, got %+v", mapping)
+		}
+	}
+}
+
+func TestLocalMountKeepsStableLUNsAcrossDisableAndTopologyGrowth(t *testing.T) {
+	ctx := context.Background()
+	resources := newLocalMountServiceResources(t)
+	settings := &fakeLocalMountSettings{}
+	mappings := memory.NewLocalMountRepo()
+	runtime := &fakeLocalMountRuntime{available: true, observed: map[string]LocalLoopbackDeviceObservation{}}
+	service := NewLocalMountService(settings, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(resources, nil, mappings, runtime)
+
+	if err := settings.SetEnabled(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Sync(ctx, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := mappings.ListDeviceMappings(ctx, "lib-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := publication.MarkReady("127.0.0.1:3260"); err != nil {
+	originalLUNs := make(map[string]int)
+	for _, mapping := range before {
+		originalLUNs[mapping.DeviceKey] = mapping.LUNIndex
+	}
+	if err := settings.SetEnabled(ctx, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := targetRepo.SavePublication(ctx, publication); err != nil {
+	if _, err := service.Sync(ctx, "tester"); err != nil {
 		t.Fatal(err)
 	}
-	securityRepo := memory.NewISCSISecurityRepo()
-	if err := securityRepo.RegisterTarget(ctx, iqn, "lib-a", "drive-a", "drive"); err != nil {
-		t.Fatal(err)
-	}
-	credential := domain.ISCSICredential{CredentialID: "cred-a", Label: "backup", Username: "backup-user", EncryptedSecret: make([]byte, 64), Version: 1}
-	if err := securityRepo.CreateCredential(ctx, credential); err != nil {
-		t.Fatal(err)
-	}
-	if err := securityRepo.SaveBinding(ctx, domain.ISCSISecurityBinding{
-		Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
-		Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthCHAP, CredentialID: "cred-a", Initiators: []string{"iqn.1991-05.com.microsoft:backup"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	runner := &recordingRunner{outputs: map[string]string{
-		"sudo -n /opt/holo/bin/holo-iscsi-helper nodes":    "127.0.0.1:3260,1 " + iqn + "\n",
-		"sudo -n /opt/holo/bin/holo-iscsi-helper sessions": "tcp: [1] 127.0.0.1:3260,1 " + iqn + "\n",
-	}}
-	mount := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260, UseSudo: true}, runner)
-	mount.SetISCSISecurityService(NewISCSISecurityService(securityRepo, nil, nil, nil))
-	status, err := mount.Sync(ctx, "tester")
+
+	newDrive, err := domain.NewVirtualDrive("drive-c", "lib-a", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(status.SkippedTargets) != 1 || status.SkippedTargets[0] != (LocalMountSkip{TargetIQN: iqn, Reason: "protected-iscsi-target"}) {
-		t.Fatalf("protected target skip reason missing: %+v", status)
+	if err := resources.CreateDrive(ctx, newDrive); err != nil {
+		t.Fatal(err)
 	}
-	commands := runner.snapshotCommands()
-	for _, command := range commands {
-		if strings.Contains(command, " login ") || strings.Contains(command, "ensure-node") {
-			t.Fatalf("local mount attempted to bypass target protection: %s", command)
+	if err := settings.SetEnabled(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.Sync(ctx, "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.DesiredDeviceCount != 4 {
+		t.Fatalf("expected newly added drive in inventory, got %+v", status)
+	}
+	after, err := mappings.ListDeviceMappings(ctx, "lib-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mapping := range after {
+		if oldLUN, existed := originalLUNs[mapping.DeviceKey]; existed && oldLUN != mapping.LUNIndex {
+			t.Fatalf("existing device LUN changed across disable/growth: %s %d -> %d", mapping.DeviceKey, oldLUN, mapping.LUNIndex)
 		}
-	}
-	if !containsCommand(commands, "sudo -n /opt/holo/bin/holo-iscsi-helper delete "+iqn+" 127.0.0.1:3260") {
-		t.Fatalf("previous local node should be removed after policy changes: %v", commands)
 	}
 }
 
-func TestLocalMountSyncSkipsAclOnlyTargets(t *testing.T) {
+func TestLocalMountSyncRecreatesMappingsWhenVPDIdentityChanges(t *testing.T) {
 	ctx := context.Background()
-	t.Setenv("HOLO_ISCSI_PRIVILEGED_HELPER", "/opt/holo/bin/holo-iscsi-helper")
-	for _, testCase := range []struct {
-		name      string
-		configure func(*testing.T, *memory.ISCSISecurityRepo)
-	}{
-		{name: "acl-only", configure: func(t *testing.T, repository *memory.ISCSISecurityRepo) {
-			t.Helper()
-			if err := repository.SaveBinding(ctx, domain.ISCSISecurityBinding{
-				Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
-				Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthNone, RestrictInitiators: true},
-			}); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			const iqn = "iqn.2026-04.cloud.backupnext.holo:drive-a"
-			targetRepo := memory.NewTargetRuntimeRepo()
-			publication, err := domain.NewTargetPublication("pub-secure", "pool-a", "lib-a", "drive-a", "cart-a", iqn)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := publication.MarkReady("127.0.0.1:3260"); err != nil {
-				t.Fatal(err)
-			}
-			if err := targetRepo.SavePublication(ctx, publication); err != nil {
-				t.Fatal(err)
-			}
-			securityRepo := memory.NewISCSISecurityRepo()
-			if err := securityRepo.RegisterTarget(ctx, iqn, "lib-a", "drive-a", "drive"); err != nil {
-				t.Fatal(err)
-			}
-			testCase.configure(t, securityRepo)
-			runner := &recordingRunner{outputs: map[string]string{
-				"sudo -n /opt/holo/bin/holo-iscsi-helper nodes": "127.0.0.1:3260,1 " + iqn + "\n",
-			}}
-			mount := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260, UseSudo: true}, runner)
-			mount.SetISCSISecurityService(NewISCSISecurityService(securityRepo, nil, nil, nil))
-			status, err := mount.Sync(ctx, "tester")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(status.SkippedTargets) != 1 || status.SkippedTargets[0] != (LocalMountSkip{TargetIQN: iqn, Reason: "protected-iscsi-target"}) {
-				t.Fatalf("expected protected target skip, got %+v", status.SkippedTargets)
-			}
-			for _, command := range runner.snapshotCommands() {
-				if strings.Contains(command, " login ") || strings.Contains(command, "ensure-node") {
-					t.Fatalf("local mount attempted an iSCSI login bypass: %s", command)
-				}
-			}
+	resources := newLocalMountServiceResources(t)
+	descriptors, err := BuildLocalMountInventory(ctx, resources, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mappings := memory.NewLocalMountRepo()
+	if err := mappings.SaveLibraryMapping(ctx, localLoopbackLibraryMapping("lib-a")); err != nil {
+		t.Fatal(err)
+	}
+	owner := LocalLoopbackOwner{LibraryID: "lib-a", Present: true}
+	actualIdentities := []string{"IBMChangerSerial", "IBMDriveSerialA", "IBMDriveSerialB"}
+	resolved := make(map[string]string, len(descriptors))
+	nextDriveLUN := 1
+	for i, descriptor := range descriptors {
+		lun := 0
+		if descriptor.Kind == domain.LocalDeviceKindDrive {
+			lun = nextDriveLUN
+			nextDriveLUN++
+		}
+		mapping := domain.LocalLoopbackDeviceMapping{
+			DeviceKey: descriptor.DeviceKey, LibraryID: descriptor.LibraryID, Kind: descriptor.Kind,
+			DriveID: descriptor.DriveID, LUNIndex: lun, IdentityRef: "legacy-identity-" + string(rune('a'+i)),
+			BackendRef: localMountBackendRef(descriptor.DeviceKey), State: domain.LocalMappingStateActive,
+		}
+		if err := mappings.SaveDeviceMapping(ctx, mapping); err != nil {
+			t.Fatal(err)
+		}
+		resolved[descriptor.DeviceKey] = actualIdentities[i]
+		owner.Devices = append(owner.Devices, LocalLoopbackOwnedDevice{
+			DeviceKey: mapping.DeviceKey, Kind: mapping.Kind, DriveID: mapping.DriveID, LUN: mapping.LUNIndex,
+			IdentityRef: mapping.IdentityRef, BackendRef: mapping.BackendRef, State: mapping.State,
 		})
 	}
-}
+	baseRuntime := &fakeLocalMountRuntime{available: true, owners: []LocalLoopbackOwner{owner}, observed: map[string]LocalLoopbackDeviceObservation{}}
+	runtime := &fakeLocalMountIdentityRuntime{fakeLocalMountRuntime: baseRuntime, identities: resolved}
+	settings := &fakeLocalMountSettings{enabled: true}
+	service := NewLocalMountService(settings, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu"})
+	service.SetRuntime(resources, nil, mappings, runtime)
 
-func containsCommand(commands []string, want string) bool {
-	for _, command := range commands {
-		if command == want {
-			return true
+	status, err := service.Sync(ctx, "tester")
+	if err != nil {
+		t.Fatalf("sync with changed VPD identity: %v; status=%+v", err, status)
+	}
+	if status.State != domain.LocalMountStateConnected || status.ConnectedDeviceCount != len(descriptors) {
+		t.Fatalf("expected all devices to reconnect after identity migration: %+v", status)
+	}
+	if len(baseRuntime.removeCalls) != 1 || len(baseRuntime.removeCalls[0]) != len(descriptors) {
+		t.Fatalf("identity change must detach the complete owned loopback before remapping: %+v", baseRuntime.removeCalls)
+	}
+	if len(baseRuntime.released) != len(descriptors) {
+		t.Fatalf("expected old local mappings to be released before recreation, got %v", baseRuntime.released)
+	}
+	updated, err := mappings.ListDeviceMappings(ctx, "lib-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != len(descriptors) {
+		t.Fatalf("expected one persisted mapping per device, got %+v", updated)
+	}
+	for _, mapping := range updated {
+		if mapping.IdentityRef != resolved[mapping.DeviceKey] {
+			t.Fatalf("mapping did not persist its resolved VPD serial: %+v", mapping)
 		}
 	}
-	return false
 }
 
-func TestParseISCSIADMNodes(t *testing.T) {
-	nodes := parseISCSIADMNodes("10.0.0.1:3260,1 iqn.2026-04.cloud.backupnext.holo:drive-a\n")
-	if len(nodes) != 1 || nodes[0].Portal != "10.0.0.1:3260" || nodes[0].IQN != "iqn.2026-04.cloud.backupnext.holo:drive-a" {
-		t.Fatalf("unexpected nodes: %+v", nodes)
-	}
-}
-
-func TestIsHoloIQNAllowsFutureDates(t *testing.T) {
-	if !isHoloIQN("iqn.2027-01.cloud.backupnext.holo:drive-a") {
-		t.Fatal("expected future Holo IQN to be managed")
-	}
-}
-
-func TestLocalMountSyncAsyncCoalescesPendingRequests(t *testing.T) {
-	runner := &blockingLocalMountRunner{
-		outputs: map[string]string{
-			"iscsiadm -m node":    "",
-			"iscsiadm -m session": "",
-		},
-		entered: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	service := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: false}, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260}, runner)
-
-	service.SyncAsync("tester")
-	select {
-	case <-runner.entered:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for first async sync")
-	}
-	for i := 0; i < 5; i++ {
-		service.SyncAsync("tester")
-	}
-	close(runner.release)
-	waitForAsyncLocalMount(t, service)
-
-	if got := runner.countCommand("iscsiadm -m node"); got != 2 {
-		t.Fatalf("expected one running sync plus one coalesced sync, got %d node scans", got)
-	}
-}
-
-func TestLocalMountAuditOnlyEmitsOnStatusChange(t *testing.T) {
-	ctx := context.Background()
-	writer := audit.NewMemoryWriter()
-	runner := &recordingRunner{outputs: map[string]string{
-		"iscsiadm -m node":    "",
-		"iscsiadm -m session": "",
-	}}
-	service := newLocalMountServiceWithRunner(&fakeLocalMountSettings{enabled: false}, memory.NewTargetRuntimeRepo(), writer, TargetRuntimeConfig{Mode: "tcmu", PortalHost: "127.0.0.1", PortalPort: 3260}, runner)
-
-	if _, err := service.Sync(ctx, "tester"); err != nil {
-		t.Fatalf("first sync failed: %v", err)
-	}
-	if _, err := service.Sync(ctx, "tester"); err != nil {
-		t.Fatalf("second sync failed: %v", err)
-	}
-	if got := len(writer.Events()); got != 0 {
-		t.Fatalf("expected no repeated no-op sync audit events, got %d", got)
-	}
-}
-
-type blockingLocalMountRunner struct {
-	mu       sync.Mutex
-	outputs  map[string]string
-	commands []string
-	entered  chan struct{}
-	release  chan struct{}
-	once     sync.Once
-}
-
-func (r *blockingLocalMountRunner) Run(_ context.Context, command string, args ...string) (string, error) {
-	line := command + " " + strings.Join(args, " ")
-	r.mu.Lock()
-	r.commands = append(r.commands, line)
-	r.mu.Unlock()
-	if line == "iscsiadm -m node" {
-		r.once.Do(func() {
-			close(r.entered)
-			<-r.release
-		})
-	}
-	if out, ok := r.outputs[line]; ok {
-		return out, nil
-	}
-	return "", nil
-}
-
-func (r *blockingLocalMountRunner) countCommand(want string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	count := 0
-	for _, command := range r.commands {
-		if command == want {
-			count++
-		}
-	}
-	return count
-}
-
-func waitForAsyncLocalMount(t *testing.T, service *LocalMountService) {
+func newLocalMountServiceResources(t *testing.T) *memory.CoreResourcesRepo {
 	t.Helper()
-	deadline := time.After(time.Second)
-	for {
-		service.asyncMu.Lock()
-		running := service.asyncRun
-		service.asyncMu.Unlock()
-		if !running {
-			return
+	ctx := context.Background()
+	resources := memory.NewCoreResourcesRepo()
+	library, err := domain.NewVirtualLibrary("lib-a", "Library A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resources.CreateLibrary(ctx, library); err != nil {
+		t.Fatal(err)
+	}
+	for slot, id := range []string{"drive-b", "drive-a"} {
+		drive, err := domain.NewVirtualDrive(id, library.LibraryID, slot+1)
+		if err != nil {
+			t.Fatal(err)
 		}
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for async sync to drain")
-		case <-time.After(10 * time.Millisecond):
+		if err := resources.CreateDrive(ctx, drive); err != nil {
+			t.Fatal(err)
 		}
 	}
+	return resources
 }
 
-func hasLocalMountCommand(commands []string, want string) bool {
-	for _, command := range commands {
-		if command == want {
-			return true
-		}
-	}
-	return false
+type failingPoolReader struct{}
+
+func (failingPoolReader) GetPool(context.Context, string) (*domain.StoragePoolRuntime, error) {
+	return nil, domain.ErrNotFound
 }

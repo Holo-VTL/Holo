@@ -174,6 +174,7 @@ export function TargetsPage() {
   const [localMount, setLocalMount] = useState<LocalMountStatus | null>(null);
   const [error, setError] = useState("");
   const [mountBusy, setMountBusy] = useState(false);
+  const mountPollInFlight = useRef(false);
   const [publicationAction, setPublicationAction] = useState<PublicationAction | null>(null);
   const [publicationActionBusy, setPublicationActionBusy] = useState(false);
 
@@ -213,7 +214,7 @@ export function TargetsPage() {
     try {
       const status = await api.targets.setLocalMount(enabled);
       setLocalMount(status);
-      push(t("messages.requestSuccess"), "success");
+      push(t("targets.localMountAccepted"), "success");
     } catch (err) {
       push((err as Error).message || t("messages.requestFailed"), "error");
     } finally {
@@ -253,6 +254,18 @@ export function TargetsPage() {
   useEffect(() => {
     void reloadAll();
   }, []);
+  useEffect(() => {
+    if (!localMount || (!localMount.enabled && localMount.state !== "disconnecting")) return undefined;
+    const timer = window.setInterval(() => {
+      if (mountPollInFlight.current) return;
+      mountPollInFlight.current = true;
+      void api.targets.localMountStatus()
+        .then(setLocalMount)
+        .catch(() => undefined)
+        .finally(() => { mountPollInFlight.current = false; });
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [localMount?.enabled, localMount?.state]);
   const targetRows = makeTargetRows(publications, securityTargets);
 
   const connectedHostsLabels = {
@@ -279,7 +292,7 @@ export function TargetsPage() {
             <span className="switch-label">{t("targets.mountLocally")}</span>
           </label>
         </div>
-        {localMount?.lastError ? <p className="notice notice-error">{localMount.lastError}</p> : null}
+        {localMount?.lastError ? <p className="notice notice-error">{t(`targets.localMountReasons.${localMount.lastError}`, { defaultValue: localMount.lastError })}</p> : null}
       </div>
 
       {error ? <p className="notice notice-error">{error}</p> : null}

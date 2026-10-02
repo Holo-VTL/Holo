@@ -31,10 +31,15 @@ func (h *TargetDiscoveryHandler) handleDiscovery(w http.ResponseWriter, r *http.
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
+	actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+	if err != nil {
+		respondResourceError(w, err)
+		return
+	}
 
 	req := domain.TargetDiscoveryRequest{
 		Initiator: r.URL.Query().Get("initiator"),
-		Actor:     r.URL.Query().Get("actor"),
+		Actor:     actor,
 		Portal:    r.URL.Query().Get("portal"),
 	}
 	results, err := h.service.Discover(r.Context(), req)
@@ -54,8 +59,13 @@ func (h *TargetDiscoveryHandler) handleVisible(w http.ResponseWriter, r *http.Re
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
+	actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+	if err != nil {
+		respondResourceError(w, err)
+		return
+	}
 	initiator := r.URL.Query().Get("initiator")
-	publications, err := h.service.VisiblePublications(r.Context(), initiator, r.URL.Query().Get("actor"))
+	publications, err := h.service.VisiblePublications(r.Context(), initiator, actor)
 	if err != nil {
 		respondResourceError(w, err)
 		return

@@ -8,11 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
-	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
-	"github.com/Holo-VTL/Holo/control-plane/internal/orchestration"
-	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 )
 
 type apiLocalMountSettings struct{ enabled bool }
@@ -68,6 +63,75 @@ func TestTargetPublicationEndpoints(t *testing.T) {
 		return
 	}
 	t.Fatalf("expected published drive target in response, got %+v", publications)
+}
+
+func TestTargetPublicationActorClaimIsNotTrustedSystemAndUnsafeClaimIsRejected(t *testing.T) {
+	srv := newTestServer(t)
+	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-audit-actor","poolName":"pool-audit-actor","capacityBytes":1073741824,"libraryId":"lib-audit-actor","libraryName":"lib-audit-actor","driveId":"drive-audit-actor","driveSlot":1,"cartridgeId":"car-audit-actor","barcode":"B901"}`))
+	chainResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(chainResp, chainReq)
+	if chainResp.Code != http.StatusCreated {
+		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
+	}
+
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-audit-actor","driveId":"drive-audit-actor","cartridgeId":"car-audit-actor","targetIqn":"iqn.2026-04.ai.holo:audit-actor","actor":"system"}`))
+	pubResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(pubResp, pubReq)
+	if pubResp.Code != http.StatusAccepted {
+		t.Fatalf("expected publish accepted, got %d body=%s", pubResp.Code, pubResp.Body.String())
+	}
+
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if auditResp.Code != http.StatusOK || !strings.Contains(auditResp.Body.String(), `"actor":"self-asserted:system"`) {
+		t.Fatalf("expected user-supplied system claim to be marked self-asserted, status=%d body=%s", auditResp.Code, auditResp.Body.String())
+	}
+
+	badReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-audit-actor","driveId":"drive-audit-actor","cartridgeId":"car-audit-actor","targetIqn":"iqn.2026-04.ai.holo:bad-audit-actor","actor":"bad\nactor"}`))
+	badResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(badResp, badReq)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe actor to return 400, got %d body=%s", badResp.Code, badResp.Body.String())
+	}
+	listReq := newAuthedRequest(http.MethodGet, "/v1/targets/publications?history=all", nil)
+	listResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(listResp, listReq)
+	if strings.Contains(listResp.Body.String(), "bad-audit-actor") {
+		t.Fatalf("unsafe actor request created a publication, body=%s", listResp.Body.String())
+	}
+}
+
+func TestTargetRollbackLabelsActorClaim(t *testing.T) {
+	srv := newTestServer(t)
+	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-rollback-actor","poolName":"pool-rollback-actor","capacityBytes":1073741824,"libraryId":"lib-rollback-actor","libraryName":"lib-rollback-actor","driveId":"drive-rollback-actor","driveSlot":1,"cartridgeId":"car-rollback-actor","barcode":"B902"}`))
+	chainResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(chainResp, chainReq)
+	if chainResp.Code != http.StatusCreated {
+		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
+	}
+
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-rollback-actor","driveId":"drive-rollback-actor","cartridgeId":"car-rollback-actor","targetIqn":"iqn.2026-04.ai.holo:rollback-actor","actor":"tester"}`))
+	pubResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(pubResp, pubReq)
+	if pubResp.Code != http.StatusAccepted {
+		t.Fatalf("expected publish accepted, got %d body=%s", pubResp.Code, pubResp.Body.String())
+	}
+	publicationID := decodePublicationID(t, pubResp)
+
+	rollbackReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications/"+publicationID+"/rollback?actor=system", nil)
+	rollbackResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rollbackResp, rollbackReq)
+	if rollbackResp.Code != http.StatusOK {
+		t.Fatalf("expected rollback 200, got %d body=%s", rollbackResp.Code, rollbackResp.Body.String())
+	}
+
+	auditReq := newAuthedRequest(http.MethodGet, "/v1/audit/events", nil)
+	auditResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(auditResp, auditReq)
+	if !strings.Contains(auditResp.Body.String(), `"actor":"self-asserted:system"`) {
+		t.Fatalf("expected rollback actor claim to be self-asserted, body=%s", auditResp.Body.String())
+	}
 }
 
 func TestTargetPublicationRejectsNilBody(t *testing.T) {
@@ -245,8 +309,8 @@ func TestTargetLocalMountEndpointsPersistToggle(t *testing.T) {
 	postReq := newAuthedRequest(http.MethodPost, "/v1/targets/local-mount", bytes.NewBufferString(`{"enabled":true,"actor":"tester"}`))
 	postResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(postResp, postReq)
-	if postResp.Code != http.StatusOK {
-		t.Fatalf("expected local mount enable 200, got %d body=%s", postResp.Code, postResp.Body.String())
+	if postResp.Code != http.StatusAccepted {
+		t.Fatalf("expected local mount enable 202, got %d body=%s", postResp.Code, postResp.Body.String())
 	}
 	var enabledPayload map[string]any
 	if err := json.Unmarshal(postResp.Body.Bytes(), &enabledPayload); err != nil {
@@ -255,42 +319,19 @@ func TestTargetLocalMountEndpointsPersistToggle(t *testing.T) {
 	if enabled, _ := enabledPayload["enabled"].(bool); !enabled {
 		t.Fatalf("expected local mount enabled: %s", postResp.Body.String())
 	}
+	if state, _ := enabledPayload["state"].(string); state != "connecting" {
+		t.Fatalf("202 must report accepted intent, not completion: %s", postResp.Body.String())
+	}
 }
 
-func TestTargetLocalMountStatusReportsProtectedTargetSkipReason(t *testing.T) {
-	ctx := context.Background()
-	const iqn = "iqn.2026-04.cloud.backupnext.holo:drive-local-skip"
-	targetRepo := memory.NewTargetRuntimeRepo()
-	publication, err := domain.NewTargetPublication("pub-local-skip", "pool-a", "lib-a", "drive-a", "cart-a", iqn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := publication.MarkReady("192.0.2.10:3260"); err != nil {
-		t.Fatal(err)
-	}
-	if err := targetRepo.SavePublication(ctx, publication); err != nil {
-		t.Fatal(err)
-	}
-	securityRepo := memory.NewISCSISecurityRepo()
-	if err := securityRepo.RegisterTarget(ctx, iqn, "lib-a", "drive-a", "drive"); err != nil {
-		t.Fatal(err)
-	}
-	credential := domain.ISCSICredential{CredentialID: "cred-local-skip", Label: "Backup", Username: "backup-user", EncryptedSecret: make([]byte, 64), Version: 1}
-	if err := securityRepo.CreateCredential(ctx, credential); err != nil {
-		t.Fatal(err)
-	}
-	if err := securityRepo.SaveBinding(ctx, domain.ISCSISecurityBinding{
-		Scope: domain.SecurityScopeLibrary, OwnerID: "lib-a", Generation: 1,
-		Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthCHAP, CredentialID: credential.CredentialID, Initiators: []string{"iqn.1991-05.com.microsoft:backup"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	localMount := orchestration.NewLocalMountService(&apiLocalMountSettings{enabled: true}, targetRepo, audit.NewMemoryWriter(), orchestration.TargetRuntimeConfig{Mode: "tcmu", PortalHost: "192.0.2.10", PortalPort: 3260})
-	localMount.SetISCSISecurityService(orchestration.NewISCSISecurityService(securityRepo, nil, nil, nil))
-	handler := NewTargetHandlerWithLocalMount(nil, localMount)
-	response := httptest.NewRecorder()
-	handler.handleLocalMount(response, httptest.NewRequest(http.MethodGet, "/v1/targets/local-mount", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"reason":"protected-iscsi-target"`) || !strings.Contains(response.Body.String(), iqn) {
-		t.Fatalf("local mount API omitted the protected target skip reason: status=%d body=%s", response.Code, response.Body.String())
+func TestTargetLocalMountRequiresExplicitEnabledBoolean(t *testing.T) {
+	srv := newTestServer(t)
+	for _, body := range []string{`{}`, `{"enabled":null}`} {
+		request := newAuthedRequest(http.MethodPost, "/v1/targets/local-mount", bytes.NewBufferString(body))
+		response := httptest.NewRecorder()
+		srv.Router().ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("expected missing/null enabled to return 400, body=%s status=%d", body, response.Code)
+		}
 	}
 }

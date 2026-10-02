@@ -284,9 +284,11 @@ export function ResourceManagePage() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [createCartridgeOpen, createDriveOpen]);
 
-  async function reloadAll() {
+  async function reloadAll(showLoading = false) {
     setError("");
-    setLoading(true);
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const [libRows, driveRows, cartRows, poolRows] = await Promise.all([
         api.resources.listLibraries(),
@@ -306,7 +308,7 @@ export function ResourceManagePage() {
   }
 
   useEffect(() => {
-    void reloadAll();
+    void reloadAll(true);
   }, [libraryId]);
 
   async function createDrive(event: FormEvent) {

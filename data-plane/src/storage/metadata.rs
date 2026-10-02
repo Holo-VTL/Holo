@@ -7,7 +7,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::blk_map::BlkMapRecord;
-use super::layout::{checksum32, SegmentKind};
+use super::layout::{checksum32, sanitize_id, SegmentKind};
 use super::map_lookup::MapLookupRecord;
 use super::segment::{read_segment_file, write_segment_file};
 
@@ -204,6 +204,36 @@ pub fn storage_root_dir() -> PathBuf {
     PathBuf::from("/tmp/holo-storage")
 }
 
+pub fn storage_root_dir_for_cartridge(cartridge_id: &str) -> PathBuf {
+	let media_state_dir = env::var("HOLO_MEDIA_STATE_DIR")
+		.map(PathBuf::from)
+		.unwrap_or_else(|_| PathBuf::from("/run/holo/media-state"));
+	let pool_root_base = env::var("HOLO_STORAGE_POOL_ROOT_BASE")
+		.ok()
+		.map(PathBuf::from);
+	resolve_cartridge_storage_root(cartridge_id, &media_state_dir, &storage_root_dir(), pool_root_base.as_deref())
+}
+
+fn resolve_cartridge_storage_root(
+	cartridge_id: &str,
+	media_state_dir: &Path,
+	fallback_root: &Path,
+	pool_root_base: Option<&Path>,
+) -> PathBuf {
+	let metadata_path = media_state_dir.join(format!("cartridge_{}.meta", sanitize_id(cartridge_id)));
+	let Ok(raw) = fs::read_to_string(metadata_path) else {
+		return fallback_root.to_path_buf();
+	};
+	let pool_id = raw.lines().find_map(|line| {
+		let (key, value) = line.trim().split_once('=')?;
+		(key.trim() == "pool_id" && !value.trim().is_empty()).then(|| value.trim())
+	});
+	let (Some(pool_id), Some(base)) = (pool_id, pool_root_base) else {
+		return fallback_root.to_path_buf();
+	};
+	base.join(sanitize_id(pool_id))
+}
+
 pub fn persist_checkpoint_page(
     path: &Path,
     checkpoint: &MetadataCheckpoint,
@@ -221,6 +251,39 @@ pub fn persist_checkpoint_page(
 pub fn load_checkpoint_page(path: &Path) -> Result<MetadataCheckpoint, StorageError> {
     let (_, payload) = read_segment_file(path, SegmentKind::Metadata)?;
     MetadataCheckpoint::decode(&payload)
+}
+
+#[cfg(test)]
+mod local_mount_pool_tests {
+	use super::resolve_cartridge_storage_root;
+	use std::fs;
+
+	#[test]
+	fn resolves_loaded_cartridge_to_its_pool_root() {
+		let root = std::env::temp_dir().join(format!("holo-pool-route-{}", std::process::id()));
+		let state_dir = root.join("media-state");
+		let pool_base = root.join("pools");
+		let fallback = root.join("fallback");
+		fs::create_dir_all(&state_dir).expect("create state dir");
+		fs::write(state_dir.join("cartridge_tape001.meta"), "pool_id=pool-a\n").expect("write media map");
+
+		let resolved = resolve_cartridge_storage_root("TAPE001", &state_dir, &fallback, Some(&pool_base));
+		assert_eq!(resolved, pool_base.join("pool-a"));
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn missing_pool_metadata_keeps_existing_storage_root_behavior() {
+		let root = std::env::temp_dir().join(format!("holo-pool-fallback-{}", std::process::id()));
+		let state_dir = root.join("media-state");
+		let fallback = root.join("fallback");
+		fs::create_dir_all(&state_dir).expect("create state dir");
+		fs::write(state_dir.join("cartridge_tape002.meta"), "capacity_bytes=1024\n").expect("write legacy metadata");
+
+		let resolved = resolve_cartridge_storage_root("TAPE002", &state_dir, &fallback, Some(&root.join("pools")));
+		assert_eq!(resolved, fallback);
+		let _ = fs::remove_dir_all(root);
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

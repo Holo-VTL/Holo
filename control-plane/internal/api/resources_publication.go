@@ -31,6 +31,7 @@ func (h *ResourcesHandler) ensureLibraryAutoPublications(ctx context.Context, li
 		}
 	}
 	if len(drives) == 0 {
+		h.syncLocalMount("system")
 		return nil
 	}
 	sort.Slice(drives, func(i, j int) bool {
@@ -47,6 +48,7 @@ func (h *ResourcesHandler) ensureLibraryAutoPublications(ctx context.Context, li
 		}
 	}
 	if len(cartridges) == 0 {
+		h.syncLocalMount("system")
 		return nil
 	}
 	sort.Slice(cartridges, func(i, j int) bool {
@@ -129,6 +131,7 @@ func (h *ResourcesHandler) ensureLibraryAutoPublications(ctx context.Context, li
 			return err
 		}
 	}
+	h.syncLocalMount("system")
 	return nil
 }
 

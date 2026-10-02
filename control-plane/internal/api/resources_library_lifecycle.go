@@ -81,6 +81,7 @@ func (h *ResourcesHandler) deleteLibraryCascade(ctx context.Context, libraryID s
 	if err := h.repo.DeleteLibrary(ctx, libraryID); err != nil {
 		return err
 	}
+	h.syncLocalMount("web-console")
 	unlock()
 	locked = false
 	h.slotLocksMu.Lock()

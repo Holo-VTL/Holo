@@ -43,6 +43,13 @@ func TestTargetDiscoveryEndpoints(t *testing.T) {
 		t.Fatalf("expected discovery to exclude publicationB, got %s", discoverResp.Body.String())
 	}
 
+	visibleReq := newAuthedRequest(http.MethodGet, "/v1/targets/visible?initiator="+initiator+"&actor=system", nil)
+	visibleResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(visibleResp, visibleReq)
+	if visibleResp.Code != http.StatusOK {
+		t.Fatalf("expected visible publication query 200, got %d body=%s", visibleResp.Code, visibleResp.Body.String())
+	}
+
 	unpublishReq := newAuthedRequest(http.MethodDelete, "/v1/targets/publications/"+publicationA+"?actor=tester", nil)
 	unpublishResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(unpublishResp, unpublishReq)
@@ -78,6 +85,9 @@ func TestTargetDiscoveryEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(auditResp.Body.String(), "discover_targets") {
 		t.Fatalf("expected audit events to include discover_targets action, got %s", auditResp.Body.String())
+	}
+	if !strings.Contains(auditResp.Body.String(), "query_visible_publications") || !strings.Contains(auditResp.Body.String(), `"actor":"self-asserted:system"`) {
+		t.Fatalf("expected visible query actor claim to remain self-asserted, got %s", auditResp.Body.String())
 	}
 }
 

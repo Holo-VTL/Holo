@@ -416,7 +416,7 @@ export function IscsiSecurityForm({ scope, ownerId, title, open, onClose, modalO
                 </>
               )}
               {preview ? (
-                <div className="notice">
+                <div className="modal-notice modal-notice-stack" role="alert">
                   <strong>{t("iscsiSecurity.previewTitle")}</strong>
                   {preview.map((item) => (
                     <p key={item.targetIqn}>

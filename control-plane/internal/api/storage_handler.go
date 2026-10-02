@@ -76,11 +76,16 @@ func (h *StorageHandler) handlePools(w http.ResponseWriter, r *http.Request) {
 			respondStorageError(w, err)
 			return
 		}
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondStorageError(w, err)
+			return
+		}
 		pool, err := h.svc.CreatePool(r.Context(), orchestration.CreateStoragePoolRequest{
 			PoolID:              strings.TrimSpace(req.PoolID),
 			Name:                strings.TrimSpace(req.Name),
 			WarningThresholdPct: req.WarningThresholdPct,
-			Actor:               strings.TrimSpace(req.Actor),
+			Actor:               actor,
 		})
 		if err != nil {
 			respondStorageError(w, err)
@@ -124,10 +129,14 @@ func (h *StorageHandler) handlePoolDeleteAction(w http.ResponseWriter, r *http.R
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
+	actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+	if err != nil {
+		respondStorageError(w, err)
+		return
+	}
 	if !h.reconcileStorageView(w, r) {
 		return
 	}
-	actor := strings.TrimSpace(r.URL.Query().Get("actor"))
 	if err := h.svc.DeletePool(r.Context(), poolID, actor); err != nil {
 		respondStorageError(w, err)
 		return
@@ -148,10 +157,14 @@ func (h *StorageHandler) handlePoolByID(w http.ResponseWriter, r *http.Request, 
 		}
 		respondJSON(w, http.StatusOK, pool)
 	case http.MethodDelete:
+		actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+		if err != nil {
+			respondStorageError(w, err)
+			return
+		}
 		if !h.reconcileStorageView(w, r) {
 			return
 		}
-		actor := strings.TrimSpace(r.URL.Query().Get("actor"))
 		if err := h.svc.DeletePool(r.Context(), poolID, actor); err != nil {
 			respondStorageError(w, err)
 			return
@@ -188,22 +201,24 @@ func (h *StorageHandler) handlePoolDiskManagement(w http.ResponseWriter, r *http
 		respondStorageError(w, err)
 		return
 	}
+	actor, err := selfAssertedAuditActor(req.Actor)
+	if err != nil {
+		respondStorageError(w, err)
+		return
+	}
 	if domain.ValidateDevicePath(req.DevicePath) != nil {
 		respondStorageError(w, domain.ErrInvalidInput)
 		return
 	}
 
-	var (
-		pool *domain.StoragePoolRuntime
-		err  error
-	)
+	var pool *domain.StoragePoolRuntime
 	if action == "detach" && !h.reconcileStorageView(w, r) {
 		return
 	}
 	if action == "attach" {
-		pool, err = h.svc.AttachDisk(r.Context(), poolID, req.DevicePath, req.Actor)
+		pool, err = h.svc.AttachDisk(r.Context(), poolID, req.DevicePath, actor)
 	} else {
-		pool, err = h.svc.DetachDisk(r.Context(), poolID, req.DevicePath, req.Actor)
+		pool, err = h.svc.DetachDisk(r.Context(), poolID, req.DevicePath, actor)
 	}
 	if err != nil {
 		respondStorageError(w, err)

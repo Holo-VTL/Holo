@@ -74,7 +74,7 @@ Options:
   --portal-host HOST        iSCSI portal host (default: auto-detect)
   --portal-port PORT        iSCSI portal port (default: 3260)
   --no-firewall             Do not open firewall ports automatically
-  --with-validation-tools   Install jq/lsscsi/sg3-utils etc.
+  --with-validation-tools   Install curl/jq/lsscsi and other operator validation tools
   --build-tcmu-plugin       Build handler_holo.so on host
   --plugin-source-dir PATH  tcmu-runner source for --build-tcmu-plugin
   --control-plane PATH      Override control-plane binary path
@@ -89,6 +89,7 @@ Required bundle layout (beside this script):
   ./holo-tcmu-handler
   ./web-console/dist/index.html
   ./handler_holo.so          (unless --build-tcmu-plugin)
+  ./holo-local-loopback-helper.py
 USAGE
 }
 
@@ -324,6 +325,9 @@ validate_artifacts() {
   if [[ "${BUILD_TCMU_PLUGIN}" == "1" ]]; then
     [[ -f "${BUNDLE_DIR}/handler_holo.c" || -f "${SCRIPT_DIR}/../infra/tcmu/handler_holo.c" ]] || missing+=("handler_holo.c")
   fi
+  if [[ ! -f "${BUNDLE_DIR}/holo-local-loopback-helper.py" && ! -f "${SCRIPT_DIR}/../infra/iscsi/holo-local-loopback-helper.py" ]]; then
+    missing+=("holo-local-loopback-helper.py")
+  fi
   if [[ "${#missing[@]}" -gt 0 ]]; then
     printf '[holo-install][error] missing required release artifacts:\n' >&2
     printf '  - %s\n' "${missing[@]}" >&2
@@ -512,8 +516,8 @@ build_package_plan() {
   case "${PKG_MANAGER}" in
     apt)
       REPO_ACTIONS=("apt-get update")
-      RUNTIME_PACKAGES=(kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi)
-      VALIDATION_PACKAGES=(curl jq lsscsi sg3-utils open-iscsi)
+      RUNTIME_PACKAGES=(kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi sg3-utils)
+      VALIDATION_PACKAGES=(curl jq lsscsi open-iscsi)
       BUILD_PACKAGES=(gcc make pkg-config dpkg-dev libtcmu-dev)
       ;;
     dnf)
@@ -538,7 +542,7 @@ build_package_plan() {
             REPO_ACTIONS=()
             ;;
         esac
-        RUNTIME_PACKAGES=(kmod sudo targetcli xfsprogs iscsi-initiator-utils)
+        RUNTIME_PACKAGES=(kmod sudo targetcli xfsprogs iscsi-initiator-utils sg3_utils)
       else
         case "${OS_ID}:${OS_MAJOR}" in
           rhel:8)
@@ -583,18 +587,18 @@ build_package_plan() {
             )
             ;;
         esac
-        RUNTIME_PACKAGES=(kmod sudo targetcli tcmu-runner xfsprogs iscsi-initiator-utils)
+        RUNTIME_PACKAGES=(kmod sudo targetcli tcmu-runner xfsprogs iscsi-initiator-utils sg3_utils)
       fi
       if [[ "${OS_MAJOR}" == "10" ]]; then
         RUNTIME_PACKAGES=(kmod sudo "kernel-modules-$(uname -r)" "${RUNTIME_PACKAGES[@]:2}")
       fi
-      VALIDATION_PACKAGES=(curl jq lsscsi sg3_utils iscsi-initiator-utils)
+      VALIDATION_PACKAGES=(curl jq lsscsi iscsi-initiator-utils)
       BUILD_PACKAGES=(gcc make pkgconfig rpm-build rpmdevtools tcmu-runner-devel)
       ;;
     zypper)
       REPO_ACTIONS=()
-      RUNTIME_PACKAGES=(kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi)
-      VALIDATION_PACKAGES=(curl jq lsscsi sg3_utils open-iscsi)
+      RUNTIME_PACKAGES=(kernel-default kmod sudo xfsprogs util-linux-systemd python3-targetcli-fb tcmu-runner open-iscsi sg3_utils)
+      VALIDATION_PACKAGES=(curl jq lsscsi open-iscsi)
       BUILD_PACKAGES=(gcc make pkg-config)
       ;;
     *)
@@ -895,13 +899,16 @@ ensure_user_and_dirs() {
   run_cmd chmod 0700 "${CONFIG_DIR}/iscsi"
   run_cmd chown root:"${SERVICE_GROUP}" "${CONFIG_DIR}"
   run_cmd chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}" "${LOG_DIR}"
+  run_cmd mkdir -p "${DATA_DIR}/local-loopback"
+  run_cmd chown root:root "${DATA_DIR}/local-loopback"
+  run_cmd chmod 0700 "${DATA_DIR}/local-loopback"
   run_cmd chmod 0750 "${CONFIG_DIR}"
 }
 
 load_kernel_modules() {
   log "Loading LIO/TCMU kernel modules"
   local module hint
-  for module in target_core_mod target_core_user iscsi_target_mod; do
+  for module in target_core_mod target_core_user iscsi_target_mod tcm_loop; do
     if [[ "${DRY_RUN}" == "1" ]]; then
       printf '[dry-run][verify-module] %s (package: %s)\n' "${module}" "$(kernel_module_hint "${module}")"
       run_cmd modprobe "${module}"
@@ -1302,6 +1309,25 @@ write_iscsi_security_helper() {
   rm -f "${helper_tmp}"
 }
 
+write_local_loopback_helper() {
+  log "Installing local loopback privilege helper"
+  local source helper_tmp helper_path
+  source="${BUNDLE_DIR}/holo-local-loopback-helper.py"
+  if [[ ! -f "${source}" ]]; then
+    source="${SCRIPT_DIR}/../infra/iscsi/holo-local-loopback-helper.py"
+  fi
+  [[ -f "${source}" ]] || die "local loopback helper source is missing"
+  helper_tmp="$(mktemp)"
+  helper_path="${PREFIX}/bin/holo-local-loopback-helper"
+  cp "${source}" "${helper_tmp}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] install -m 0750 -o root -g root ${helper_path}"
+  else
+    install -m 0750 -o root -g root "${helper_tmp}" "${helper_path}"
+  fi
+  rm -f "${helper_tmp}"
+}
+
 write_support_helper() {
   log "Writing support bundle privilege helper"
   local helper_tmp helper_path
@@ -1650,10 +1676,12 @@ Defaults:${SERVICE_USER} !requiretty
 Defaults:${SERVICE_USER} !pam_session
 Defaults:${SERVICE_USER} env_keep += "HOLO_CONFIG_DIR"
 Defaults!${PREFIX}/bin/holo-iscsi-security-helper !log_input, !log_output
+Defaults!${PREFIX}/bin/holo-local-loopback-helper !log_input, !log_output
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-storage-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-targetcli-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-iscsi-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-iscsi-security-helper
+${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-local-loopback-helper
 ${SERVICE_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/holo-support-helper
 EOF
 
@@ -1853,7 +1881,84 @@ EOF
 
 # ── Uninstall ───────────────────────────────────────────────────────
 
+cleanup_local_loopback_mappings() {
+  log "Cleaning Holo-owned local loopback mappings before shared backstores"
+  local helper_path="${PREFIX}/bin/holo-local-loopback-helper"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] would remove only mappings listed by the ownership helper: ${helper_path}"
+    return 0
+  fi
+
+  if [[ ! -x "${helper_path}" ]]; then
+    if [[ -d /var/lib/holo/local-loopback ]] && find /var/lib/holo/local-loopback -maxdepth 1 -type f -name '*.json' -print -quit | grep -q .; then
+      die "owned local loopback mappings exist but ${helper_path} is unavailable; refusing to remove shared backstores"
+    fi
+    return 0
+  fi
+
+  python3 - "${helper_path}" <<'PY'
+import json
+import subprocess
+import sys
+
+helper = sys.argv[1]
+
+def call(operation, mapping=None):
+    request = {"version": 1, "operation": operation}
+    if mapping is not None:
+        request["mapping"] = mapping
+    result = subprocess.run(
+        [helper], input=json.dumps(request), text=True,
+        capture_output=True, timeout=15, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("ownership helper invocation failed")
+    try:
+        response = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        raise RuntimeError("ownership helper response was invalid") from None
+    if response.get("version") != 1 or response.get("ok") is not True:
+        reason = response.get("reason")
+        if reason not in {
+            "invalid_size", "invalid_json", "invalid_envelope", "invalid_schema",
+            "unsupported_operation", "invalid_mapping", "mapping_conflict",
+            "backend_not_ready", "device_busy", "operation_timeout",
+            "cleanup_failed", "operation_failed", "loopback_unavailable",
+        }:
+            reason = "operation_failed"
+        raise RuntimeError("ownership helper rejected cleanup: " + reason)
+    return response.get("result")
+
+owners = call("list")
+if not isinstance(owners, list):
+    raise RuntimeError("ownership helper returned an invalid mapping list")
+for owner in owners:
+    if not isinstance(owner, dict):
+        raise RuntimeError("ownership helper returned an invalid mapping")
+    devices = owner.get("devices")
+    if not isinstance(devices, list):
+        raise RuntimeError("ownership helper omitted device ownership details")
+    mapping = {
+        "libraryId": owner.get("libraryId"),
+        "targetNaa": owner.get("targetNaa"),
+        "nexusNaa": owner.get("nexusNaa"),
+        "tpgTag": owner.get("tpgTag"),
+        "devices": [],
+    }
+    for device in devices:
+        if not isinstance(device, dict):
+            raise RuntimeError("ownership helper returned an invalid device record")
+        mapping["devices"].append({**device, "state": "cleanup_pending"})
+    call("remove", mapping)
+
+remaining = call("list")
+if not isinstance(remaining, list) or remaining:
+    raise RuntimeError("owned local loopback mappings remain after cleanup")
+PY
+}
+
 cleanup_runtime_targets() {
+  cleanup_local_loopback_mappings
   log "Cleaning Holo-VTL runtime targets"
   run_shell "if command -v targetcli >/dev/null 2>&1; then targetcli /iscsi ls 2>/dev/null | grep -oE 'iqn\\.2026-04\\.[a-z.]+\\.holo:[^ ]+' | while read -r iqn; do targetcli /iscsi delete \"\$iqn\" >/dev/null 2>&1 || true; done; fi"
   run_shell "if command -v targetcli >/dev/null 2>&1; then targetcli /backstores/user:holo ls 2>/dev/null | grep -oE 'holo_pub_[A-Za-z0-9_.:-]+' | while read -r bs; do targetcli /backstores/user:holo delete \"\$bs\" >/dev/null 2>&1 || true; done; fi"
@@ -1966,6 +2071,7 @@ install_or_upgrade_holo() {
   write_targetcli_helper
   write_iscsi_helper
   write_iscsi_security_helper
+  write_local_loopback_helper
   write_support_helper
   write_runtime_config
   write_systemd_units

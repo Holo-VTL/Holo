@@ -735,6 +735,7 @@ func writeDriveMediaState(libraryID, driveID, cartridgeID string) error {
 type cartridgeMetadata struct {
 	CapacityBytes int64
 	UsedBytes     int64
+	PoolID        string
 }
 
 func cartridgeMetadataLabels(cartridge *domain.VirtualCartridge) []string {
@@ -777,11 +778,17 @@ func readCartridgeMetadata(cartridge *domain.VirtualCartridge) (*cartridgeMetada
 			if !ok {
 				continue
 			}
-			parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if key == "pool_id" {
+				meta.PoolID = value
+				continue
+			}
+			parsed, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
 				continue
 			}
-			switch strings.TrimSpace(key) {
+			switch key {
 			case "capacity_bytes":
 				meta.CapacityBytes = parsed
 			case "used_bytes":
@@ -814,6 +821,7 @@ func writeCartridgeMetadata(cartridge *domain.VirtualCartridge) error {
 		}
 	}
 	payload := "cartridge_id=" + strings.TrimSpace(cartridge.CartridgeID) + "\n" +
+		"pool_id=" + strings.TrimSpace(cartridge.PoolID) + "\n" +
 		"capacity_bytes=" + strconv.FormatInt(capacityBytes, 10) + "\n" +
 		"used_bytes=" + strconv.FormatInt(usedBytes, 10) + "\n"
 	for _, label := range cartridgeMetadataLabels(cartridge) {

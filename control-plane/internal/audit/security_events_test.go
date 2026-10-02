@@ -23,10 +23,10 @@ func TestSecurityEventEmittersWriteExpectedEvents(t *testing.T) {
 		t.Fatalf("expected four audit events, got %d", len(events))
 	}
 	want := []Event{
-		{Actor: "operator", Action: "access_denied", ObjectType: "target", ObjectID: "target-a", Result: "failure"},
-		{Actor: "operator", Action: "retention_blocked", ObjectType: "cartridge", ObjectID: "cart-a", Result: "failure"},
+		{Actor: "self-asserted:operator", Action: "access_denied", ObjectType: "target", ObjectID: "target-a", Result: "failure"},
+		{Actor: "self-asserted:operator", Action: "retention_blocked", ObjectType: "cartridge", ObjectID: "cart-a", Result: "failure"},
 		{Actor: "system", Action: "publish", ObjectType: "target_publication", ObjectID: "pub-a", Result: "success"},
-		{Actor: "scanner", Action: "discovery", ObjectType: "target_discovery", ObjectID: "target-a", Result: "failure"},
+		{Actor: "self-asserted:scanner", Action: "discovery", ObjectType: "target_discovery", ObjectID: "target-a", Result: "failure"},
 	}
 	for i := range want {
 		if events[i].Actor != want[i].Actor || events[i].Action != want[i].Action || events[i].ObjectType != want[i].ObjectType || events[i].ObjectID != want[i].ObjectID || events[i].Result != want[i].Result {

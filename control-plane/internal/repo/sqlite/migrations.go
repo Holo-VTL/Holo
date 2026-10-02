@@ -271,6 +271,35 @@ ALTER TABLE drive_iscsi_security ADD COLUMN restrict_initiators INTEGER NOT NULL
 ALTER TABLE target_iscsi_security ADD COLUMN restrict_initiators INTEGER NOT NULL DEFAULT 0 CHECK(restrict_initiators IN (0, 1));
 `,
 	},
+	{
+		version: 10,
+		sql: `
+CREATE TABLE IF NOT EXISTS local_loopback_libraries (
+  library_id TEXT PRIMARY KEY,
+  target_naa TEXT NOT NULL UNIQUE,
+  nexus_naa TEXT NOT NULL UNIQUE,
+  tpg_tag INTEGER NOT NULL CHECK(tpg_tag = 1)
+);
+
+CREATE TABLE IF NOT EXISTS local_loopback_devices (
+  device_key TEXT PRIMARY KEY,
+  library_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('changer', 'drive')),
+  drive_id TEXT,
+  lun_index INTEGER NOT NULL,
+  identity_ref TEXT NOT NULL UNIQUE,
+  backend_ref TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK(state IN ('active', 'cleanup_pending', 'inactive')),
+  FOREIGN KEY(library_id) REFERENCES local_loopback_libraries(library_id) ON DELETE RESTRICT,
+  UNIQUE(library_id, lun_index),
+  CHECK((kind = 'changer' AND device_key = 'changer:' || library_id AND drive_id IS NULL AND lun_index = 0) OR
+        (kind = 'drive' AND drive_id IS NOT NULL AND device_key = 'drive:' || drive_id AND lun_index BETWEEN 1 AND 65535))
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_loopback_devices_library
+  ON local_loopback_devices(library_id, device_key);
+`,
+	},
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {

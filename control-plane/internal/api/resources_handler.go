@@ -59,6 +59,10 @@ type resourceTargetService interface {
 	Unpublish(ctx context.Context, publicationID, actor string) (*domain.TargetPublication, error)
 }
 
+type resourceLocalMountSync interface {
+	SyncLocalMountAsync(string)
+}
+
 func NewResourcesHandler(repo coreResourcesRepo, storage resourceStoragePoolService, target resourceTargetService) *ResourcesHandler {
 	return &ResourcesHandler{repo: repo, storage: storage, target: target}
 }
@@ -84,6 +88,12 @@ func (h *ResourcesHandler) lockLibrarySlots(libraryID string) func() {
 	h.slotLocksMu.Unlock()
 	mu.Lock()
 	return mu.Unlock
+}
+
+func (h *ResourcesHandler) syncLocalMount(actor string) {
+	if syncer, ok := h.target.(resourceLocalMountSync); ok {
+		syncer.SyncLocalMountAsync(actor)
+	}
 }
 
 func (h *ResourcesHandler) logCompensationError(ctx context.Context, operation string, err error, fields ...any) {
@@ -219,6 +229,7 @@ func (h *ResourcesHandler) handleLibraries(w http.ResponseWriter, r *http.Reques
 			respondResourceError(w, err)
 			return
 		}
+		h.syncLocalMount("web-console")
 		respondJSON(w, http.StatusCreated, library)
 	case http.MethodGet:
 		respondJSON(w, http.StatusOK, h.repo.ListLibraries(r.Context()))
@@ -284,7 +295,12 @@ func (h *ResourcesHandler) handleLibraryByID(w http.ResponseWriter, r *http.Requ
 			respondResourceError(w, err)
 			return
 		}
-		library, err := h.addLibrarySlots(r.Context(), libraryID, req.Count, req.Actor)
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		library, err := h.addLibrarySlots(r.Context(), libraryID, req.Count, actor)
 		if err != nil {
 			respondResourceError(w, err)
 			return
@@ -438,7 +454,12 @@ func (h *ResourcesHandler) handleDriveByID(w http.ResponseWriter, r *http.Reques
 			respondResourceError(w, err)
 			return
 		}
-		drive, err := h.loadCartridgeIntoDrive(r.Context(), driveID, req.CartridgeID, req.Actor)
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		drive, err := h.loadCartridgeIntoDrive(r.Context(), driveID, req.CartridgeID, actor)
 		if err != nil {
 			respondResourceError(w, err)
 			return
@@ -457,7 +478,12 @@ func (h *ResourcesHandler) handleDriveByID(w http.ResponseWriter, r *http.Reques
 			respondResourceError(w, err)
 			return
 		}
-		drive, err := h.unloadDrive(r.Context(), driveID, req.Actor)
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		drive, err := h.unloadDrive(r.Context(), driveID, actor)
 		if err != nil {
 			respondResourceError(w, err)
 			return
@@ -573,7 +599,7 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 		if expandedSlots {
 			updatedLibrary, findErr := h.repo.FindLibrary(r.Context(), library.LibraryID)
 			if findErr == nil {
-				h.emitLibraryAudit(r.Context(), "web-console", "library_add_slots", updatedLibrary, "success", map[string]any{
+				h.emitLibraryAudit(r.Context(), "self-asserted:web-console", "library_add_slots", updatedLibrary, "success", map[string]any{
 					"addedSlots":  updatedLibrary.SlotCount - originalSlotCount,
 					"slotCount":   updatedLibrary.SlotCount,
 					"reason":      "create_cartridge_expand_slots",
@@ -583,7 +609,7 @@ func (h *ResourcesHandler) handleCartridges(w http.ResponseWriter, r *http.Reque
 				log.Printf("library slot expansion audit skipped library=%s cartridge=%s err=%v", library.LibraryID, cartridge.CartridgeID, findErr)
 			}
 		}
-		h.emitCartridgeAudit(r.Context(), "web-console", "cartridge_create", cartridge, "success", map[string]any{
+		h.emitCartridgeAudit(r.Context(), "self-asserted:web-console", "cartridge_create", cartridge, "success", map[string]any{
 			"assignedSlotAddress": slotAddress,
 			"expandedSlots":       expandedSlots,
 		})
@@ -684,7 +710,7 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			h.annotateCartridgeElementAddresses(r.Context(), []*domain.VirtualCartridge{cartridge})
 			respondJSON(w, http.StatusOK, cartridge)
 		case http.MethodDelete:
-			deleteCartridge("web-console")
+			deleteCartridge("self-asserted:web-console")
 		default:
 			respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		}
@@ -701,7 +727,12 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			respondResourceError(w, err)
 			return
 		}
-		deleteCartridge(req.Actor)
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		deleteCartridge(actor)
 		return
 	}
 
@@ -715,6 +746,12 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			respondResourceError(w, err)
 			return
 		}
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		req.Actor = actor
 		cartridge, err := h.eraseCartridge(r.Context(), cartridgeID, req)
 		if err != nil {
 			respondResourceError(w, err)
@@ -734,7 +771,12 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			respondResourceError(w, err)
 			return
 		}
-		cartridge, err := h.exportCartridge(r.Context(), cartridgeID, req.Actor)
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		cartridge, err := h.exportCartridge(r.Context(), cartridgeID, actor)
 		if err != nil {
 			respondResourceError(w, err)
 			return
@@ -753,7 +795,12 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			respondResourceError(w, err)
 			return
 		}
-		cartridge, err := h.importCartridge(r.Context(), cartridgeID, req.Actor)
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		cartridge, err := h.importCartridge(r.Context(), cartridgeID, actor)
 		if err != nil {
 			respondResourceError(w, err)
 			return
@@ -806,7 +853,7 @@ func (h *ResourcesHandler) handleCreateChain(w http.ResponseWriter, r *http.Requ
 			PoolID:              req.PoolID,
 			Name:                poolName,
 			WarningThresholdPct: 90,
-			Actor:               "system",
+			Actor:               "self-asserted:unspecified",
 		})
 	}
 	if err != nil {
@@ -939,7 +986,7 @@ func (h *ResourcesHandler) emitCartridgeAudit(ctx context.Context, actor, action
 	details["libraryId"] = cartridge.LibraryID
 	evt := audit.Event{
 		EventID:    fmt.Sprintf("%s-%s-%d", action, cartridge.CartridgeID, time.Now().UTC().UnixNano()),
-		Actor:      nonEmpty(strings.TrimSpace(actor), "web-console"),
+		Actor:      audit.NormalizeServiceActor(actor),
 		Action:     action,
 		ObjectType: "cartridge",
 		ObjectID:   cartridge.CartridgeID,
@@ -962,7 +1009,7 @@ func (h *ResourcesHandler) emitLibraryAudit(ctx context.Context, actor, action s
 	details["libraryId"] = library.LibraryID
 	evt := audit.Event{
 		EventID:    fmt.Sprintf("%s-%s-%d", action, library.LibraryID, time.Now().UTC().UnixNano()),
-		Actor:      nonEmpty(strings.TrimSpace(actor), "web-console"),
+		Actor:      audit.NormalizeServiceActor(actor),
 		Action:     action,
 		ObjectType: "library",
 		ObjectID:   library.LibraryID,

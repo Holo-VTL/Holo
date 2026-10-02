@@ -192,6 +192,9 @@ func TestCoreResourceCreateAndQueryEndpoints(t *testing.T) {
 	if !strings.Contains(string(metadataRaw), "capacity_bytes=1073741824") {
 		t.Fatalf("expected cartridge metadata capacity, got %s", string(metadataRaw))
 	}
+	if !strings.Contains(string(metadataRaw), "pool_id=pool-a") {
+		t.Fatalf("expected cartridge metadata pool routing, got %s", string(metadataRaw))
+	}
 
 	listCartridgeReq := newAuthedRequest(http.MethodGet, "/v1/cartridges", nil)
 	listCartridgeResp := httptest.NewRecorder()
@@ -1746,6 +1749,13 @@ func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
 	srv := newTestServer(t)
 
 	setupSlotFlowLibrary(t, srv, "lib-add-slot-audit", "drive-add-slot-audit", 2)
+	unsafeActorReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-slot-audit/slots", bytes.NewBufferString(`{"count":1,"actor":"bad\nactor"}`))
+	unsafeActorResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(unsafeActorResp, unsafeActorReq)
+	if unsafeActorResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe actor 400, got %d body=%s", unsafeActorResp.Code, unsafeActorResp.Body.String())
+	}
+
 	badReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-slot-audit/slots", bytes.NewBufferString(`{"count":-2,"actor":"tester"}`))
 	badResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(badResp, badReq)
@@ -1765,7 +1775,7 @@ func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
 	if auditResp.Code != http.StatusOK {
 		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
 	}
-	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), `"addedSlots":2`) {
+	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), `"addedSlots":2`) || !strings.Contains(auditResp.Body.String(), `"actor":"self-asserted:tester"`) {
 		t.Fatalf("expected add slots audit event, got %s", auditResp.Body.String())
 	}
 }

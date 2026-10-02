@@ -122,9 +122,24 @@ export interface ConnectedHostsSummary {
 
 export interface LocalMountStatus {
   enabled: boolean;
-  desiredIqns: string[];
-  mountedIqns: string[];
-  skippedTargets?: Array<{ targetIqn: string; reason: string }>;
+  state: "disabled" | "connecting" | "connected" | "partial" | "failed" | "disconnecting";
+  desiredDeviceCount: number;
+  connectedDeviceCount: number;
+  residualDeviceCount: number;
+  devices: Array<{
+    deviceKey: string;
+    kind: "changer" | "drive";
+    libraryId: string;
+    driveId?: string;
+    displayName: string;
+    state: "pending" | "connected" | "not_ready" | "failed" | "removing" | "residual";
+    observedPaths: string[];
+    reasonCode?: string;
+    message?: string;
+  }>;
+  desiredIqns?: string[];
+  mountedIqns?: string[];
+  skippedTargets?: string[];
   lastSyncAt?: string;
   lastError?: string;
 }

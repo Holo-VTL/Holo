@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{env, ffi::OsStr};
 
 use super::metadata::{
-    load_checkpoint_page, persist_checkpoint_page, storage_root_dir, CheckpointFlags,
+    load_checkpoint_page, persist_checkpoint_page, storage_root_dir_for_cartridge, CheckpointFlags,
     MetadataCheckpoint, StorageError,
 };
 use super::segment::{read_segment_file, validate_segment_shape, write_segment_file};
@@ -309,7 +309,7 @@ pub fn bootstrap_for_mount(
     drive_id: &str,
     cartridge_id: &str,
 ) -> Result<LayoutSnapshot, StorageError> {
-    let root = storage_root_dir();
+    let root = storage_root_dir_for_cartridge(cartridge_id);
     let paths = LayoutPaths::for_cartridge(&root, drive_id, cartridge_id);
     initialize_layout(&paths)
 }
