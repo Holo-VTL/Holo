@@ -291,7 +291,7 @@ DOCKEREOF
 fi
 echo "  Building handler_holo.so (Rocky 8, GLIBC_2.17+)..."
 sudo docker run --rm \
-  -v "\${BUILD_DIR}:/src:ro" \
+  -v "\${BUILD_DIR}:/src:ro,Z" \
   -v "\${OUTPUT_DIR}:/out" \
   "\$BUILDER_IMAGE" \
   gcc -std=gnu11 -O2 -fPIC -shared -Wall -Wextra \
