@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::blk_map::{
     append_blk_map_record, load_blk_map_records, locate_active_record, mark_blk_map_stale_batch,
-    persist_blk_map_records, sync_blk_map, BlkMapRecord, BlkMapState,
+    persist_blk_map_records, sync_blk_map, BlkMapRecord, BlkMapState, PayloadChecksumAlgorithm,
 };
 use super::compression::{compress_payload, decompress_payload, CompressionCodec};
 use super::dedup::{
@@ -509,6 +509,11 @@ pub fn write_logical_block(
     } else {
         0
     };
+    let block_map_checksum = if options.payload_checksum_enabled {
+        integrity32(payload)
+    } else {
+        0
+    };
     trace.mark("prepare_payload_metadata");
 
     let mut dedup_hit = false;
@@ -688,7 +693,12 @@ pub fn write_logical_block(
             dedup_entry_id,
             compression: codec_used,
             compressed_len: stored_len,
-            payload_checksum,
+            payload_checksum: block_map_checksum,
+            payload_checksum_algorithm: if options.payload_checksum_enabled {
+                PayloadChecksumAlgorithm::Crc32c
+            } else {
+                PayloadChecksumAlgorithm::None
+            },
         },
     )?;
     trace.mark("append_blk_map");
@@ -877,11 +887,11 @@ pub fn read_logical_block(
         decompress_payload(record.compression, &blob.bytes, logical_len)?
     };
 
-    if record.payload_checksum != 0 && checksum32(&payload) != record.payload_checksum {
-        return Err(StorageError::Corrupt(
-            "payload checksum mismatch on read".to_string(),
-        ));
-    }
+    verify_logical_payload_checksum(
+        record.payload_checksum_algorithm,
+        record.payload_checksum,
+        &payload,
+    )?;
 
     Ok(Some(LogicalReadResult {
         record_id: record.record_id,
@@ -891,6 +901,25 @@ pub fn read_logical_block(
         codec_used: record.compression,
         payload,
     }))
+}
+
+fn verify_logical_payload_checksum(
+    algorithm: PayloadChecksumAlgorithm,
+    expected: u32,
+    payload: &[u8],
+) -> Result<(), StorageError> {
+    let matches = match algorithm {
+        PayloadChecksumAlgorithm::None => true,
+        PayloadChecksumAlgorithm::Fnv1a32 => checksum32(payload) == expected,
+        PayloadChecksumAlgorithm::Crc32c => integrity32(payload) == expected,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(StorageError::Corrupt(
+            "payload checksum mismatch on read".to_string(),
+        ))
+    }
 }
 
 pub fn run_unmap(
@@ -1713,6 +1742,70 @@ mod tests {
             dedup_file: root.join("dedup.segment"),
             segment_index_file: root.join("segment_index.segment"),
         }
+    }
+
+    #[test]
+    fn verifies_versioned_logical_checksums_without_zero_sentinel_for_v3() {
+        let payload = b"versioned checksum payload";
+        verify_logical_payload_checksum(
+            PayloadChecksumAlgorithm::Fnv1a32,
+            checksum32(payload),
+            payload,
+        )
+        .expect("legacy FNV checksum should pass");
+        verify_logical_payload_checksum(
+            PayloadChecksumAlgorithm::Crc32c,
+            integrity32(payload),
+            payload,
+        )
+        .expect("CRC32C checksum should pass");
+        verify_logical_payload_checksum(PayloadChecksumAlgorithm::None, 0, payload)
+            .expect("disabled checksum should pass");
+
+        assert_ne!(integrity32(payload), 0);
+        let err = verify_logical_payload_checksum(PayloadChecksumAlgorithm::Crc32c, 0, payload)
+            .expect_err("tagged zero checksum must still be compared");
+        assert!(format!("{err}").contains("payload checksum mismatch"));
+    }
+
+    #[test]
+    fn reads_existing_v2_logical_payload_checksum_after_upgrade() {
+        let paths = temp_layout_paths("read-v2-blk-map-checksum");
+        super::super::layout::initialize_layout(&paths).expect("initialize layout");
+        let payload = b"existing V2 logical tape data";
+        write_logical_block(
+            &paths,
+            0,
+            payload,
+            0,
+            WriteOptions {
+                dedup_enabled: false,
+                preferred_codec: CompressionCodec::None,
+                force_sync: true,
+                payload_checksum_enabled: true,
+            },
+            None,
+        )
+        .expect("write fixture data");
+
+        let (_, mut records) = load_blk_map_records(&paths.blk_map_file).expect("load new record");
+        assert_eq!(records[0].payload_checksum_algorithm, PayloadChecksumAlgorithm::Crc32c);
+        assert_eq!(records[0].payload_checksum, integrity32(payload));
+        let mut legacy = records.pop().expect("one block-map record");
+        legacy.payload_checksum = checksum32(payload);
+        legacy.payload_checksum_algorithm = PayloadChecksumAlgorithm::Fnv1a32;
+        let encoded = legacy.encode();
+        let mut v2_payload = b"BMV2".to_vec();
+        v2_payload.extend_from_slice(&encoded[..58]);
+        write_segment_file(&paths.blk_map_file, SegmentKind::BlkMap, 2, 2, &v2_payload)
+            .expect("write existing V2 block-map fixture");
+
+        let read = read_logical_block(&paths, 0)
+            .expect("read existing V2 logical block")
+            .expect("block should exist");
+        assert_eq!(read.payload, payload);
+
+        let _ = fs::remove_dir_all(&paths.root);
     }
 
     #[test]
