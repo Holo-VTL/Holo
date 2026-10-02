@@ -143,11 +143,11 @@ func identityReference(deviceKey string) string {
 }
 
 func profileOrDefault(value, fallback string) string {
-	value = strings.TrimSpace(strings.ToLower(value))
-	if value == "" {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
 		return fallback
 	}
-	return value
+	return strings.ToLower(strings.Join(fields, "-"))
 }
 
 func libraryID(library *domain.VirtualLibrary) string {
