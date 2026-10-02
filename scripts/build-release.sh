@@ -292,7 +292,7 @@ fi
 echo "  Building handler_holo.so (Rocky 8, GLIBC_2.17+)..."
 sudo docker run --rm \
   -v "\${BUILD_DIR}:/src:ro,Z" \
-  -v "\${OUTPUT_DIR}:/out" \
+  -v "\${OUTPUT_DIR}:/out:Z" \
   "\$BUILDER_IMAGE" \
   gcc -std=gnu11 -O2 -fPIC -shared -Wall -Wextra \
     -I/tmp/tcmu-runner -I/tmp/tcmu-runner/ccan -I/tmp/tcmu-runner/ccan/ccan \
@@ -348,7 +348,7 @@ RPMBUILDEREOF
 
     echo "    EL\${el}: building tcmu-runner/libtcmu RPMs"
     sudo docker run --rm \
-      -v "\${out_dir}:/out" \
+      -v "\${out_dir}:/out:Z" \
       "\${rpm_builder}" \
       bash -c 'cd /tmp/tcmu-runner/extra && ./make_runnerrpms.sh --without rbd --without glfs --without qcow --without zbc --without tcmalloc && find rpmbuild/RPMS -type f \( -name "tcmu-runner-*.rpm" -o -name "libtcmu-*.rpm" \) ! -name "*devel*" -exec cp -v {} /out/ \; && test -n "\$(find /out -maxdepth 1 -type f -name "tcmu-runner-*.rpm" -print -quit)" && test -n "\$(find /out -maxdepth 1 -type f -name "libtcmu-*.rpm" -print -quit)"'
   done
