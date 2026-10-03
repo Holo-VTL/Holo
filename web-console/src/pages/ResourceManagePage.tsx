@@ -6,6 +6,7 @@ import { api } from "../services/api";
 import { useToast } from "../components/Toast";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { SelectInput } from "../components/SelectInput";
+import { IscsiSecurityForm } from "../components/IscsiSecurityForm";
 import { formatBytes } from "../utils/format";
 import type { ApiError, StoragePoolRuntime, VirtualCartridge, VirtualDrive, VirtualLibrary } from "../services/types";
 import { MAX_LIBRARY_DRIVES, nextDriveSuffix, resolveTapeProfileFromDriveType } from "./resourceOptions";
@@ -19,6 +20,7 @@ type DeleteTarget =
 type EraseTarget = { id: string; mode: "short" | "long" } | null;
 
 type SlotShortageImportTarget = { cartridgeId: string; barcode: string } | null;
+type SecurityEditorTarget = { scope: "library" | "drive"; ownerId: string; section: "chap" } | null;
 
 type TopologySelection =
   | { kind: "library" }
@@ -104,6 +106,7 @@ export function ResourceManagePage() {
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [eraseTarget, setEraseTarget] = useState<EraseTarget>(null);
   const [slotShortageImportTarget, setSlotShortageImportTarget] = useState<SlotShortageImportTarget>(null);
+  const [securityEditorTarget, setSecurityEditorTarget] = useState<SecurityEditorTarget>(null);
   const [selectedNode, setSelectedNode] = useState<TopologySelection>({ kind: "library" });
 
   const [driveForm, setDriveForm] = useState({ driveId: "", slot: 1 });
@@ -281,9 +284,11 @@ export function ResourceManagePage() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [createCartridgeOpen, createDriveOpen]);
 
-  async function reloadAll() {
+  async function reloadAll(showLoading = false) {
     setError("");
-    setLoading(true);
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const [libRows, driveRows, cartRows, poolRows] = await Promise.all([
         api.resources.listLibraries(),
@@ -303,7 +308,7 @@ export function ResourceManagePage() {
   }
 
   useEffect(() => {
-    void reloadAll();
+    void reloadAll(true);
   }, [libraryId]);
 
   async function createDrive(event: FormEvent) {
@@ -915,6 +920,11 @@ export function ResourceManagePage() {
                       <span>{t("resources.driveCount")}</span>
                       <strong>{libraryDrives.length}</strong>
                     </div>
+                    <div className="inline-actions inspector-security-actions">
+                      <button className="btn btn-quiet" type="button" onClick={() => setSecurityEditorTarget({ scope: "library", ownerId: library.libraryId, section: "chap" })}>
+                        {t("resources.configureChap")}
+                      </button>
+                    </div>
                   </div>
                 ) : null}
 
@@ -933,6 +943,11 @@ export function ResourceManagePage() {
                       <span>{t("resources.driveIqn")}</span>
                       <strong>{selectedDrive.iqn || "-"}</strong>
                     </div>
+                    <div className="inline-actions inspector-security-actions">
+                      <button className="btn btn-quiet" type="button" onClick={() => setSecurityEditorTarget({ scope: "drive", ownerId: selectedDrive.driveId, section: "chap" })}>
+                        {t("resources.configureChap")}
+                      </button>
+                    </div>
                     {mountedCartridgeId(selectedDrive) ? (
                       <button
                         className="btn btn-quiet"
@@ -949,6 +964,19 @@ export function ResourceManagePage() {
                       {t("common.delete")}
                     </button>
                   </div>
+                ) : null}
+
+                {securityEditorTarget ? (
+                  <IscsiSecurityForm
+                    key={`${securityEditorTarget.scope}-${securityEditorTarget.ownerId}-${securityEditorTarget.section}`}
+                    scope={securityEditorTarget.scope}
+                    ownerId={securityEditorTarget.ownerId}
+                    title={securityEditorTarget.scope === "drive" ? t("iscsiSecurity.drivePolicy") : t("iscsiSecurity.libraryPolicy")}
+                    editorSection={securityEditorTarget.section}
+                    open
+                    modalOnly
+                    onClose={() => setSecurityEditorTarget(null)}
+                  />
                 ) : null}
 
                 {selectedCartridge ? (
@@ -1161,7 +1189,7 @@ export function ResourceManagePage() {
               {cartridgeCreateNeedsSlots ? (
                 <div className="modal-notice modal-notice-stack" style={{ gridColumn: "1 / -1" }}>
                   <span>{t("resources.addSlotRequiredDescription", { count: Math.max(requestedCartridgeCount - emptySlots, 1) })}</span>
-                  <label className="checkbox-inline" style={{ marginTop: 8 }}>
+                  <label className="cdb-trace-toggle modal-notice-toggle">
                     <input
                       type="checkbox"
                       checked={cartridgeForm.expandSlots}
@@ -1169,7 +1197,8 @@ export function ResourceManagePage() {
                         setCartridgeForm((prev) => ({ ...prev, expandSlots: event.target.checked }))
                       }
                     />
-                    <span>{t("resources.addSlotAndInsert")}</span>
+                    <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
+                    <span className="switch-label">{t("resources.addSlotAndInsert")}</span>
                   </label>
                 </div>
               ) : null}

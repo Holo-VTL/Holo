@@ -98,10 +98,14 @@ func cloneTcmuSession(in *TcmuHandlerSession) *TcmuHandlerSession {
 // TcmuAdapter implements TargetRuntimeAdapter using TCMU user:holo backstores.
 // It replaces the fileio image approach with direct CDB dispatch to the data-plane.
 type TcmuAdapter struct {
-	cfg      TargetRuntimeConfig
-	runner   commandRunner
-	registry *tcmuRegistry
-	auditW   audit.Writer
+	cfg            TargetRuntimeConfig
+	runner         commandRunner
+	registry       *tcmuRegistry
+	auditW         audit.Writer
+	securityHelper *ISCSISecurityHelper
+	localMountRepo LocalMountRepository
+	handlerBinary  string
+	startHandler   func(context.Context, *domain.TargetPublication, string, []string) (int, error)
 }
 
 type tcmuBackstorePlan struct {
@@ -119,20 +123,249 @@ func newTcmuAdapter(cfg TargetRuntimeConfig, runner commandRunner, auditW audit.
 		runner = &osCommandRunner{}
 	}
 	return &TcmuAdapter{
-		cfg:      normalizeTargetRuntimeConfig(cfg),
-		runner:   runner,
-		registry: newTcmuRegistry(),
-		auditW:   auditW,
+		cfg:            normalizeTargetRuntimeConfig(cfg),
+		runner:         runner,
+		registry:       newTcmuRegistry(),
+		auditW:         auditW,
+		securityHelper: NewDefaultISCSISecurityHelper(cfg.UseSudo),
 	}
+}
+
+func (a *TcmuAdapter) SetLocalMountRepository(repository LocalMountRepository) {
+	a.localMountRepo = repository
+}
+
+func (a *TcmuAdapter) backstoreNameForPublication(ctx context.Context, publication *domain.TargetPublication) (string, error) {
+	if publication == nil {
+		return "", domain.ErrInvalidInput
+	}
+	if a.localMountRepo != nil {
+		mappings, err := a.localMountRepo.ListDeviceMappings(ctx, publication.LibraryID)
+		if err != nil {
+			return "", err
+		}
+		deviceKey := publicationDeviceKey(publication)
+		for _, mapping := range mappings {
+			if mapping.DeviceKey == deviceKey && mapping.BackendRef != "" &&
+				(mapping.State == domain.LocalMappingStateActive || mapping.State == domain.LocalMappingStateCleanupPending || mapping.State == domain.LocalMappingStateInactive) {
+				return mapping.BackendRef, nil
+			}
+		}
+	}
+	return runtimeBackstoreName(publication), nil
+}
+
+func (a *TcmuAdapter) hasLocalLoopbackMapping(ctx context.Context, deviceKey string) (bool, error) {
+	if a.localMountRepo == nil || deviceKey == "" {
+		return false, nil
+	}
+	// Device mapping lists are scoped by library. The stable key includes the
+	// resource identifier, so scan the persisted libraries without touching any
+	// target or foreign mapping.
+	libraries, err := a.localMountRepo.ListLibraryMappings(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, library := range libraries {
+		mappings, err := a.localMountRepo.ListDeviceMappings(ctx, library.LibraryID)
+		if err != nil {
+			return false, err
+		}
+		for _, mapping := range mappings {
+			if mapping.DeviceKey == deviceKey && mapping.BackendRef != "" &&
+				(mapping.State == domain.LocalMappingStateActive || mapping.State == domain.LocalMappingStateCleanupPending) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (a *TcmuAdapter) EnsureLocalMountBackend(ctx context.Context, descriptor domain.VTLDeviceDescriptor) error {
+	if descriptor.DeviceKey == "" || descriptor.BackendRef == "" || !descriptor.BackendReady {
+		return domain.ErrInvalidInput
+	}
+	if _, exists := a.registry.find(descriptor.BackendRef); exists {
+		return nil
+	}
+	publication := localMountSyntheticPublication(descriptor)
+	socketPath := tcmuSocketPath("local-" + descriptor.DeviceKey)
+	available, err := a.availableUserBackstores(ctx)
+	if err != nil {
+		return err
+	}
+	if !containsString(available, "holo") {
+		return ErrISCSISecurityHelperUnavailable
+	}
+	plan := tcmuBackstorePlan{Subtype: "holo", CfgString: socketPath, SizeArg: fmt.Sprintf("size=%dM", a.cfg.BackstoreSizeMB), UseHandler: true}
+	env := localMountHandlerEnv(publication, descriptor)
+	pid, err := a.spawnHandlerWithEnv(ctx, publication, socketPath, env)
+	if err != nil {
+		return fmt.Errorf("spawn local TCMU handler: %w", err)
+	}
+	if err := a.runTargetcli(ctx, "/backstores/user:holo", "create", "name="+descriptor.BackendRef, plan.SizeArg, "cfgstring="+plan.CfgString); err != nil {
+		a.killHandler(pid)
+		_ = os.Remove(socketPath)
+		return fmt.Errorf("create local TCMU backstore: %w", err)
+	}
+	a.registry.save(&TcmuHandlerSession{
+		PublicationID: descriptor.DeviceKey, SocketPath: socketPath, PID: pid,
+		ProcessStartToken: processStartToken(pid), BackstoreName: descriptor.BackendRef,
+		BackstoreSubtype: "holo",
+	})
+	return nil
+}
+
+func (a *TcmuAdapter) ResolveLocalMountIdentity(ctx context.Context, descriptor domain.VTLDeviceDescriptor, publication *domain.TargetPublication) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if descriptor.DeviceKey == "" || descriptor.LibraryID == "" {
+		return "", domain.ErrInvalidInput
+	}
+	if publication == nil {
+		publication = localMountSyntheticPublication(descriptor)
+	}
+	env := tcmuHandlerEnv(publication)
+	if publication.PublicationID == descriptor.DeviceKey {
+		env = localMountHandlerEnv(publication, descriptor)
+	}
+	binary := strings.TrimSpace(a.handlerBinary)
+	if binary == "" {
+		binary = tcmuHandlerBinary()
+	}
+	cmd := exec.CommandContext(ctx, binary, "--print-vpd-serial", "--publication-id", publication.PublicationID)
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolve local mount SCSI identity: %w", err)
+	}
+	identity := strings.TrimSpace(string(output))
+	if identity == "" || strings.ContainsAny(identity, "\r\n") || domain.ValidateManagementID(identity) != nil {
+		return "", fmt.Errorf("resolve local mount SCSI identity: invalid handler response")
+	}
+	return identity, nil
+}
+
+func localMountSyntheticPublication(descriptor domain.VTLDeviceDescriptor) *domain.TargetPublication {
+	publication := &domain.TargetPublication{
+		PublicationID:       descriptor.DeviceKey,
+		PoolID:              descriptor.PoolID,
+		LibraryID:           descriptor.LibraryID,
+		DriveID:             descriptor.DriveID,
+		DeviceRole:          string(descriptor.Kind),
+		DeviceProfile:       descriptor.Profile,
+		DriveProfile:        descriptor.DriveProfile,
+		SecurityEnforcement: domain.SecurityEnforcementUnprotected,
+		CompressionEnabled:  descriptor.CompressionEnabled,
+		DedupEnabled:        descriptor.DedupEnabled,
+	}
+	if descriptor.Kind == domain.LocalDeviceKindChanger && len(descriptor.DriveIDs) > 0 {
+		// The changer serial follows the first attached drive, matching its CDB worker.
+		publication.DriveID = descriptor.DriveIDs[0]
+	}
+	return publication
+}
+func (a *TcmuAdapter) ReleaseLocalMountBackend(ctx context.Context, mapping domain.LocalLoopbackDeviceMapping) error {
+	session, exists := a.registry.find(mapping.BackendRef)
+	if !exists {
+		return a.deleteTcmuBackstore(ctx, "holo", mapping.BackendRef)
+	}
+	a.killSession(session)
+	if err := a.deleteTcmuBackstore(ctx, session.BackstoreSubtype, mapping.BackendRef); err != nil {
+		return err
+	}
+	a.registry.delete(mapping.BackendRef)
+	if err := os.Remove(session.SocketPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove local TCMU socket: %w", err)
+	}
+	return nil
+}
+
+func (a *TcmuAdapter) PublishProtected(ctx context.Context, publication *domain.TargetPublication, security ISCSIResolvedPublicationSecurity) (string, error) {
+	if err := validateTargetPublicationForRuntime(publication); err != nil {
+		return "", err
+	}
+	backstoreName, err := a.backstoreNameForPublication(ctx, publication)
+	if err != nil {
+		return "", err
+	}
+	socketPath := tcmuSocketPath(publication.PublicationID)
+	session, reuseBackend := a.registry.find(backstoreName)
+	plan := tcmuBackstorePlan{Subtype: "holo", CfgString: socketPath, SizeArg: fmt.Sprintf("size=%dM", a.cfg.BackstoreSizeMB), UseHandler: !reuseBackend}
+	if plan.Subtype != "holo" {
+		return "", ErrISCSISecurityHelperUnavailable
+	}
+	pid := 0
+	if plan.UseHandler {
+		pid, err = a.spawnHandler(ctx, publication, socketPath)
+		if err != nil {
+			return "", fmt.Errorf("spawn tcmu handler: %w", err)
+		}
+	}
+	if !reuseBackend {
+		if err := a.runTargetcli(ctx, "/backstores/user:"+plan.Subtype, "create",
+			"name="+backstoreName, plan.SizeArg, "cfgstring="+plan.CfgString); err != nil {
+			a.killHandler(pid)
+			if plan.CleanupPath != "" {
+				_ = os.Remove(plan.CleanupPath)
+			}
+			return "", fmt.Errorf("create protected TCMU backstore: %w", err)
+		}
+	}
+	if err := runProtectedTargetHelper(ctx, a.securityHelper, publication, security, backstoreName, "user:holo", a.cfg.PortalHost, a.cfg.PortalPort); err != nil {
+		var cleanupErr error
+		if reuseBackend {
+			_, cleanupErr = a.securityHelper.Call(ctx, map[string]any{"version": 1, "operation": "delete-owned-target", "targetIQN": publication.TargetIQN})
+		} else {
+			cleanupErr = a.cleanupProtectedTarget(ctx, publication, &plan, backstoreName, pid)
+		}
+		return "", errors.Join(err, cleanupErr)
+	}
+	if !reuseBackend {
+		a.registry.save(&TcmuHandlerSession{
+			PublicationID: publication.PublicationID, SocketPath: socketPath, PID: pid,
+			ProcessStartToken: processStartToken(pid), BackstoreName: backstoreName,
+			BackstoreSubtype: plan.Subtype, BackstoreConfigPath: plan.CleanupPath,
+		})
+	} else if session != nil {
+		a.registry.save(session)
+	}
+	portal := fmt.Sprintf("%s:%d", a.cfg.PortalHost, a.cfg.PortalPort)
+	audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_publish", publication.PublicationID, "success",
+		map[string]any{"runtimeMode": "tcmu", "backstoreName": backstoreName, "portal": portal, "backstoreType": plan.Subtype, "protected": true})
+	return portal, nil
+}
+
+func (a *TcmuAdapter) cleanupProtectedTarget(ctx context.Context, publication *domain.TargetPublication, plan *tcmuBackstorePlan, backstoreName string, pid int) error {
+	_, targetErr := a.securityHelper.Call(ctx, map[string]any{"version": 1, "operation": "delete-owned-target", "targetIQN": publication.TargetIQN})
+	backstoreErr := a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
+	if pid > 0 {
+		a.killHandler(pid)
+	}
+	var fileErr error
+	if plan.CleanupPath != "" {
+		fileErr = os.Remove(plan.CleanupPath)
+		if errors.Is(fileErr, os.ErrNotExist) {
+			fileErr = nil
+		}
+	}
+	return errors.Join(targetErr, backstoreErr, fileErr)
 }
 
 // Publish creates a user:holo TCMU backstore for the publication and brings
 // up the iSCSI target, exposing a Type-1 SCSI tape device to initiators.
 func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPublication) (string, error) {
-	backstoreName := runtimeBackstoreName(publication)
+	backstoreName, err := a.backstoreNameForPublication(ctx, publication)
+	if err != nil {
+		return "", err
+	}
 	socketPath := tcmuSocketPath(publication.PublicationID)
-
-	plan, err := a.buildBackstorePlan(ctx, backstoreName, socketPath)
+	session, reuseBackend := a.registry.find(backstoreName)
+	plan := tcmuBackstorePlan{Subtype: "holo", CfgString: socketPath, SizeArg: fmt.Sprintf("size=%dM", a.cfg.BackstoreSizeMB), UseHandler: !reuseBackend}
+	if !reuseBackend {
+		plan, err = a.buildBackstorePlan(ctx, backstoreName, socketPath)
+	}
 	if err != nil {
 		audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_publish", publication.PublicationID, "failure",
 			map[string]any{
@@ -156,24 +389,28 @@ func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPub
 	}
 
 	// 2. Register user:holo backstore in targetcli.
-	if err := a.runTargetcli(ctx, "/backstores/user:"+plan.Subtype, "create",
-		"name="+backstoreName,
-		plan.SizeArg,
-		"cfgstring="+plan.CfgString,
-	); err != nil {
-		a.killHandler(pid)
-		if plan.CleanupPath != "" {
-			_ = os.Remove(plan.CleanupPath)
+	if !reuseBackend {
+		if err := a.runTargetcli(ctx, "/backstores/user:"+plan.Subtype, "create",
+			"name="+backstoreName,
+			plan.SizeArg,
+			"cfgstring="+plan.CfgString,
+		); err != nil {
+			a.killHandler(pid)
+			if plan.CleanupPath != "" {
+				_ = os.Remove(plan.CleanupPath)
+			}
+			audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_publish", publication.PublicationID, "failure",
+				map[string]any{"step": "create_backstore", "error": err.Error(), "runtimeMode": "tcmu"})
+			return "", fmt.Errorf("create user:%s backstore: %w", plan.Subtype, err)
 		}
-		audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_publish", publication.PublicationID, "failure",
-			map[string]any{"step": "create_backstore", "error": err.Error(), "runtimeMode": "tcmu"})
-		return "", fmt.Errorf("create user:%s backstore: %w", plan.Subtype, err)
 	}
 
 	// 3. Create iSCSI target.
 	if err := createISCSITargetReplacingExisting(ctx, a.runTargetcli, a.deleteTcmuTarget, publication.TargetIQN); err != nil {
-		_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
-		a.killHandler(pid)
+		if !reuseBackend {
+			_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
+			a.killHandler(pid)
+		}
 		if plan.CleanupPath != "" {
 			_ = os.Remove(plan.CleanupPath)
 		}
@@ -189,8 +426,10 @@ func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPub
 	}, tcmuTargetcliTPGAttributes...)
 	if err := a.runTargetcli(ctx, tpgAttributeArgs...); err != nil {
 		_ = a.deleteTcmuTarget(ctx, publication.TargetIQN)
-		_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
-		a.killHandler(pid)
+		if !reuseBackend {
+			_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
+			a.killHandler(pid)
+		}
 		if plan.CleanupPath != "" {
 			_ = os.Remove(plan.CleanupPath)
 		}
@@ -201,8 +440,10 @@ func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPub
 	if shouldTuneTcmuISCSIDataPath(publication) {
 		if err := a.configureTcmuISCSIDataPath(ctx, publication.TargetIQN); err != nil {
 			_ = a.deleteTcmuTarget(ctx, publication.TargetIQN)
-			_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
-			a.killHandler(pid)
+			if !reuseBackend {
+				_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
+				a.killHandler(pid)
+			}
 			if plan.CleanupPath != "" {
 				_ = os.Remove(plan.CleanupPath)
 			}
@@ -214,8 +455,10 @@ func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPub
 	lunPath := "/backstores/user:" + plan.Subtype + "/" + backstoreName
 	if err := a.runTargetcli(ctx, "/iscsi/"+publication.TargetIQN+"/tpg1/luns", "create", lunPath); err != nil {
 		_ = a.deleteTcmuTarget(ctx, publication.TargetIQN)
-		_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
-		a.killHandler(pid)
+		if !reuseBackend {
+			_ = a.deleteTcmuBackstore(ctx, plan.Subtype, backstoreName)
+			a.killHandler(pid)
+		}
 		if plan.CleanupPath != "" {
 			_ = os.Remove(plan.CleanupPath)
 		}
@@ -223,16 +466,18 @@ func (a *TcmuAdapter) Publish(ctx context.Context, publication *domain.TargetPub
 	}
 
 	// 7. Record session.
-	session := &TcmuHandlerSession{
-		PublicationID:       publication.PublicationID,
-		SocketPath:          socketPath,
-		PID:                 pid,
-		ProcessStartToken:   processStartToken(pid),
-		BackstoreName:       backstoreName,
-		BackstoreSubtype:    plan.Subtype,
-		BackstoreConfigPath: plan.CleanupPath,
+	if !reuseBackend {
+		session = &TcmuHandlerSession{
+			PublicationID:       publication.PublicationID,
+			SocketPath:          socketPath,
+			PID:                 pid,
+			ProcessStartToken:   processStartToken(pid),
+			BackstoreName:       backstoreName,
+			BackstoreSubtype:    plan.Subtype,
+			BackstoreConfigPath: plan.CleanupPath,
+		}
+		a.registry.save(session)
 	}
-	a.registry.save(session)
 
 	portal := fmt.Sprintf("%s:%d", a.cfg.PortalHost, a.cfg.PortalPort)
 	audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_publish", publication.PublicationID, "success",
@@ -269,7 +514,10 @@ func (a *TcmuAdapter) configureTcmuISCSIDataPath(ctx context.Context, targetIQN 
 // Unpublish tears down the iSCSI target, removes the user:holo backstore,
 // terminates the CDB handler process, and removes the socket file.
 func (a *TcmuAdapter) Unpublish(ctx context.Context, publication *domain.TargetPublication) error {
-	backstoreName := runtimeBackstoreName(publication)
+	backstoreName, err := a.backstoreNameForPublication(ctx, publication)
+	if err != nil {
+		return err
+	}
 	socketPath := tcmuSocketPath(publication.PublicationID)
 	backstoreSubtype := desiredTcmuSubtype()
 	var backstoreConfigPath string
@@ -281,6 +529,18 @@ func (a *TcmuAdapter) Unpublish(ctx context.Context, publication *domain.TargetP
 			backstoreSubtype = s.BackstoreSubtype
 		}
 		backstoreConfigPath = s.BackstoreConfigPath
+	}
+	sharedLocalBackend, err := a.hasLocalLoopbackMapping(ctx, publicationDeviceKey(publication))
+	if err != nil {
+		return err
+	}
+	if sharedLocalBackend {
+		if err := a.deleteTcmuTarget(ctx, publication.TargetIQN); err != nil {
+			return err
+		}
+		audit.EmitTargetRuntimeEvent(ctx, a.auditW, "system", "tcmu_unpublish", publication.PublicationID, "success",
+			map[string]any{"runtimeMode": "tcmu", "backstoreName": backstoreName, "sharedLocalBackend": true})
+		return nil
 	}
 
 	// 1. Stop userspace socket worker first. Some targetcli/tcmu-runner
@@ -326,6 +586,13 @@ func (a *TcmuAdapter) Unpublish(ctx context.Context, publication *domain.TargetP
 // dispatches CDBs to the data-plane's tape state machine.
 // Returns the PID of the spawned process, or an error.
 func (a *TcmuAdapter) spawnHandler(ctx context.Context, publication *domain.TargetPublication, socketPath string) (int, error) {
+	return a.spawnHandlerWithEnv(ctx, publication, socketPath, tcmuHandlerEnv(publication))
+}
+
+func (a *TcmuAdapter) spawnHandlerWithEnv(ctx context.Context, publication *domain.TargetPublication, socketPath string, env []string) (int, error) {
+	if a.startHandler != nil {
+		return a.startHandler(ctx, publication, socketPath, env)
+	}
 	publicationID := publication.PublicationID
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("create socket dir: %w", err)
@@ -338,7 +605,7 @@ func (a *TcmuAdapter) spawnHandler(ctx context.Context, publication *domain.Targ
 		"--socket-path", socketPath,
 		"--publication-id", publicationID,
 	)
-	cmd.Env = tcmuHandlerEnv(publication)
+	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -356,6 +623,15 @@ func (a *TcmuAdapter) spawnHandler(ctx context.Context, publication *domain.Targ
 		return 0, err
 	}
 	return pid, nil
+}
+
+func localMountHandlerEnv(publication *domain.TargetPublication, descriptor domain.VTLDeviceDescriptor) []string {
+	env := tcmuHandlerEnv(publication)
+	if descriptor.Kind == domain.LocalDeviceKindChanger {
+		env = withEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", descriptor.LibraryID)
+		env = withEnvAssignment(env, "HOLO_CHANGER_DRIVE_IDS", strings.Join(descriptor.DriveIDs, ","))
+	}
+	return env
 }
 
 func waitForHandlerSocket(ctx context.Context, pid int, socketPath string, timeout, interval time.Duration, alive func(int) bool) error {
@@ -399,6 +675,7 @@ func tcmuHandlerEnv(publication *domain.TargetPublication) []string {
 	env = withEnvAssignment(env, "HOLO_SCSI_SERIAL_SEED", serialSeed)
 	env = withEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", storageutil.MediaStateKey(publication.LibraryID, publication.DriveID))
 	env = withEnvAssignment(env, "HOLO_STORAGE_ROOT", storageutil.PoolStorageRoot(publication.PoolID))
+	env = withEnvAssignment(env, "HOLO_STORAGE_POOL_ROOT_BASE", storageutil.ResolvePoolStorageBaseDir())
 	env = withEnvAssignment(env, "HOLO_SCSI_TRACE_CONFIG", tcmuTraceConfigPath())
 	env = withEnvAssignment(env, "HOLO_CDB_TIMING_METRICS_FILE", tcmuTimingMetricsPath(publication.PublicationID))
 	env = withEnvAssignment(env, "HOLO_TAPE_COMPRESSION_ENABLED", runtimeBoolEnv(publication.CompressionEnabled))

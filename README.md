@@ -170,9 +170,9 @@ The installer handles everything: runtime dependencies, binary setup, systemd se
 
 | Dependency                         | Purpose                                                   |
 | ---------------------------------- | --------------------------------------------------------- |
-| Linux kernel with LIO/TCMU modules | `target_core_mod`, `target_core_user`, `iscsi_target_mod` |
+| Linux kernel with LIO/TCMU modules | `target_core_mod`, `target_core_user`, `iscsi_target_mod`, `tcm_loop` |
 | `targetcli`                        | LIO iSCSI configuration                                   |
-| `open-iscsi` / `iscsi-initiator-utils` | Optional local initiator support for Mount Locally     |
+| `open-iscsi` / `iscsi-initiator-utils` | Host-side iSCSI initiator tools; Local Mount uses `tcm_loop` |
 | `tcmu-runner` 1.5+                 | User-space SCSI command processing                        |
 | `xfsprogs`                         | XFS filesystem tools                                      |
 | `kmod`, `sudo`                     | Kernel module loading, privilege escalation               |
@@ -262,9 +262,9 @@ VTL Rack View
 
 ### Mount Locally
 
-On the **Targets** page, enable **Mount Locally** when you want the Holo appliance itself to log in to the VTL targets it publishes. This is useful for lab validation and for backup applications such as Veeam that can use the Holo Linux host directly as a tape server.
+On the **Targets** page, enable **Mount Locally** when you want the Holo appliance itself to use the VTL devices it publishes. This is useful for lab validation and for backup applications such as Veeam that can use the Holo Linux host directly as a tape server.
 
-When enabled, Holo creates local iSCSI node records only for the desired published Holo IQNs, sets them to automatic startup, logs in to the tape drive and medium changer targets, and cleans up stale local Holo nodes for the same portal. On Linux, the mounted devices appear as standard tape and changer devices such as `/dev/st0`, `/dev/st1`, and `/dev/sch0`.
+Local Mount attaches the published backstores through Linux LIO's local loopback fabric (`tcm_loop`); it does not log the host back in to its own iSCSI portal. The tape drive and medium changer appear as standard Linux SCSI devices such as `/dev/st0`, `/dev/st1`, and `/dev/sch0`. Remote backup hosts continue to connect to Holo over iSCSI.
 
 ---
 
@@ -340,6 +340,7 @@ All profiles work on all major Linux distributions (RHEL, Rocky, Ubuntu, Debian,
 - **API key auth**: Optional but recommended for network-facing deployments
 - **Audit journal**: JSONL append-only log of all mutating operations
 - **Secret redaction**: Support bundles automatically redact API keys and sensitive data
+- **iSCSI security**: CHAP, mutual CHAP, and Initiator IQN access lists can be configured at Library, Drive, and Target scope. CHAP authenticates logins; it does not encrypt tape traffic.
 
 
 

@@ -130,6 +130,7 @@ pub fn compact_segment(
             compression: moved.2,
             compressed_len: moved.3,
             payload_checksum: record.payload_checksum,
+            payload_checksum_algorithm: record.payload_checksum_algorithm,
         });
     }
 

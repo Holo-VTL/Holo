@@ -145,6 +145,43 @@ func TestStorageHandler_InvalidBody(t *testing.T) {
 	}
 }
 
+func TestStorageHandlerLabelsActorClaimsAndRejectsUnsafeActorBeforeMutation(t *testing.T) {
+	repo := memory.NewStoragePoolRepo()
+	writer := audit.NewMemoryWriter()
+	svc := orchestration.NewStorageManagementService(repo, writer, &staticRunner{payload: storageTestLsblk})
+	h := NewStorageHandler(svc)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-actor-claim","name":"Pool Actor Claim","actor":"system"}`))
+	createResp := httptest.NewRecorder()
+	h.handlePools(createResp, createReq)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("expected create pool 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	eventsBeforeInvalidRequest := writer.Events()
+	foundClaim := false
+	for _, event := range eventsBeforeInvalidRequest {
+		if event.Action == "storage_pool_create" {
+			foundClaim = event.Actor == "self-asserted:system"
+		}
+	}
+	if !foundClaim {
+		t.Fatalf("expected claimed system actor to remain self-asserted, events=%+v", eventsBeforeInvalidRequest)
+	}
+
+	badReq := httptest.NewRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-bad-actor","name":"Pool Bad Actor","actor":"bad\nactor"}`))
+	badResp := httptest.NewRecorder()
+	h.handlePools(badResp, badReq)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid actor to return 400, got %d body=%s", badResp.Code, badResp.Body.String())
+	}
+	if len(svc.ListPools(context.Background())) != 1 {
+		t.Fatalf("invalid actor request mutated storage state, pools=%+v", svc.ListPools(context.Background()))
+	}
+	if len(writer.Events()) != len(eventsBeforeInvalidRequest) {
+		t.Fatalf("invalid actor request emitted audit events: before=%+v after=%+v", eventsBeforeInvalidRequest, writer.Events())
+	}
+}
+
 func TestStorageHandlerRejectsUnsafeDevicePath(t *testing.T) {
 	h := newStorageHandlerForTest()
 	createReq := httptest.NewRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-devpath","name":"Pool DevPath","warningThresholdPct":90}`))

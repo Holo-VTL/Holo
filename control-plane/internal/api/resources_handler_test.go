@@ -192,6 +192,9 @@ func TestCoreResourceCreateAndQueryEndpoints(t *testing.T) {
 	if !strings.Contains(string(metadataRaw), "capacity_bytes=1073741824") {
 		t.Fatalf("expected cartridge metadata capacity, got %s", string(metadataRaw))
 	}
+	if !strings.Contains(string(metadataRaw), "pool_id=pool-a") {
+		t.Fatalf("expected cartridge metadata pool routing, got %s", string(metadataRaw))
+	}
 
 	listCartridgeReq := newAuthedRequest(http.MethodGet, "/v1/cartridges", nil)
 	listCartridgeResp := httptest.NewRecorder()
@@ -424,6 +427,135 @@ func TestResourcesAutoPublishLibraryAndDriveIQN(t *testing.T) {
 	}
 	if !strings.Contains(body, `"deviceRole":"changer"`) || !strings.Contains(body, `"deviceRole":"drive"`) {
 		t.Fatalf("expected changer and drive roles, got %s", body)
+	}
+}
+
+func TestAutoPublicationHonorsAdministrativelyOfflineTargetIntent(t *testing.T) {
+	srv := newTestServer(t)
+	createAutoPublicationTestLibrary(t, srv, "pool-auto-offline", "lib-auto-offline", "drive-auto-offline")
+
+	const changerIQN = "iqn.2026-04.cloud.backupnext.holo:library-lib-auto-offline"
+	const driveIQN = "iqn.2026-04.cloud.backupnext.holo:drive-drive-auto-offline"
+	var changer *domain.TargetPublication
+	var drive *domain.TargetPublication
+	for _, publication := range srv.runtime.ListPublications(context.Background()) {
+		switch publication.TargetIQN {
+		case changerIQN:
+			changer = publication
+		case driveIQN:
+			drive = publication
+		}
+	}
+	if changer == nil || changer.State != domain.PublicationReady {
+		t.Fatalf("expected auto-published changer target, got %+v", changer)
+	}
+	if drive == nil || drive.State != domain.PublicationReady {
+		t.Fatalf("expected auto-published drive target, got %+v", drive)
+	}
+	if _, err := srv.runtime.Unpublish(context.Background(), changer.PublicationID, "operator"); err != nil {
+		t.Fatalf("unpublish changer target: %v", err)
+	}
+	before := len(srv.runtime.ListPublications(context.Background()))
+	if err := srv.resources.ensureLibraryAutoPublications(context.Background(), "lib-auto-offline"); err != nil {
+		t.Fatalf("automatic publication should skip the administratively offline target: %v", err)
+	}
+	publications := srv.runtime.ListPublications(context.Background())
+	if len(publications) != before {
+		t.Fatalf("automatic publication recreated a deliberately offline target: before=%d after=%d", before, len(publications))
+	}
+	for _, publication := range publications {
+		if publication.TargetIQN == changerIQN && publication.State != domain.PublicationDisabled {
+			t.Fatalf("offline changer changed state during auto-publication: %+v", publication)
+		}
+		if publication.TargetIQN == driveIQN && publication.State != domain.PublicationReady {
+			t.Fatalf("online drive changed state while the changer is offline: %+v", publication)
+		}
+	}
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, newAuthedRequest(http.MethodPost, "/v1/cartridges", strings.NewReader(`{"poolId":"pool-auto-offline","libraryId":"lib-auto-offline","capacityBytes":1073741824,"ltoGeneration":6}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("creating media should succeed while the changer remains offline: status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, publication := range srv.runtime.ListPublications(context.Background()) {
+		if publication.TargetIQN == changerIQN && publication.State != domain.PublicationDisabled {
+			t.Fatalf("media creation unexpectedly brought the offline changer online: %+v", publication)
+		}
+	}
+	if _, err := srv.runtime.Unpublish(context.Background(), drive.PublicationID, "operator"); err != nil {
+		t.Fatalf("unpublish drive target: %v", err)
+	}
+	if err := srv.resources.ensureLibraryAutoPublications(context.Background(), "lib-auto-offline"); err != nil {
+		t.Fatalf("automatic publication should skip offline targets: %v", err)
+	}
+	response = httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, newAuthedRequest(http.MethodPost, "/v1/cartridges", strings.NewReader(`{"poolId":"pool-auto-offline","libraryId":"lib-auto-offline","capacityBytes":1073741824,"ltoGeneration":6}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("creating media should succeed while both targets remain offline: status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, publication := range srv.runtime.ListPublications(context.Background()) {
+		if (publication.TargetIQN == changerIQN || publication.TargetIQN == driveIQN) && publication.State != domain.PublicationDisabled {
+			t.Fatalf("media creation unexpectedly brought an offline target online: %+v", publication)
+		}
+	}
+}
+
+func TestAutoPublicationHonorsAdministrativelyOfflineDriveIntent(t *testing.T) {
+	srv := newTestServer(t)
+	createAutoPublicationTestLibrary(t, srv, "pool-drive-offline", "lib-drive-offline", "drive-drive-offline")
+
+	const changerIQN = "iqn.2026-04.cloud.backupnext.holo:library-lib-drive-offline"
+	const driveIQN = "iqn.2026-04.cloud.backupnext.holo:drive-drive-drive-offline"
+	var changer *domain.TargetPublication
+	var drive *domain.TargetPublication
+	for _, publication := range srv.runtime.ListPublications(context.Background()) {
+		switch publication.TargetIQN {
+		case changerIQN:
+			changer = publication
+		case driveIQN:
+			drive = publication
+		}
+	}
+	if changer == nil || changer.State != domain.PublicationReady || drive == nil || drive.State != domain.PublicationReady {
+		t.Fatalf("expected changer and drive to be auto-published: changer=%+v drive=%+v", changer, drive)
+	}
+	if _, err := srv.runtime.Unpublish(context.Background(), drive.PublicationID, "operator"); err != nil {
+		t.Fatalf("unpublish drive target: %v", err)
+	}
+	if err := srv.resources.ensureLibraryAutoPublications(context.Background(), "lib-drive-offline"); err != nil {
+		t.Fatalf("automatic publication should skip the administratively offline drive: %v", err)
+	}
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, newAuthedRequest(http.MethodPost, "/v1/cartridges", strings.NewReader(`{"poolId":"pool-drive-offline","libraryId":"lib-drive-offline","capacityBytes":1073741824,"ltoGeneration":6}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("creating media should succeed while the drive remains offline: status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, publication := range srv.runtime.ListPublications(context.Background()) {
+		if publication.TargetIQN == driveIQN && publication.State != domain.PublicationDisabled {
+			t.Fatalf("media creation unexpectedly brought the offline drive online: %+v", publication)
+		}
+		if publication.TargetIQN == changerIQN && publication.State != domain.PublicationReady {
+			t.Fatalf("online changer changed state while the drive is offline: %+v", publication)
+		}
+	}
+}
+
+func createAutoPublicationTestLibrary(t *testing.T, srv *Server, poolID, libraryID, driveID string) {
+	t.Helper()
+	requests := []struct {
+		path string
+		body string
+	}{
+		{"/v1/storage/pools", `{"poolId":"` + poolID + `","name":"Auto Publication Pool"}`},
+		{"/v1/libraries", `{"libraryId":"` + libraryID + `","name":"Auto Publication Library","vendor":"IBM","libraryType":"03584L32","driveType":"ULT3580-TD6"}`},
+		{"/v1/drives", `{"driveId":"` + driveID + `","libraryId":"` + libraryID + `","slot":1}`},
+		{"/v1/cartridges", `{"poolId":"` + poolID + `","libraryId":"` + libraryID + `","capacityBytes":1073741824,"ltoGeneration":6}`},
+	}
+	for _, request := range requests {
+		response := httptest.NewRecorder()
+		srv.Router().ServeHTTP(response, newAuthedRequest(http.MethodPost, request.path, strings.NewReader(request.body)))
+		if response.Code < 200 || response.Code >= 300 {
+			t.Fatalf("setup request %s failed: status=%d body=%s", request.path, response.Code, response.Body.String())
+		}
 	}
 }
 
@@ -1617,6 +1749,13 @@ func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
 	srv := newTestServer(t)
 
 	setupSlotFlowLibrary(t, srv, "lib-add-slot-audit", "drive-add-slot-audit", 2)
+	unsafeActorReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-slot-audit/slots", bytes.NewBufferString(`{"count":1,"actor":"bad\nactor"}`))
+	unsafeActorResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(unsafeActorResp, unsafeActorReq)
+	if unsafeActorResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe actor 400, got %d body=%s", unsafeActorResp.Code, unsafeActorResp.Body.String())
+	}
+
 	badReq := newAuthedRequest(http.MethodPost, "/v1/libraries/lib-add-slot-audit/slots", bytes.NewBufferString(`{"count":-2,"actor":"tester"}`))
 	badResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(badResp, badReq)
@@ -1636,7 +1775,7 @@ func TestAddLibrarySlotsRejectsNegativeCountAndAuditsSuccess(t *testing.T) {
 	if auditResp.Code != http.StatusOK {
 		t.Fatalf("expected audit list 200, got %d body=%s", auditResp.Code, auditResp.Body.String())
 	}
-	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), `"addedSlots":2`) {
+	if !strings.Contains(auditResp.Body.String(), "library_add_slots") || !strings.Contains(auditResp.Body.String(), `"addedSlots":2`) || !strings.Contains(auditResp.Body.String(), `"actor":"self-asserted:tester"`) {
 		t.Fatalf("expected add slots audit event, got %s", auditResp.Body.String())
 	}
 }
@@ -1701,6 +1840,68 @@ func TestDeleteLibraryRemovesSlotLock(t *testing.T) {
 	defer srv.resources.slotLocksMu.Unlock()
 	if got := len(srv.resources.slotLocks); got != 0 {
 		t.Fatalf("expected slot lock removed after library delete, got %d", got)
+	}
+}
+
+func TestDeleteLibraryReleasesPoolUsage(t *testing.T) {
+	mediaStateDir := t.TempDir()
+	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
+	srv := newTestServer(t)
+
+	createPoolReq := newAuthedRequest(http.MethodPost, "/v1/storage/pools", bytes.NewBufferString(`{"poolId":"pool-delete-usage","name":"Delete Usage Pool"}`))
+	createPoolResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createPoolResp, createPoolReq)
+	if createPoolResp.Code != http.StatusCreated {
+		t.Fatalf("expected pool create 201, got %d body=%s", createPoolResp.Code, createPoolResp.Body.String())
+	}
+	if _, err := srv.metadataDB.Exec(
+		`INSERT INTO storage_pool_disks(device_path, pool_id, size_bytes, attached_at) VALUES (?, ?, ?, ?)`,
+		"/dev/sdb",
+		"pool-delete-usage",
+		int64(10*1024*1024),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("seed storage pool disk: %v", err)
+	}
+
+	createLibraryReq := newAuthedRequest(http.MethodPost, "/v1/libraries", bytes.NewBufferString(`{"libraryId":"lib-delete-usage","name":"Delete Usage Library"}`))
+	createLibraryResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createLibraryResp, createLibraryReq)
+	if createLibraryResp.Code != http.StatusCreated {
+		t.Fatalf("expected library create 201, got %d body=%s", createLibraryResp.Code, createLibraryResp.Body.String())
+	}
+	createCartridgeReq := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-delete-usage","libraryId":"lib-delete-usage","cartridgeId":"VTA777L06","barcode":"VTA777L06","capacityBytes":5242880}`))
+	createCartridgeResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(createCartridgeResp, createCartridgeReq)
+	if createCartridgeResp.Code != http.StatusCreated {
+		t.Fatalf("expected cartridge create 201, got %d body=%s", createCartridgeResp.Code, createCartridgeResp.Body.String())
+	}
+	if err := writeAtomicText(cartridgeMetadataPath("VTA777L06"), "cartridge_id=VTA777L06\ncapacity_bytes=5242880\nused_bytes=1048576\n"); err != nil {
+		t.Fatalf("write cartridge metadata: %v", err)
+	}
+	if err := srv.resources.syncPoolUsage(context.Background(), "pool-delete-usage"); err != nil {
+		t.Fatalf("sync pool usage: %v", err)
+	}
+
+	deleteLibraryReq := newAuthedRequest(http.MethodDelete, "/v1/libraries/lib-delete-usage", nil)
+	deleteLibraryResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(deleteLibraryResp, deleteLibraryReq)
+	if deleteLibraryResp.Code != http.StatusNoContent {
+		t.Fatalf("expected library delete 204, got %d body=%s", deleteLibraryResp.Code, deleteLibraryResp.Body.String())
+	}
+
+	getPoolReq := newAuthedRequest(http.MethodGet, "/v1/storage/pools/pool-delete-usage", nil)
+	getPoolResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getPoolResp, getPoolReq)
+	if getPoolResp.Code != http.StatusOK {
+		t.Fatalf("expected get pool 200, got %d body=%s", getPoolResp.Code, getPoolResp.Body.String())
+	}
+	var pool domain.StoragePoolRuntime
+	if err := json.Unmarshal(getPoolResp.Body.Bytes(), &pool); err != nil {
+		t.Fatalf("decode pool: %v", err)
+	}
+	if pool.Capacity.UsedBytes != 0 {
+		t.Fatalf("expected deleted cartridge usage to be released, got %d bytes", pool.Capacity.UsedBytes)
 	}
 }
 

@@ -9,18 +9,19 @@ import (
 var APIRequestDurationBucketMicros = [...]uint64{5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000}
 
 type MetricsRegistry struct {
-	PublicationsActive        int64
-	PublicationsTotal         int64
-	AuditEventsTotal          int64
-	AuditWriteFailures        int64
-	AuditJournalFailed        int64
-	AuditParseFailures        int64
-	AuditJournalSizeBytes     int64
-	AuditJournalLastWriteUnix int64
-	ScsiSenseErrors           int64
-	DedupHitsTotal            int64
-	CompressionRatio          uint64 // stored as float64 bits
-	HealthStatus              int64
+	PublicationsActive              int64
+	PublicationsTotal               int64
+	AuditEventsTotal                int64
+	AuditWriteFailures              int64
+	AuditJournalFailed              int64
+	AuditParseFailures              int64
+	AuditJournalSizeBytes           int64
+	AuditJournalLastWriteUnix       int64
+	ISCSISecurityApplyFailures      int64
+	ScsiSenseErrors                 int64
+	DedupHitsTotal                  int64
+	CompressionRatio                uint64 // stored as float64 bits
+	HealthStatus                    int64
 
 	APIRequestDurationBuckets [len(APIRequestDurationBucketMicros)]uint64
 	APIRequestDurationCount   uint64
@@ -54,6 +55,10 @@ func (r *MetricsRegistry) GetCompressionRatio() float64 {
 
 func (r *MetricsRegistry) RecordScsiSenseError() {
 	atomic.AddInt64(&r.ScsiSenseErrors, 1)
+}
+
+func (r *MetricsRegistry) RecordISCSISecurityApplyFailure() {
+	atomic.AddInt64(&r.ISCSISecurityApplyFailures, 1)
 }
 
 func (r *MetricsRegistry) RecordPublicationPublish() {

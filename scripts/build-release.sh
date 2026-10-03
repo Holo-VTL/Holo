@@ -60,6 +60,13 @@ if [[ -z "${VERSION}" ]]; then
   VERSION="${VERSION#v}"
 fi
 
+# The remote build directory intentionally excludes .git; pass the local source
+# revision explicitly so the control-plane can report the commit used to build it.
+SOURCE_COMMIT="$(git -C "${PROJECT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "${PROJECT_DIR}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  SOURCE_COMMIT="${SOURCE_COMMIT}-dirty"
+fi
+
 PACKAGE_DIR_NAME="holo-vtl-${VERSION}-linux-x86_64"
 TARBALL_NAME="${PACKAGE_DIR_NAME}.tar.gz"
 
@@ -108,7 +115,7 @@ fi
 
 # ── Build ─────────────────────────────────────────────────────────
 echo "[3/7] Building on remote host..."
-ssh ${SSH_OPTS} "${BUILD_HOST}" "export VERSION=${VERSION}; bash -s" << REMOTE_BUILD
+ssh ${SSH_OPTS} "${BUILD_HOST}" "export VERSION=${VERSION}; export BUILD_COMMIT=${SOURCE_COMMIT}; bash -s" << REMOTE_BUILD
 set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR}"
@@ -256,7 +263,7 @@ source "\$HOME/.cargo/env" 2>/dev/null || true
 echo "  Building control-plane (static)..."
 cd "\${BUILD_DIR}/control-plane"
 VERSION_PKG="github.com/Holo-VTL/Holo/control-plane/internal/config"
-COMMIT="\$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+COMMIT="\${BUILD_COMMIT:-\$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 BUILD_DATE="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X \${VERSION_PKG}.Version=${VERSION} -X \${VERSION_PKG}.Commit=\${COMMIT} -X \${VERSION_PKG}.BuildDate=\${BUILD_DATE}" \
   -o "\${OUTPUT_DIR}/control-plane" ./cmd/api
@@ -291,8 +298,8 @@ DOCKEREOF
 fi
 echo "  Building handler_holo.so (Rocky 8, GLIBC_2.17+)..."
 sudo docker run --rm \
-  -v "\${BUILD_DIR}:/src:ro" \
-  -v "\${OUTPUT_DIR}:/out" \
+  -v "\${BUILD_DIR}:/src:ro,Z" \
+  -v "\${OUTPUT_DIR}:/out:Z" \
   "\$BUILDER_IMAGE" \
   gcc -std=gnu11 -O2 -fPIC -shared -Wall -Wextra \
     -I/tmp/tcmu-runner -I/tmp/tcmu-runner/ccan -I/tmp/tcmu-runner/ccan/ccan \
@@ -348,7 +355,7 @@ RPMBUILDEREOF
 
     echo "    EL\${el}: building tcmu-runner/libtcmu RPMs"
     sudo docker run --rm \
-      -v "\${out_dir}:/out" \
+      -v "\${out_dir}:/out:Z" \
       "\${rpm_builder}" \
       bash -c 'cd /tmp/tcmu-runner/extra && ./make_runnerrpms.sh --without rbd --without glfs --without qcow --without zbc --without tcmalloc && find rpmbuild/RPMS -type f \( -name "tcmu-runner-*.rpm" -o -name "libtcmu-*.rpm" \) ! -name "*devel*" -exec cp -v {} /out/ \; && test -n "\$(find /out -maxdepth 1 -type f -name "tcmu-runner-*.rpm" -print -quit)" && test -n "\$(find /out -maxdepth 1 -type f -name "libtcmu-*.rpm" -print -quit)"'
   done
@@ -370,6 +377,17 @@ echo "  Packaging..."
 mkdir -p "\${OUTPUT_DIR}/web-console"
 cp -a "\${BUILD_DIR}/web-console/dist" "\${OUTPUT_DIR}/web-console/dist"
 cp "\${BUILD_DIR}/infra/tcmu/handler_holo.c" "\${OUTPUT_DIR}/handler_holo.c"
+if [ ! -f "\${BUILD_DIR}/infra/iscsi/holo-iscsi-security-helper.py" ]; then
+  echo "Missing infra/iscsi/holo-iscsi-security-helper.py" >&2
+  exit 1
+fi
+cp "\${BUILD_DIR}/infra/iscsi/holo-iscsi-security-helper.py" "\${OUTPUT_DIR}/holo-iscsi-security-helper.py"
+if [ ! -f "\${BUILD_DIR}/infra/iscsi/holo-local-loopback-helper.py" ]; then
+  echo "Missing infra/iscsi/holo-local-loopback-helper.py" >&2
+  exit 1
+fi
+cp "\${BUILD_DIR}/infra/iscsi/holo-local-loopback-helper.py" "\${OUTPUT_DIR}/holo-local-loopback-helper.py"
+
 
 # Use scripts/install.sh if it exists
 if [ -f "\${BUILD_DIR}/scripts/install.sh" ]; then
@@ -390,7 +408,9 @@ chmod -R u+rwX "\${PACKAGE_ROOT}" 2>/dev/null || true
 rm -rf "\${PACKAGE_ROOT}"
 mkdir -p "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}"
 cp -a control-plane holo-tcmu-handler handler_holo.so handler_holo.c \
+  holo-iscsi-security-helper.py \
   install-holo.sh install.sh web-console "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
+cp "\${OUTPUT_DIR}/holo-local-loopback-helper.py" "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/holo-local-loopback-helper.py"
 if [ -d packages ]; then
   cp -a packages "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
 fi
@@ -415,7 +435,7 @@ tar xzf "${RELEASE_DIR}/${TARBALL_NAME}" -C "${VERIFY_DIR}"
 
 # Check all required files exist
 VERIFY_ROOT="${VERIFY_DIR}/${PACKAGE_DIR_NAME}"
-for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c install-holo.sh web-console/dist/index.html; do
+for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c holo-iscsi-security-helper.py holo-local-loopback-helper.py install-holo.sh web-console/dist/index.html; do
   if [[ ! -f "${VERIFY_ROOT}/${f}" && ! -d "${VERIFY_ROOT}/${f}" ]]; then
     echo "error: missing ${f} in tarball" >&2
     rm -rf "${VERIFY_DIR}"

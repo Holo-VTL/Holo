@@ -1276,7 +1276,8 @@ pub(crate) fn drive_mode_block_descriptor(
         crate::scsi_tape::state::BlockMode::Fixed if state.block_mode.fixed_block_size > 0 => {
             state.block_mode.fixed_block_size
         }
-        _ => DRIVE_DEFAULT_BLOCK_LENGTH,
+        crate::scsi_tape::state::BlockMode::Fixed => DRIVE_DEFAULT_BLOCK_LENGTH,
+        crate::scsi_tape::state::BlockMode::Variable => 0,
     };
     if state.mount_state == crate::scsi_tape::state::MountState::Loaded
         && has_custom_capacity_override(state, profile)

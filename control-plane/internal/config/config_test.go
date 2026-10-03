@@ -17,6 +17,17 @@ func TestLoad_DefaultAPIKeyIsEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ISCSISecretKeyPath(t *testing.T) {
+	t.Setenv("HOLO_ISCSI_SECRET_KEY", "")
+	if got := Load().ISCSISecretKeyPath; got != "/etc/holo/iscsi-secrets.key" {
+		t.Fatalf("expected default iSCSI key path, got %q", got)
+	}
+	t.Setenv("HOLO_ISCSI_SECRET_KEY", "/tmp/iscsi.key")
+	if got := Load().ISCSISecretKeyPath; got != "/tmp/iscsi.key" {
+		t.Fatalf("expected configured iSCSI key path, got %q", got)
+	}
+}
+
 func TestLoad_DefaultHTTPAddrUsesPort80(t *testing.T) {
 	t.Setenv("HOLO_HTTP_ADDR", "")
 	cfg := Load()

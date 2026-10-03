@@ -28,7 +28,6 @@ type HealthSummary struct {
 
 type HealthService struct {
 	targetProvider  TargetRuntimeHealthProvider
-	accessProvider  TargetAccessHealthProvider
 	discovery       TargetDiscoveryHealthProvider
 	metricsRegistry *metrics.MetricsRegistry
 	metadataDSN     string
@@ -36,18 +35,13 @@ type HealthService struct {
 	runDir          string
 }
 
-type TargetAccessHealthProvider interface {
-	AccessPolicySnapshotCount() int
+func NewHealthService(provider TargetRuntimeHealthProvider, discoveryProvider TargetDiscoveryHealthProvider, m *metrics.MetricsRegistry) *HealthService {
+	return NewHealthServiceWithConfig(provider, discoveryProvider, m, "", "")
 }
 
-func NewHealthService(provider TargetRuntimeHealthProvider, accessProvider TargetAccessHealthProvider, discoveryProvider TargetDiscoveryHealthProvider, m *metrics.MetricsRegistry) *HealthService {
-	return NewHealthServiceWithConfig(provider, accessProvider, discoveryProvider, m, "", "")
-}
-
-func NewHealthServiceWithConfig(provider TargetRuntimeHealthProvider, accessProvider TargetAccessHealthProvider, discoveryProvider TargetDiscoveryHealthProvider, m *metrics.MetricsRegistry, metadataDSN, runtimeMode string) *HealthService {
+func NewHealthServiceWithConfig(provider TargetRuntimeHealthProvider, discoveryProvider TargetDiscoveryHealthProvider, m *metrics.MetricsRegistry, metadataDSN, runtimeMode string) *HealthService {
 	return &HealthService{
 		targetProvider:  provider,
-		accessProvider:  accessProvider,
 		discovery:       discoveryProvider,
 		metricsRegistry: m,
 		metadataDSN:     strings.TrimSpace(metadataDSN),
@@ -83,13 +77,6 @@ func (s *HealthService) Summary() HealthSummary {
 			Name:    "target-runtime",
 			Status:  "healthy",
 			Message: "total=" + itoa(snap.TotalPublications) + ",ready=" + itoa(snap.ReadyPublications) + ",failed=" + itoa(snap.FailedPublications) + ",disabled=" + itoa(snap.DisabledPublications),
-		})
-	}
-	if s.accessProvider != nil {
-		components = append(components, ComponentHealth{
-			Name:    "target-access-policy",
-			Status:  "healthy",
-			Message: "snapshots=" + itoa(s.accessProvider.AccessPolicySnapshotCount()),
 		})
 	}
 	if s.discovery != nil {

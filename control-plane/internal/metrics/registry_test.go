@@ -43,6 +43,14 @@ func TestMetricsRegistry_Gauge(t *testing.T) {
 	}
 }
 
+func TestMetricsRegistryISCSISecurityMetrics(t *testing.T) {
+	r := NewMetricsRegistry()
+	r.RecordISCSISecurityApplyFailure()
+	if atomic.LoadInt64(&r.ISCSISecurityApplyFailures) != 1 {
+		t.Fatal("iSCSI security failure counters were not incremented")
+	}
+}
+
 func TestMetricsRegistry_AuditJournalFailureState(t *testing.T) {
 	r := NewMetricsRegistry()
 

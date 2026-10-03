@@ -5,14 +5,12 @@ import (
 	"testing"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
-	"github.com/Holo-VTL/Holo/control-plane/internal/auth"
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 )
 
 type discoveryServices struct {
 	runtime   *TargetRuntimeService
-	access    *TargetAccessService
 	discovery *TargetDiscoveryService
 }
 
@@ -20,9 +18,7 @@ func seededDiscoveryServices(t *testing.T) discoveryServices {
 	t.Helper()
 	coreRepo := memory.NewCoreResourcesRepo()
 	runtimeRepo := memory.NewTargetRuntimeRepo()
-	accessRepo := memory.NewTargetAccessRepo()
 	auditWriter := audit.NewMemoryWriter()
-	evaluator := auth.NewAccessEvaluator()
 
 	lib, err := domain.NewVirtualLibrary("lib-1", "lib-1")
 	if err != nil {
@@ -40,12 +36,11 @@ func seededDiscoveryServices(t *testing.T) discoveryServices {
 	_ = coreRepo.SaveCartridge(ctx, car)
 
 	runtimeSvc := NewTargetRuntimeService(coreRepo, runtimeRepo, auditWriter, nil)
-	accessSvc := NewTargetAccessService(runtimeRepo, accessRepo, evaluator, auditWriter)
-	discoverySvc := NewTargetDiscoveryService(runtimeRepo, accessRepo, evaluator, auditWriter)
-	return discoveryServices{runtime: runtimeSvc, access: accessSvc, discovery: discoverySvc}
+	discoverySvc := NewTargetDiscoveryService(runtimeRepo, auditWriter)
+	return discoveryServices{runtime: runtimeSvc, discovery: discoverySvc}
 }
 
-func TestTargetDiscoveryFiltersByStateACLAndPortal(t *testing.T) {
+func TestTargetDiscoveryFiltersByStateAndPortal(t *testing.T) {
 	svcs := seededDiscoveryServices(t)
 	ctx := context.Background()
 
@@ -70,29 +65,16 @@ func TestTargetDiscoveryFiltersByStateACLAndPortal(t *testing.T) {
 		t.Fatalf("publish B failed: %v", err)
 	}
 
-	_, err = svcs.access.ReplaceRules(ctx, pubA.PublicationID, "ops", []domain.InitiatorRule{{
-		Initiator:  "iqn.1993-08.org.debian:01:init-a",
-		Permission: domain.PermissionAllow,
-		Priority:   100,
-	}})
-	if err != nil {
-		t.Fatalf("set rules for A failed: %v", err)
-	}
-	_, err = svcs.access.ReplaceRules(ctx, pubB.PublicationID, "ops", []domain.InitiatorRule{{
-		Initiator:  "iqn.1993-08.org.debian:01:init-a",
-		Permission: domain.PermissionDeny,
-		Priority:   100,
-	}})
-	if err != nil {
-		t.Fatalf("set rules for B failed: %v", err)
-	}
-
 	results, err := svcs.discovery.Discover(ctx, domain.TargetDiscoveryRequest{Initiator: "iqn.1993-08.org.debian:01:init-a", Actor: "ops"})
 	if err != nil {
 		t.Fatalf("discover failed: %v", err)
 	}
-	if len(results) != 1 || results[0].PublicationID != pubA.PublicationID {
-		t.Fatalf("expected only pubA discoverable, got %+v", results)
+	found := make(map[string]bool, len(results))
+	for _, result := range results {
+		found[result.PublicationID] = true
+	}
+	if len(results) != 2 || !found[pubA.PublicationID] || !found[pubB.PublicationID] {
+		t.Fatalf("expected both unrestricted publications to be discoverable, got %+v", results)
 	}
 
 	portalFiltered, err := svcs.discovery.Discover(ctx, domain.TargetDiscoveryRequest{Initiator: "iqn.1993-08.org.debian:01:init-a", Portal: "10.10.10.10:3260", Actor: "ops"})
@@ -111,8 +93,8 @@ func TestTargetDiscoveryFiltersByStateACLAndPortal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discover after unpublish failed: %v", err)
 	}
-	if len(resultsAfter) != 0 {
-		t.Fatalf("expected no discoverable results after unpublish, got %+v", resultsAfter)
+	if len(resultsAfter) != 1 || resultsAfter[0].PublicationID != pubB.PublicationID {
+		t.Fatalf("expected only pubB after unpublishing pubA, got %+v", resultsAfter)
 	}
 
 	snapshot := svcs.discovery.DiscoverySnapshot()

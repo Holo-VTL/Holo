@@ -12,16 +12,15 @@ import (
 
 type TargetHandler struct {
 	service    *orchestration.TargetRuntimeService
-	access     *TargetAccessHandler
 	localMount *orchestration.LocalMountService
 }
 
-func NewTargetHandler(service *orchestration.TargetRuntimeService, access *TargetAccessHandler) *TargetHandler {
-	return &TargetHandler{service: service, access: access}
+func NewTargetHandler(service *orchestration.TargetRuntimeService) *TargetHandler {
+	return &TargetHandler{service: service}
 }
 
-func NewTargetHandlerWithLocalMount(service *orchestration.TargetRuntimeService, access *TargetAccessHandler, localMount *orchestration.LocalMountService) *TargetHandler {
-	return &TargetHandler{service: service, access: access, localMount: localMount}
+func NewTargetHandlerWithLocalMount(service *orchestration.TargetRuntimeService, localMount *orchestration.LocalMountService) *TargetHandler {
+	return &TargetHandler{service: service, localMount: localMount}
 }
 
 type publishTargetRequest struct {
@@ -43,7 +42,7 @@ type validationRunRequest struct {
 }
 
 type localMountRequest struct {
-	Enabled bool   `json:"enabled"`
+	Enabled *bool  `json:"enabled"`
 	Actor   string `json:"actor,omitempty"`
 }
 
@@ -66,12 +65,21 @@ func (h *TargetHandler) handleLocalMount(w http.ResponseWriter, r *http.Request)
 			respondError(w, http.StatusBadRequest, "invalid request body", err)
 			return
 		}
-		status, err := h.localMount.SetEnabled(r.Context(), req.Enabled, req.Actor)
+		if req.Enabled == nil {
+			respondError(w, http.StatusBadRequest, "enabled is required", nil)
+			return
+		}
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		status, err := h.localMount.SetEnabled(r.Context(), *req.Enabled, actor)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, "local mount sync failed", err)
 			return
 		}
-		respondJSON(w, http.StatusOK, status)
+		respondJSON(w, http.StatusAccepted, status)
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 	}
@@ -85,6 +93,12 @@ func (h *TargetHandler) handlePublications(w http.ResponseWriter, r *http.Reques
 			respondError(w, http.StatusBadRequest, "invalid request body", err)
 			return
 		}
+		actor, err := selfAssertedAuditActor(req.Actor)
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		req.Actor = actor
 		if err := validatePublishTargetRequest(req); err != nil {
 			respondError(w, http.StatusBadRequest, "invalid request", err)
 			return
@@ -229,24 +243,6 @@ func (h *TargetHandler) handlePublicationSubresource(w http.ResponseWriter, r *h
 		h.handleRollback(w, r, publicationID)
 	case "validation-runs":
 		h.handleValidationRuns(w, r, publicationID)
-	case "access-rules":
-		if h.access == nil {
-			respondError(w, http.StatusNotFound, "not found", nil)
-			return
-		}
-		h.access.handleAccessRules(w, r, publicationID)
-	case "authorize":
-		if h.access == nil {
-			respondError(w, http.StatusNotFound, "not found", nil)
-			return
-		}
-		h.access.handleAuthorize(w, r, publicationID)
-	case "access-rollback":
-		if h.access == nil {
-			respondError(w, http.StatusNotFound, "not found", nil)
-			return
-		}
-		h.access.handleAccessRollback(w, r, publicationID)
 	default:
 		respondError(w, http.StatusNotFound, "not found", nil)
 	}
@@ -257,7 +253,11 @@ func (h *TargetHandler) handleUnpublishAction(w http.ResponseWriter, r *http.Req
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	actor := r.URL.Query().Get("actor")
+	actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+	if err != nil {
+		respondResourceError(w, err)
+		return
+	}
 	publication, err := h.service.Unpublish(r.Context(), publicationID, actor)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -290,7 +290,11 @@ func (h *TargetHandler) handlePublicationByID(w http.ResponseWriter, r *http.Req
 		}
 		respondJSON(w, http.StatusOK, publication)
 	case http.MethodDelete:
-		actor := r.URL.Query().Get("actor")
+		actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
 		publication, err := h.service.Unpublish(r.Context(), publicationID, actor)
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -321,7 +325,11 @@ func (h *TargetHandler) handleRollback(w http.ResponseWriter, r *http.Request, p
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	actor := r.URL.Query().Get("actor")
+	actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+	if err != nil {
+		respondResourceError(w, err)
+		return
+	}
 	publication, err := h.service.Rollback(r.Context(), publicationID, actor)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, "invalid request", nil)
@@ -333,7 +341,11 @@ func (h *TargetHandler) handleRollback(w http.ResponseWriter, r *http.Request, p
 func (h *TargetHandler) handleValidationRuns(w http.ResponseWriter, r *http.Request, publicationID string) {
 	switch r.Method {
 	case http.MethodPost:
-		actor := r.URL.Query().Get("actor")
+		actor, err := selfAssertedAuditActor(r.URL.Query().Get("actor"))
+		if err != nil {
+			respondResourceError(w, err)
+			return
+		}
 		var req validationRunRequest
 		if err := decodeOptionalJSONBody(r, &req); err != nil {
 			respondError(w, http.StatusBadRequest, "invalid request body", err)

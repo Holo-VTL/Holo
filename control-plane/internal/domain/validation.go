@@ -109,13 +109,6 @@ func ValidateDevicePath(value string) error {
 	return nil
 }
 
-func ValidatePermission(value PolicyPermission) error {
-	if value != PermissionAllow && value != PermissionDeny {
-		return ErrInvalidInput
-	}
-	return nil
-}
-
 func hasControlRune(value string) bool {
 	for _, r := range value {
 		if unicode.IsControl(r) {

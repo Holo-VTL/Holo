@@ -1,6 +1,6 @@
 use std::fs;
 
-use super::blk_map::BlkMapRecord;
+use super::blk_map::{BlkMapRecord, PayloadChecksumAlgorithm};
 use super::compression::CompressionCodec;
 use super::layout::{initialize_layout, LayoutPaths};
 use super::map_lookup::MapLookupRecord;
@@ -50,9 +50,10 @@ fn flush_chain_respects_deterministic_order() {
             compression: CompressionCodec::None,
             compressed_len: 8,
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         };
         let mut out = Vec::new();
-        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(b"BMV3");
         out.extend_from_slice(&rec.encode());
         out
     };

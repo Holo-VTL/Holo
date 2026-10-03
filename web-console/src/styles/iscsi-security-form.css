@@ -1,0 +1,254 @@
+.iscsi-security-summary {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.iscsi-security-summary-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.iscsi-security-summary-header > div {
+  min-width: 0;
+}
+
+.iscsi-security-summary-header h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.iscsi-security-summary-header p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.iscsi-security-summary-header .btn {
+  flex: 0 0 auto;
+}
+
+.iscsi-security-summary-status {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.iscsi-security-summary-status > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-soft);
+}
+
+.iscsi-security-summary-status span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.iscsi-security-summary-status strong {
+  color: var(--text-body);
+  font-size: 13px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.iscsi-security-loading {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.iscsi-security-dialog {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.app-modal-card:has(.iscsi-security-create-layout),
+.app-modal-card:has(.iscsi-security-dialog) {
+  min-height: min(380px, calc(100vh - 40px));
+}
+
+.app-modal-card:has(.iscsi-security-create-layout) .app-modal-body,
+.app-modal-card:has(.iscsi-security-dialog) .app-modal-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+}
+
+.iscsi-security-create-layout {
+  display: contents;
+}
+
+.iscsi-security-editor-form {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.iscsi-security-editor-form .resource-create-chap-pair {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.iscsi-security-editor-form .form-row {
+  min-width: 0;
+}
+
+.iscsi-security-editor-form .form-row label {
+  color: var(--text-body);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.iscsi-security-editor-form .input,
+.iscsi-security-editor-form .select-input-trigger {
+  min-height: 42px;
+  border-color: var(--border-strong);
+  background: var(--bg-panel-solid);
+  font-size: 14px;
+}
+
+.iscsi-security-editor-form textarea.input {
+  min-height: 104px;
+  border-radius: var(--radius-md);
+}
+
+.iscsi-security-editor-form .form-row small {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.iscsi-security-editor-form .inline-actions {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.iscsi-security-editor-form .resource-create-main-actions {
+  margin: auto 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.iscsi-security-editor-form > .notice {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+}
+
+.iscsi-security-targets {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-soft);
+}
+
+.iscsi-security-targets > summary {
+  padding: 11px 13px;
+  color: var(--text-body);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.iscsi-security-targets[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.iscsi-security-sources {
+  display: grid;
+  gap: 8px;
+}
+
+.iscsi-security-sources .inspector-field {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 5px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.iscsi-security-sources .inspector-field:last-child {
+  border-bottom: 0;
+}
+
+.iscsi-security-sources .inspector-field > strong {
+  color: var(--text-body);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.55;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.iscsi-security-dialog > form {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.iscsi-security-dialog > form > .notice {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+}
+
+.iscsi-security-dialog .form-row {
+  max-width: 760px;
+}
+
+.iscsi-security-dialog .form-row label {
+  color: var(--text-body);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.iscsi-security-dialog .form-row small {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.iscsi-security-dialog .input,
+.iscsi-security-dialog .select-input-trigger {
+  min-height: 44px;
+  border-color: var(--border-strong);
+  background: var(--bg-panel-solid);
+  font-size: 14px;
+}
+
+.iscsi-security-dialog textarea.input {
+  min-height: 104px;
+  border-radius: var(--radius-md);
+}
+
+.iscsi-security-dialog .inline-actions {
+  justify-content: flex-end;
+  margin-top: auto;
+}
+
+@media (max-width: 560px) {
+  .iscsi-security-summary-header {
+    flex-direction: column;
+  }
+
+  .iscsi-security-summary-status {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .iscsi-security-sources .inspector-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

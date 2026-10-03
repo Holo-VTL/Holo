@@ -11,6 +11,8 @@
 use data_plane::iscsi::cdb_server::{
     dispatch_raw_cdb_with_context, CdbDispatchContext, CdbPacket, CdbResponse, MAX_DATA_LEN,
 };
+use data_plane::scsi_tape::identity::DeviceIdentityProfile;
+use data_plane::scsi_tape::profiles::resolve_active_profile_from_env;
 use data_plane::scsi_tape::state::TapeState;
 use signal_hook::consts::signal::SIGTERM;
 use signal_hook::flag;
@@ -32,6 +34,20 @@ const SLOW_CDB_CRITICAL_US: u64 = 30_000_000;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|arg| arg == "--print-vpd-serial") {
+        let publication_id =
+            parse_arg(&args, "--publication-id").unwrap_or_else(|| "default".to_string());
+        let serial_seed = resolve_serial_seed(&publication_id);
+        match resolve_vpd_serial(&resolve_active_profile_from_env(), &serial_seed) {
+            Ok(serial) => println!("{serial}"),
+            Err(error) => {
+                eprintln!("[tcmu_handler] could not resolve VPD serial: {error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     let socket_path = parse_arg(&args, "--socket-path")
         .unwrap_or_else(|| "/run/holo/cdb-default.sock".to_string());
@@ -209,6 +225,15 @@ fn resolve_serial_seed(publication_id: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn resolve_vpd_serial(
+    profile: &DeviceIdentityProfile,
+    serial_seed: &str,
+) -> Result<String, String> {
+    profile
+        .serial_for_vpd_seed(serial_seed)
+        .map_err(|_| "invalid device identity profile".to_string())
 }
 
 fn read_frame_data<R: Read>(
@@ -732,5 +757,14 @@ mod tests {
     #[test]
     fn hex_bytes_uses_uppercase_scsi_cdb_format() {
         assert_eq!(hex_bytes(&[0x0A, 0x01, 0x00, 0xFF]), "0A0100FF");
+    }
+
+    #[test]
+    fn resolves_vpd_serial_with_profile_rules() {
+        let profile = data_plane::scsi_tape::profiles::resolve_changer_profile("ibm-03584l32");
+        assert_eq!(
+            resolve_vpd_serial(&profile, "drive-01").unwrap(),
+            "IBMdrive01000400"
+        );
     }
 }

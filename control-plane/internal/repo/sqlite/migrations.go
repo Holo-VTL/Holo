@@ -3,9 +3,12 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrUnsupportedSchemaVersion = errors.New("database schema version is newer than supported")
 
 type migration struct {
 	version int
@@ -80,22 +83,6 @@ CREATE TABLE IF NOT EXISTS storage_pool_disks (
   FOREIGN KEY(pool_id) REFERENCES storage_pools(pool_id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS access_policies (
-  policy_id TEXT PRIMARY KEY,
-  scope TEXT NOT NULL,
-  subject TEXT NOT NULL,
-  permission TEXT NOT NULL,
-  effective_from TEXT NOT NULL,
-  effective_to TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS retention_policies (
-  retention_id TEXT PRIMARY KEY,
-  cartridge_id TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  lock_until TEXT NOT NULL,
-  created_by TEXT NOT NULL
-);
 `,
 	},
 	{
@@ -187,6 +174,132 @@ CREATE TABLE IF NOT EXISTS local_mount_settings (
 ALTER TABLE virtual_cartridges ADD COLUMN assigned_slot_address INTEGER;
 `,
 	},
+	{
+		version: 7,
+		sql: `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_virtual_drives_drive_library
+  ON virtual_drives(drive_id, library_id);
+
+CREATE TABLE IF NOT EXISTS iscsi_chap_credentials (
+  credential_id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  username TEXT NOT NULL,
+  mutual_username TEXT NOT NULL DEFAULT '',
+  encrypted_secret BLOB NOT NULL,
+  version INTEGER NOT NULL CHECK(version > 0),
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS library_iscsi_security (
+  library_id TEXT PRIMARY KEY,
+  auth_mode TEXT,
+  credential_id TEXT,
+  initiators_json TEXT NOT NULL DEFAULT '[]',
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  FOREIGN KEY(library_id) REFERENCES virtual_libraries(library_id) ON DELETE CASCADE,
+  FOREIGN KEY(credential_id) REFERENCES iscsi_chap_credentials(credential_id) ON DELETE RESTRICT,
+  CHECK(auth_mode IS NULL OR auth_mode IN ('none', 'chap', 'mutual_chap')),
+  CHECK((auth_mode IN ('chap', 'mutual_chap') AND credential_id IS NOT NULL AND initiators_json <> '[]') OR (auth_mode = 'none' AND credential_id IS NULL) OR (auth_mode IS NULL AND credential_id IS NULL AND initiators_json = '[]'))
+);
+
+CREATE TABLE IF NOT EXISTS drive_iscsi_security (
+  drive_id TEXT PRIMARY KEY,
+  library_id TEXT NOT NULL,
+  auth_mode TEXT,
+  credential_id TEXT,
+  initiators_json TEXT NOT NULL DEFAULT '[]',
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  FOREIGN KEY(drive_id, library_id) REFERENCES virtual_drives(drive_id, library_id) ON DELETE CASCADE,
+  FOREIGN KEY(credential_id) REFERENCES iscsi_chap_credentials(credential_id) ON DELETE RESTRICT,
+  CHECK(auth_mode IS NULL OR auth_mode IN ('none', 'chap', 'mutual_chap')),
+  CHECK((auth_mode IN ('chap', 'mutual_chap') AND credential_id IS NOT NULL AND initiators_json <> '[]') OR (auth_mode = 'none' AND credential_id IS NULL) OR (auth_mode IS NULL AND credential_id IS NULL AND initiators_json = '[]'))
+);
+
+CREATE TABLE IF NOT EXISTS target_iscsi_security (
+  target_iqn TEXT PRIMARY KEY,
+  library_id TEXT NOT NULL,
+  drive_id TEXT,
+  device_role TEXT NOT NULL CHECK(device_role IN ('drive', 'changer')),
+  administrative_offline INTEGER NOT NULL DEFAULT 0 CHECK(administrative_offline IN (0, 1)),
+  auth_mode TEXT,
+  credential_id TEXT,
+  initiators_json TEXT NOT NULL DEFAULT '[]',
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  FOREIGN KEY(library_id) REFERENCES virtual_libraries(library_id) ON DELETE CASCADE,
+  FOREIGN KEY(drive_id, library_id) REFERENCES virtual_drives(drive_id, library_id) ON DELETE CASCADE,
+  FOREIGN KEY(credential_id) REFERENCES iscsi_chap_credentials(credential_id) ON DELETE RESTRICT,
+  CHECK((device_role = 'drive' AND drive_id IS NOT NULL) OR (device_role = 'changer' AND drive_id IS NULL)),
+  CHECK(auth_mode IS NULL OR auth_mode IN ('none', 'chap', 'mutual_chap')),
+  CHECK((auth_mode IN ('chap', 'mutual_chap') AND credential_id IS NOT NULL AND initiators_json <> '[]') OR (auth_mode = 'none' AND credential_id IS NULL) OR (auth_mode IS NULL AND credential_id IS NULL AND initiators_json = '[]'))
+);
+
+CREATE TABLE IF NOT EXISTS iscsi_security_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK(scope IN ('library', 'drive', 'target')),
+  owner_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK(version > 0),
+  payload BLOB NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(scope, owner_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS iscsi_snapshot_credentials (
+  snapshot_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id, credential_id),
+  FOREIGN KEY(snapshot_id) REFERENCES iscsi_security_snapshots(snapshot_id) ON DELETE CASCADE,
+  FOREIGN KEY(credential_id) REFERENCES iscsi_chap_credentials(credential_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_iscsi_security_snapshot_history
+  ON iscsi_security_snapshots(scope, owner_id, version DESC);
+`,
+	},
+	{
+		version: 8,
+		sql: `
+ALTER TABLE target_publications ADD COLUMN security_enforcement TEXT NOT NULL DEFAULT 'unprotected'
+  CHECK(security_enforcement IN ('unprotected', 'simulated', 'enforcing', 'blocked', 'offline'));
+`,
+	},
+	{
+		version: 9,
+		sql: `
+ALTER TABLE library_iscsi_security ADD COLUMN restrict_initiators INTEGER NOT NULL DEFAULT 0 CHECK(restrict_initiators IN (0, 1));
+ALTER TABLE drive_iscsi_security ADD COLUMN restrict_initiators INTEGER NOT NULL DEFAULT 0 CHECK(restrict_initiators IN (0, 1));
+ALTER TABLE target_iscsi_security ADD COLUMN restrict_initiators INTEGER NOT NULL DEFAULT 0 CHECK(restrict_initiators IN (0, 1));
+`,
+	},
+	{
+		version: 10,
+		sql: `
+CREATE TABLE IF NOT EXISTS local_loopback_libraries (
+  library_id TEXT PRIMARY KEY,
+  target_naa TEXT NOT NULL UNIQUE,
+  nexus_naa TEXT NOT NULL UNIQUE,
+  tpg_tag INTEGER NOT NULL CHECK(tpg_tag = 1)
+);
+
+CREATE TABLE IF NOT EXISTS local_loopback_devices (
+  device_key TEXT PRIMARY KEY,
+  library_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('changer', 'drive')),
+  drive_id TEXT,
+  lun_index INTEGER NOT NULL,
+  identity_ref TEXT NOT NULL UNIQUE,
+  backend_ref TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK(state IN ('active', 'cleanup_pending', 'inactive')),
+  FOREIGN KEY(library_id) REFERENCES local_loopback_libraries(library_id) ON DELETE RESTRICT,
+  UNIQUE(library_id, lun_index),
+  CHECK((kind = 'changer' AND device_key = 'changer:' || library_id AND drive_id IS NULL AND lun_index = 0) OR
+        (kind = 'drive' AND drive_id IS NOT NULL AND device_key = 'drive:' || drive_id AND lun_index BETWEEN 1 AND 65535))
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_loopback_devices_library
+  ON local_loopback_devices(library_id, device_key);
+`,
+	},
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {
@@ -196,6 +309,12 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	applied, err := appliedVersions(ctx, db)
 	if err != nil {
 		return err
+	}
+	maxVersion := migrations[len(migrations)-1].version
+	for version := range applied {
+		if version > maxVersion {
+			return fmt.Errorf("%w: database version %d, supported maximum %d", ErrUnsupportedSchemaVersion, version, maxVersion)
+		}
 	}
 	for _, m := range migrations {
 		if applied[m.version] {

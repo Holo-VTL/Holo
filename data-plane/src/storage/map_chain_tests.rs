@@ -1,6 +1,9 @@
 use std::fs;
 
-use super::blk_map::{append_blk_map_record, load_blk_map_records, BlkMapRecord, BlkMapState};
+use super::blk_map::{
+    append_blk_map_record, load_blk_map_records, BlkMapRecord, BlkMapState,
+    PayloadChecksumAlgorithm,
+};
 use super::compression::CompressionCodec;
 use super::data_path::{read_logical_block, write_logical_block, WriteOptions};
 use super::layout::{initialize_layout, load_layout, LayoutPaths};
@@ -44,6 +47,7 @@ fn appends_and_locates_map_chain_records() {
             compression: CompressionCodec::None,
             compressed_len: 64,
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         },
     )
     .expect("append rec1 should pass");
@@ -62,6 +66,7 @@ fn appends_and_locates_map_chain_records() {
             compression: CompressionCodec::None,
             compressed_len: 64,
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         },
     )
     .expect("append rec2 should pass");
@@ -115,6 +120,7 @@ fn rebuilds_lookup_after_restart() {
             compression: CompressionCodec::None,
             compressed_len: 32,
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         },
     )
     .expect("append blk map should pass");
@@ -149,6 +155,7 @@ fn rebuild_lookup_rejects_zero_length_active_record() {
             compression: CompressionCodec::None,
             compressed_len: 0,
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         },
     )
     .expect("append blk map should pass");
@@ -177,6 +184,7 @@ fn marks_reclaim_candidate_and_refreshes_safety() {
             compression: CompressionCodec::None,
             compressed_len: 10,
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         },
     )
     .expect("append blk map should pass");

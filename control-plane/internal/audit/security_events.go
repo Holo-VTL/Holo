@@ -19,7 +19,7 @@ func EmitDenyEvent(ctx context.Context, writer Writer, actor, objectID string, d
 	}
 	writeEventWithFailureLog(ctx, writer, Event{
 		EventID:    NewEventID("deny", objectID),
-		Actor:      actor,
+		Actor:      NormalizeServiceActor(actor),
 		Action:     "access_denied",
 		ObjectType: "target",
 		ObjectID:   objectID,
@@ -35,7 +35,7 @@ func EmitRetentionBlockedEvent(ctx context.Context, writer Writer, actor, object
 	}
 	writeEventWithFailureLog(ctx, writer, Event{
 		EventID:    NewEventID("retention", objectID),
-		Actor:      actor,
+		Actor:      NormalizeServiceActor(actor),
 		Action:     "retention_blocked",
 		ObjectType: "cartridge",
 		ObjectID:   objectID,
@@ -48,9 +48,7 @@ func EmitTargetRuntimeEvent(ctx context.Context, writer Writer, actor, action, o
 	if writer == nil {
 		return
 	}
-	if actor == "" {
-		actor = "system"
-	}
+	actor = NormalizeServiceActor(actor)
 	if result == "" {
 		result = "success"
 	}
@@ -66,35 +64,11 @@ func EmitTargetRuntimeEvent(ctx context.Context, writer Writer, actor, action, o
 	})
 }
 
-func EmitTargetAccessPolicyEvent(ctx context.Context, writer Writer, actor, action, objectID, result string, details map[string]any) {
-	if writer == nil {
-		return
-	}
-	if actor == "" {
-		actor = "system"
-	}
-	if result == "" {
-		result = "success"
-	}
-	writeEventWithFailureLog(ctx, writer, Event{
-		EventID:    NewEventID(action, objectID),
-		Actor:      actor,
-		Action:     action,
-		ObjectType: "target_access_policy",
-		ObjectID:   objectID,
-		Result:     result,
-		Details:    details,
-		OccurredAt: time.Now().UTC(),
-	})
-}
-
 func EmitTargetDiscoveryEvent(ctx context.Context, writer Writer, actor, action, objectID, result string, details map[string]any) {
 	if writer == nil {
 		return
 	}
-	if actor == "" {
-		actor = "system"
-	}
+	actor = NormalizeServiceActor(actor)
 	if result == "" {
 		result = "success"
 	}

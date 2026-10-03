@@ -1,5 +1,5 @@
 import { Check, ChevronDown } from "lucide-react";
-import { KeyboardEvent, useEffect, useId, useRef, useState } from "react";
+import { KeyboardEvent, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 export type SelectInputOption = {
   value: string;
@@ -20,7 +20,9 @@ export function SelectInput({ value, options, onChange, ariaLabel, disabled = fa
   const listboxId = useId();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
+  const [menuMaxHeight, setMenuMaxHeight] = useState(280);
   const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
   const selected = options[selectedIndex];
 
@@ -36,6 +38,32 @@ export function SelectInput({ value, options, onChange, ariaLabel, disabled = fa
     document.addEventListener("mousedown", closeOnOutsideClick);
     return () => document.removeEventListener("mousedown", closeOnOutsideClick);
   }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const menu = menuRef.current;
+    const trigger = buttonRef.current;
+    const scrollContainer = rootRef.current?.closest<HTMLElement>(".app-modal-body");
+    if (!menu || !trigger || !scrollContainer) {
+      setMenuMaxHeight(280);
+      return;
+    }
+
+    const maxMenuHeight = Math.min(280, menu.scrollHeight);
+    const containerBounds = scrollContainer.getBoundingClientRect();
+    const triggerBounds = trigger.getBoundingClientRect();
+    const gap = 6;
+    const overflow = triggerBounds.bottom + gap + maxMenuHeight - containerBounds.bottom;
+    if (overflow > 0) {
+      const scrollRoom = Math.max(0, triggerBounds.top - containerBounds.top - 8);
+      scrollContainer.scrollTop += Math.min(overflow, scrollRoom);
+    }
+
+    const visibleBounds = scrollContainer.getBoundingClientRect();
+    const visibleTrigger = trigger.getBoundingClientRect();
+    const availableHeight = Math.max(64, visibleBounds.bottom - visibleTrigger.bottom - gap - 8);
+    setMenuMaxHeight(Math.min(280, availableHeight));
+  }, [open, options.length]);
 
   function selectOption(option: SelectInputOption) {
     if (option.disabled) {
@@ -105,7 +133,7 @@ export function SelectInput({ value, options, onChange, ariaLabel, disabled = fa
         <ChevronDown size={16} aria-hidden="true" />
       </button>
       {open ? (
-        <div className="select-input-menu" id={listboxId} role="listbox" aria-label={ariaLabel}>
+        <div ref={menuRef} className="select-input-menu" id={listboxId} role="listbox" aria-label={ariaLabel} style={{ maxHeight: `${menuMaxHeight}px` }}>
           {options.map((option) => (
             <button
               className={`select-input-option ${option.value === value ? "select-input-option-selected" : ""}`}

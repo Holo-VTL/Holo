@@ -566,13 +566,5 @@ func isSQLiteConstraint(err error) bool {
 	if !errors.As(err, &sqliteErr) {
 		return false
 	}
-	switch sqliteErr.Code() {
-	case sqlite3.SQLITE_CONSTRAINT,
-		sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY,
-		sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
-		sqlite3.SQLITE_CONSTRAINT_UNIQUE:
-		return true
-	default:
-		return false
-	}
+	return sqliteErr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 }

@@ -3,9 +3,11 @@ import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { Plus } from "lucide-react";
 import { api } from "../services/api";
+import { AppModal } from "../components/AppModal";
+import { IscsiSecurityBlockEditor, type SecurityEditorDraft } from "../components/IscsiSecurityBlockEditor";
 import { useToast } from "../components/Toast";
 import { SelectInput } from "../components/SelectInput";
-import type { VirtualCartridge, VirtualDrive, VirtualLibrary } from "../services/types";
+import type { ISCSICredentialMetadata, VirtualCartridge, VirtualDrive, VirtualLibrary } from "../services/types";
 import {
   DEFAULT_DRIVE_OPTION,
   DEFAULT_LIBRARY_OPTION,
@@ -20,6 +22,23 @@ const DEFAULT_DRIVE_START_ADDRESS = 256;
 const DEFAULT_SLOT_START_ADDRESS = 1024;
 const DEFAULT_IE_PORT_COUNT = 4;
 const DEFAULT_IE_START_ADDRESS = 768;
+
+type CreationSecurityDraft = SecurityEditorDraft;
+type SecurityEditor = "chap";
+
+const DEFAULT_CREATION_SECURITY: CreationSecurityDraft = {
+  authMode: "none",
+  credentialId: "",
+  initiators: "",
+};
+
+function splitInitiatorIQNs(value: string): string[] {
+  return [...new Set(value.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean))];
+}
+
+function validInitiatorIQN(value: string): boolean {
+  return value.length <= 223 && !value.includes("..") && /^iqn\.[0-9]{4}-[0-9]{2}\.[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9:._-]*$/i.test(value);
+}
 
 function normalizeDriveCount(value: number): number {
   if (!Number.isFinite(value)) {
@@ -40,6 +59,15 @@ export function ResourcesPage() {
 
   const [vtlDialogOpen, setVtlDialogOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [createDialogTopOffset, setCreateDialogTopOffset] = useState<number>();
+  const [createDialogHeight, setCreateDialogHeight] = useState<number>();
+  const [securityEditor, setSecurityEditor] = useState<SecurityEditor | null>(null);
+  const [securityEditorDraft, setSecurityEditorDraft] = useState<CreationSecurityDraft>(DEFAULT_CREATION_SECURITY);
+  const [securityMaterialLoading, setSecurityMaterialLoading] = useState(false);
+  const [securityMaterialError, setSecurityMaterialError] = useState("");
+  const [createError, setCreateError] = useState("");
+  const [credentials, setCredentials] = useState<ISCSICredentialMetadata[]>([]);
+  const [creationSecurity, setCreationSecurity] = useState<CreationSecurityDraft>(DEFAULT_CREATION_SECURITY);
 
   const [vtlForm, setVtlForm] = useState({
     name: "",
@@ -94,6 +122,81 @@ export function ResourcesPage() {
     }
   }
 
+  async function loadSecurityChoices() {
+    setSecurityMaterialLoading(true);
+    setSecurityMaterialError("");
+    try {
+      const credentialRows = await api.iscsiSecurity.listCredentials();
+      setCredentials(credentialRows);
+    } catch (err) {
+      setSecurityMaterialError((err as Error).message || t("messages.requestFailed"));
+    } finally {
+      setSecurityMaterialLoading(false);
+    }
+  }
+
+  function closeVtlDialog() {
+    if (creating) return;
+    setVtlDialogOpen(false);
+    setCreateDialogTopOffset(undefined);
+    setCreateDialogHeight(undefined);
+    setSecurityEditor(null);
+    setSecurityEditorDraft(DEFAULT_CREATION_SECURITY);
+    setSecurityMaterialError("");
+    setCreateError("");
+    setCreationSecurity(DEFAULT_CREATION_SECURITY);
+  }
+
+  function pinCreateDialogPosition() {
+    const dialog = document.querySelector<HTMLElement>(".app-modal-card");
+    if (!dialog) return;
+    const bounds = dialog.getBoundingClientRect();
+    if (bounds.height <= 0) return;
+    setCreateDialogTopOffset(bounds.top);
+    setCreateDialogHeight(bounds.height);
+  }
+
+  function openSecurityEditor(editor: SecurityEditor) {
+    pinCreateDialogPosition();
+    setSecurityEditorDraft({ ...creationSecurity });
+    setSecurityEditor(editor);
+    setCreateError("");
+    void loadSecurityChoices();
+  }
+
+  function saveSecurityEditor() {
+    setCreationSecurity({ ...securityEditorDraft });
+    setSecurityEditor(null);
+    setCreateError("");
+  }
+
+  function cancelSecurityEditor() {
+    setSecurityEditorDraft({ ...creationSecurity });
+    setSecurityEditor(null);
+    setCreateError("");
+  }
+
+  async function validateCreationSecurity() {
+    const { authMode, credentialId, initiators } = creationSecurity;
+    if (authMode === "none") return;
+    const initiatorList = splitInitiatorIQNs(initiators);
+    if (authMode !== "inherit" && !credentialId) throw new Error(t("iscsiSecurity.credentialRequired"));
+    if ((authMode === "chap" || authMode === "mutual_chap") && (initiatorList.length === 0 || initiatorList.some((iqn) => !validInitiatorIQN(iqn)))) {
+      throw new Error(t("iscsiSecurity.initiatorInvalid"));
+    }
+  }
+
+  async function saveCreationSecurity(libraryId: string) {
+    const { authMode, credentialId, initiators } = creationSecurity;
+    if (authMode === "none") return;
+    const initiatorList = splitInitiatorIQNs(initiators);
+    await api.iscsiSecurity.putLibraryBinding(libraryId, {
+      generation: 1,
+      auth: authMode === "inherit" ? null : { mode: authMode, credentialId, initiators: initiatorList },
+      actor: "web-console",
+    });
+  }
+
   useEffect(() => {
     void reloadAll();
   }, []);
@@ -122,19 +225,6 @@ export function ResourcesPage() {
     }
   }, [driveTypeOptions, vtlForm.driveType]);
 
-  useEffect(() => {
-    if (!vtlDialogOpen) {
-      return;
-    }
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        setVtlDialogOpen(false);
-      }
-    }
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [vtlDialogOpen]);
-
   async function createVtl(event: FormEvent) {
     event.preventDefault();
     const trimmedName = vtlForm.name.trim();
@@ -143,7 +233,20 @@ export function ResourcesPage() {
       return;
     }
 
+    setCreateError("");
+    try {
+      await validateCreationSecurity();
+    } catch (err) {
+      setCreateError((err as Error).message || t("messages.requestFailed"));
+      pinCreateDialogPosition();
+      setSecurityEditorDraft({ ...creationSecurity });
+      setSecurityEditor("chap");
+      void loadSecurityChoices();
+      return;
+    }
+
     setCreating(true);
+    let securitySaveError: unknown;
     try {
       const libraryId = nextLibraryId(trimmedName, libraries);
       const driveCount = normalizeDriveCount(vtlForm.driveCount);
@@ -172,8 +275,25 @@ export function ResourcesPage() {
         });
       }
 
-      push(t("messages.requestSuccess"), "success");
+      try {
+        await saveCreationSecurity(libraryId);
+      } catch (err) {
+        securitySaveError = err;
+      }
+
+      if (securitySaveError) {
+        push(t("resources.createSecuritySaveFailed", { message: (securitySaveError as Error).message || t("messages.requestFailed") }), "error");
+      } else {
+        push(t("messages.requestSuccess"), "success");
+      }
       setVtlDialogOpen(false);
+      setCreateDialogTopOffset(undefined);
+      setCreateDialogHeight(undefined);
+      setSecurityEditor(null);
+      setSecurityEditorDraft(DEFAULT_CREATION_SECURITY);
+      setSecurityMaterialError("");
+      setCreateError("");
+      setCreationSecurity(DEFAULT_CREATION_SECURITY);
       setVtlForm({
         name: "",
         vendor: DEFAULT_LIBRARY_OPTION.vendor,
@@ -194,6 +314,15 @@ export function ResourcesPage() {
     }
   }
 
+  const creationInitiators = splitInitiatorIQNs(creationSecurity.initiators);
+  const chapNeedsSetup = creationSecurity.authMode !== "none" && creationSecurity.authMode !== "inherit" && (
+    !creationSecurity.credentialId ||
+    creationInitiators.length === 0 ||
+    creationInitiators.some((iqn) => !validInitiatorIQN(iqn))
+  );
+  const chapStatus = creationSecurity.authMode === "none" || creationSecurity.authMode === "inherit"
+    ? t("resources.notConfigured")
+    : t(chapNeedsSetup ? "resources.needsSetup" : "resources.configured");
   return (
     <section>
       <div className="page-header">
@@ -201,7 +330,7 @@ export function ResourcesPage() {
           <div>
             <h1 className="page-title">{t("resources.title")}</h1>
           </div>
-          <button className="btn btn-primary" type="button" onClick={() => setVtlDialogOpen(true)}>
+      <button className="btn btn-primary" type="button" onClick={() => setVtlDialogOpen(true)}>
             <Plus size={14} />
             {t("resources.createVtl")}
           </button>
@@ -224,7 +353,6 @@ export function ResourcesPage() {
                 <th>{t("resources.slotCount")}</th>
                 <th>{t("resources.cartridges")}</th>
                 <th>{t("resources.dataPolicy")}</th>
-                <th>{t("resources.iqn")}</th>
               </tr>
             </thead>
             <tbody>
@@ -253,7 +381,6 @@ export function ResourcesPage() {
                     <span className="table-chip">{library.compressionEnabled ? t("resources.compression") : t("resources.noCompression")}</span>
                     <span className="table-chip">{library.dedupEnabled ? t("resources.dedup") : t("resources.noDedup")}</span>
                   </td>
-                  <td>{library.iqn || "-"}</td>
                 </tr>
               ))}
             </tbody>
@@ -262,15 +389,61 @@ export function ResourcesPage() {
       </div>
 
       {vtlDialogOpen ? (
-        <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={() => setVtlDialogOpen(false)}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <h3 style={{ margin: 0 }}>{t("resources.createVtlDialogTitle")}</h3>
-            </div>
-            <form className="form-grid" onSubmit={createVtl}>
+        <AppModal
+          open={vtlDialogOpen}
+          title={securityEditor === "chap"
+            ? t("resources.configureChapTitle")
+            : t("resources.createVtlDialogTitle")}
+          description={securityEditor === "chap"
+            ? t("resources.configureChapHint")
+            : undefined}
+          size="medium"
+          topOffset={createDialogTopOffset}
+          fixedHeight={createDialogHeight}
+          focusKey={securityEditor ?? "create"}
+          busy={creating}
+          onClose={securityEditor ? cancelSecurityEditor : closeVtlDialog}
+        >
+          {securityEditor ? (
+            <form
+              className="form-grid resource-create-security-editor"
+              onSubmit={(event) => {
+                event.preventDefault();
+                saveSecurityEditor();
+              }}
+            >
+              {createError ? <p className="notice notice-error form-row-wide" role="alert">{createError}</p> : null}
+              {securityMaterialError ? <p className="notice notice-error form-row-wide" role="alert">{securityMaterialError}</p> : null}
+              {securityMaterialLoading ? <p className="notice form-row-wide">{t("common.loading")}</p> : null}
+              {securityMaterialError ? (
+                <div className="inline-actions form-row-wide">
+                  <a className="btn btn-quiet" href="/ui/security" target="_blank" rel="noreferrer">{t("resources.openConnectionSecurity")}</a>
+                  <button className="btn btn-quiet" type="button" disabled={securityMaterialLoading} onClick={() => void loadSecurityChoices()}>{t("resources.refreshSecurityOptions")}</button>
+                </div>
+              ) : null}
+              <IscsiSecurityBlockEditor
+                scope="create"
+                draft={securityEditorDraft}
+                credentials={credentials}
+                loading={securityMaterialLoading}
+                onRefresh={() => void loadSecurityChoices()}
+                onChange={setSecurityEditorDraft}
+              />
+              <div className="inline-actions form-row-wide resource-create-actions resource-create-main-actions" style={{ justifyContent: "flex-end" }}>
+                <button className="btn btn-primary" type="submit" disabled={creating}>
+                  {t("resources.saveSecuritySettings")}
+                </button>
+                <button className="btn btn-quiet" type="button" disabled={creating} onClick={cancelSecurityEditor}>
+                  {t("common.cancel")}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form className="form-grid resource-create-main-form" onSubmit={createVtl}>
               <div className="form-row">
-                <label>{t("resources.vtlName")}</label>
+                <label htmlFor="create-vtl-name">{t("resources.vtlName")}</label>
                 <input
+                  id="create-vtl-name"
                   className="input"
                   value={vtlForm.name}
                   onChange={(event) => setVtlForm((prev) => ({ ...prev, name: event.target.value }))}
@@ -363,17 +536,30 @@ export function ResourcesPage() {
                   </label>
                 </div>
               </div>
-              <div className="inline-actions" style={{ gridColumn: "1 / -1" }}>
-                <button className="btn btn-primary" type="submit" disabled={creating}>
+              <div className="resource-security-setup-grid form-row-wide">
+                <div className="resource-security-config-row">
+                  <div className="resource-security-config-heading">
+                    <h3>{t("resources.chapTitle")}</h3>
+                    <span className={`resource-security-config-status${chapNeedsSetup ? " is-incomplete" : creationSecurity.authMode !== "none" ? " is-configured" : ""}`}>
+                      {chapStatus}
+                    </span>
+                  </div>
+                  <button className="btn btn-quiet" type="button" disabled={creating} onClick={() => openSecurityEditor("chap")}>
+                    {t("resources.configureChap")}
+                  </button>
+                </div>
+              </div>
+              <div className="inline-actions form-row-wide resource-create-actions resource-create-main-actions" style={{ justifyContent: "flex-end" }}>
+                <button className="btn btn-primary" type="submit" disabled={creating || securityMaterialLoading}>
                   {creating ? t("common.loading") : t("common.create")}
                 </button>
-                <button className="btn btn-quiet" type="button" onClick={() => setVtlDialogOpen(false)}>
+                <button className="btn btn-quiet" type="button" disabled={creating} onClick={closeVtlDialog}>
                   {t("common.cancel")}
                 </button>
               </div>
             </form>
-          </div>
-        </div>
+          )}
+        </AppModal>
       ) : null}
 
     </section>

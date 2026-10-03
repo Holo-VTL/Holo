@@ -13,7 +13,7 @@ pub mod segment_index;
 
 pub use blk_map::{
     append_blk_map_record, load_blk_map_records, mark_blk_map_stale, mark_blk_map_stale_batch,
-    persist_blk_map_records, BlkMapRecord, BlkMapState,
+    persist_blk_map_records, BlkMapRecord, BlkMapState, PayloadChecksumAlgorithm,
 };
 pub use compaction::{compact_segment, CompactionReport};
 pub use compression::{compress_payload, decompress_payload, CompressionCodec, CompressionStats};

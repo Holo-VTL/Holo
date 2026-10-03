@@ -14,14 +14,37 @@ use super::segment::{
 
 pub const MAX_RECORDS_PER_SEGMENT: usize = 1024;
 const LEGACY_RECORD_SIZE: usize = 41;
-const EXTENDED_RECORD_SIZE: usize = 58;
-const LOG_PREFIX: &[u8; 4] = b"BMV2";
+const EXTENDED_RECORD_V2_SIZE: usize = 58;
+const EXTENDED_RECORD_V3_SIZE: usize = 59;
+const LOG_PREFIX_V2: &[u8; 4] = b"BMV2";
+const LOG_PREFIX: &[u8; 4] = b"BMV3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BlkMapState {
     Active = 1,
     Stale = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PayloadChecksumAlgorithm {
+    None = 0,
+    Fnv1a32 = 1,
+    Crc32c = 2,
+}
+
+impl PayloadChecksumAlgorithm {
+    fn from_u8(value: u8) -> Result<Self, StorageError> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Fnv1a32),
+            2 => Ok(Self::Crc32c),
+            _ => Err(StorageError::Corrupt(
+                "unknown blk map checksum algorithm".to_string(),
+            )),
+        }
+    }
 }
 
 impl BlkMapState {
@@ -47,6 +70,7 @@ pub struct BlkMapRecord {
     pub compression: CompressionCodec,
     pub compressed_len: u32,
     pub payload_checksum: u32,
+    pub payload_checksum_algorithm: PayloadChecksumAlgorithm,
 }
 
 impl BlkMapRecord {
@@ -55,7 +79,7 @@ impl BlkMapRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(EXTENDED_RECORD_SIZE);
+        let mut out = Vec::with_capacity(EXTENDED_RECORD_V3_SIZE);
         out.extend_from_slice(&self.record_id.to_le_bytes());
         out.extend_from_slice(&self.logical_start.to_le_bytes());
         out.extend_from_slice(&self.logical_len.to_le_bytes());
@@ -67,13 +91,15 @@ impl BlkMapRecord {
         out.push(self.compression as u8);
         out.extend_from_slice(&self.compressed_len.to_le_bytes());
         out.extend_from_slice(&self.payload_checksum.to_le_bytes());
+        out.push(self.payload_checksum_algorithm as u8);
         out
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
         match buf.len() {
             LEGACY_RECORD_SIZE => Self::decode_legacy(buf),
-            EXTENDED_RECORD_SIZE => Self::decode_extended(buf),
+            EXTENDED_RECORD_V2_SIZE => Self::decode_extended_v2(buf),
+            EXTENDED_RECORD_V3_SIZE => Self::decode_extended_v3(buf),
             _ => Err(StorageError::Corrupt(
                 "unsupported blk map record size".to_string(),
             )),
@@ -121,10 +147,16 @@ impl BlkMapRecord {
                     .map_err(|_| StorageError::Corrupt("blk map parse failed".to_string()))?,
             ),
             payload_checksum: 0,
+            payload_checksum_algorithm: PayloadChecksumAlgorithm::None,
         })
     }
 
-    fn decode_extended(buf: &[u8]) -> Result<Self, StorageError> {
+    fn decode_extended_v2(buf: &[u8]) -> Result<Self, StorageError> {
+        let payload_checksum = u32::from_le_bytes(
+            buf[54..58]
+                .try_into()
+                .map_err(|_| StorageError::Corrupt("blk map parse failed".to_string()))?,
+        );
         Ok(Self {
             record_id: u64::from_le_bytes(
                 buf[0..8]
@@ -168,12 +200,26 @@ impl BlkMapRecord {
                     .try_into()
                     .map_err(|_| StorageError::Corrupt("blk map parse failed".to_string()))?,
             ),
-            payload_checksum: u32::from_le_bytes(
-                buf[54..58]
-                    .try_into()
-                    .map_err(|_| StorageError::Corrupt("blk map parse failed".to_string()))?,
-            ),
+            payload_checksum,
+            payload_checksum_algorithm: if payload_checksum == 0 {
+                PayloadChecksumAlgorithm::None
+            } else {
+                PayloadChecksumAlgorithm::Fnv1a32
+            },
         })
+    }
+
+    fn decode_extended_v3(buf: &[u8]) -> Result<Self, StorageError> {
+        let mut record = Self::decode_extended_v2(&buf[..EXTENDED_RECORD_V2_SIZE])?;
+        record.payload_checksum_algorithm = PayloadChecksumAlgorithm::from_u8(buf[58])?;
+        if record.payload_checksum_algorithm == PayloadChecksumAlgorithm::None
+            && record.payload_checksum != 0
+        {
+            return Err(StorageError::Corrupt(
+                "disabled blk map checksum has a nonzero value".to_string(),
+            ));
+        }
+        Ok(record)
     }
 }
 
@@ -184,7 +230,7 @@ struct CachedBlkMap {
     records: Vec<BlkMapRecord>,
     record_index: HashMap<u64, usize>,
     next_record_id: u64,
-    is_log_format: bool,
+    log_version: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +333,7 @@ fn ensure_cache_fresh(path: &Path) -> Result<(), StorageError> {
 
     let (header, payload) = read_segment_file(path, SegmentKind::BlkMap)?;
     let records = decode_payload(&payload)?;
+    let log_version = block_map_log_version(&payload);
     lock_storage_mutex(cache(), "blk_map")?.insert(
         path.to_path_buf(),
         CachedBlkMap {
@@ -295,7 +342,7 @@ fn ensure_cache_fresh(path: &Path) -> Result<(), StorageError> {
             record_index: build_record_index(&records),
             next_record_id: next_record_id(&records),
             records,
-            is_log_format: payload.starts_with(LOG_PREFIX),
+            log_version,
         },
     );
     Ok(())
@@ -344,7 +391,7 @@ pub fn append_blk_map_record(
         let entry = guard
             .get(path)
             .ok_or_else(|| StorageError::NotFound("blk map cache not initialized".to_string()))?;
-        if !entry.is_log_format {
+        if entry.log_version != 3 {
             rewrote_legacy = true;
             let payload = encode_log_payload(&entry.records);
             let sequence = ((entry.records.len() / MAX_RECORDS_PER_SEGMENT) as u64).max(1);
@@ -389,7 +436,7 @@ pub fn append_blk_map_record(
     if !trust_hot_cache() {
         entry.stamp = file_stamp(path)?;
     }
-    entry.is_log_format = true;
+    entry.log_version = 3;
     Ok(record)
 }
 
@@ -428,7 +475,7 @@ pub fn mark_blk_map_stale_batch(
     }
 
     ensure_log_format(path, &records)?;
-    let mut appended = Vec::with_capacity(updated.len() * EXTENDED_RECORD_SIZE);
+    let mut appended = Vec::with_capacity(updated.len() * EXTENDED_RECORD_V3_SIZE);
     for rec in &updated {
         appended.extend_from_slice(&rec.encode());
     }
@@ -459,8 +506,13 @@ fn decode_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageError> {
     if payload.is_empty() {
         return Ok(Vec::new());
     }
-    if payload.starts_with(LOG_PREFIX) {
+    if payload.starts_with(LOG_PREFIX) || payload.starts_with(LOG_PREFIX_V2) {
         return decode_log_payload(payload);
+    }
+    if payload.starts_with(b"BMV") {
+        return Err(StorageError::Corrupt(
+            "unsupported blk map log version".to_string(),
+        ));
     }
     decode_legacy_payload(payload)
 }
@@ -494,7 +546,7 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageErr
         ));
     }
     let record_size = remaining / count;
-    if record_size != LEGACY_RECORD_SIZE && record_size != EXTENDED_RECORD_SIZE {
+    if record_size != LEGACY_RECORD_SIZE && record_size != EXTENDED_RECORD_V2_SIZE {
         return Err(StorageError::Corrupt(
             "unsupported blk map record size".to_string(),
         ));
@@ -514,22 +566,31 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageErr
 }
 
 fn decode_log_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageError> {
-    if payload.len() < LOG_PREFIX.len() {
+    let (prefix, record_size) = if payload.starts_with(LOG_PREFIX) {
+        (LOG_PREFIX, EXTENDED_RECORD_V3_SIZE)
+    } else if payload.starts_with(LOG_PREFIX_V2) {
+        (LOG_PREFIX_V2, EXTENDED_RECORD_V2_SIZE)
+    } else {
+        return Err(StorageError::Corrupt(
+            "unsupported blk map log version".to_string(),
+        ));
+    };
+    if payload.len() < prefix.len() {
         return Err(StorageError::Corrupt(
             "blk map log payload too short".to_string(),
         ));
     }
-    let mut offset = LOG_PREFIX.len();
+    let mut offset = prefix.len();
     let mut latest = HashMap::<u64, BlkMapRecord>::new();
     while offset < payload.len() {
-        if payload.len() < offset + EXTENDED_RECORD_SIZE {
+        if payload.len() < offset + record_size {
             return Err(StorageError::Corrupt(
                 "blk map log payload truncated".to_string(),
             ));
         }
-        let record = BlkMapRecord::decode(&payload[offset..offset + EXTENDED_RECORD_SIZE])?;
+        let record = BlkMapRecord::decode(&payload[offset..offset + record_size])?;
         latest.insert(record.record_id, record);
-        offset += EXTENDED_RECORD_SIZE;
+        offset += record_size;
     }
     let mut records = latest.into_values().collect::<Vec<_>>();
     records.sort_by_key(|entry| entry.logical_start);
@@ -548,12 +609,23 @@ fn ensure_log_format(path: &Path, records: &[BlkMapRecord]) -> Result<(), Storag
 }
 
 fn encode_log_payload(records: &[BlkMapRecord]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(LOG_PREFIX.len() + records.len() * EXTENDED_RECORD_SIZE);
+    let capacity = LOG_PREFIX.len() + records.len() * EXTENDED_RECORD_V3_SIZE;
+    let mut payload = Vec::with_capacity(capacity);
     payload.extend_from_slice(LOG_PREFIX);
     for entry in records {
         payload.extend_from_slice(&entry.encode());
     }
     payload
+}
+
+fn block_map_log_version(payload: &[u8]) -> u8 {
+    if payload.starts_with(LOG_PREFIX) {
+        3
+    } else if payload.starts_with(LOG_PREFIX_V2) {
+        2
+    } else {
+        0
+    }
 }
 
 fn update_cache(
@@ -570,7 +642,7 @@ fn update_cache(
             record_index: build_record_index(&records),
             next_record_id: next_record_id(&records),
             records,
-            is_log_format: true,
+            log_version: 3,
         },
     );
     Ok(())
@@ -596,3 +668,7 @@ fn next_record_id(records: &[BlkMapRecord]) -> u64 {
 pub fn sync_blk_map(path: &Path) -> Result<(), StorageError> {
     sync_segment_file(path)
 }
+
+#[cfg(test)]
+#[path = "blk_map_tests.rs"]
+mod tests;

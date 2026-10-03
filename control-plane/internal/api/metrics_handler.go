@@ -87,6 +87,9 @@ func PrometheusText(registry *metrics.MetricsRegistry) string {
 	fmt.Fprintf(&buf, "# TYPE holo_scsi_sense_errors_total counter\n")
 	fmt.Fprintf(&buf, "holo_scsi_sense_errors_total %d\n", atomic.LoadInt64(&registry.ScsiSenseErrors))
 
+	fmt.Fprintf(&buf, "# HELP holo_iscsi_security_apply_failures_total Failed protected iSCSI target apply operations\n")
+	fmt.Fprintf(&buf, "# TYPE holo_iscsi_security_apply_failures_total counter\n")
+	fmt.Fprintf(&buf, "holo_iscsi_security_apply_failures_total %d\n", atomic.LoadInt64(&registry.ISCSISecurityApplyFailures))
 	fmt.Fprintf(&buf, "# HELP holo_dedup_hits_total Total storage deduplication lookup hits\n")
 	fmt.Fprintf(&buf, "# TYPE holo_dedup_hits_total counter\n")
 	fmt.Fprintf(&buf, "holo_dedup_hits_total %d\n", atomic.LoadInt64(&registry.DedupHitsTotal))

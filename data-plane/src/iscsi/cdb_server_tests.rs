@@ -2937,6 +2937,33 @@ mod tests {
     }
 
     #[test]
+    fn test_drive_mode_sense_reports_variable_block_mode_after_mode_select() {
+        let mut state = crate::scsi_tape::state::TapeState::new("drive-msel-variable-block");
+        let _ = state.take_unit_attention();
+        state.mount_state = crate::scsi_tape::state::MountState::Loaded;
+        let select_cdb = [0x15, 0x10, 0x00, 0x00, 0x0C, 0x00];
+        let select_payload = [
+            0x00, 0x00, 0x00, 0x08, // Mode Select(6) header with one block descriptor.
+            0x00, 0x00, 0x00, 0x00, // Density and number of blocks.
+            0x00, 0x00, 0x00, 0x00, // Variable block length.
+        ];
+        let selected = dispatch_raw_cdb(&mut state, &select_cdb, &select_payload);
+        assert_eq!(selected.status, SCSI_STATUS_GOOD);
+        assert_eq!(
+            state.block_mode.mode,
+            crate::scsi_tape::state::BlockMode::Variable
+        );
+
+        let sensed = dispatch_raw_cdb(
+            &mut state,
+            &[0x1A, 0x00, 0x00, 0x00, 0x24, 0x00],
+            &[],
+        );
+        assert_eq!(sensed.status, SCSI_STATUS_GOOD);
+        assert_eq!(&sensed.reply[9..12], &[0x00, 0x00, 0x00]);
+    }
+
+    #[test]
     fn test_drive_persistent_reserve_out_updates_reservation_state() {
         let mut state = crate::scsi_tape::state::TapeState::new("drive-prout");
         state.mount_state = crate::scsi_tape::state::MountState::Loaded;

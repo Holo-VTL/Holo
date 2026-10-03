@@ -13,6 +13,7 @@ import (
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
+	"github.com/Holo-VTL/Holo/control-plane/internal/repo/memory"
 )
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,146 @@ func TestTcmuRegistryFindMissingDoesNotCloneNil(t *testing.T) {
 	if session != nil {
 		t.Fatalf("expected missing session to return nil, got %+v", session)
 	}
+}
+
+func TestTcmuAdapterEnsureLocalMountBackendReusesOneWorkerAndBackstore(t *testing.T) {
+	runner := newMockTcmuRunner()
+	runner.outputs["/backstores ls"] = "user:holo\n"
+	adapter := &TcmuAdapter{
+		cfg:      normalizeTargetRuntimeConfig(TargetRuntimeConfig{Mode: "tcmu", BackstoreSizeMB: 64}),
+		runner:   runner,
+		registry: newTcmuRegistry(),
+		startHandler: func(_ context.Context, publication *domain.TargetPublication, socketPath string, env []string) (int, error) {
+			if publication.DeviceRole != "changer" || socketPath == "" {
+				t.Fatalf("unexpected local handler identity/socket: %+v %q", publication, socketPath)
+			}
+			if !hasEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", "lib-a") || !hasEnvAssignment(env, "HOLO_CHANGER_DRIVE_IDS", "drive-a,drive-b") {
+				t.Fatalf("changer handler missing library/drive topology: %v", env)
+			}
+			return 0, nil
+		},
+	}
+	descriptor := domain.VTLDeviceDescriptor{
+		DeviceKey: domain.ChangerDeviceKey("lib-a"), Kind: domain.LocalDeviceKindChanger,
+		LibraryID: "lib-a", DriveIDs: []string{"drive-a", "drive-b"}, Profile: "changer",
+		IdentityRef: "identity-changer-lib-a", BackendRef: localMountBackendRef("changer:lib-a"), BackendReady: true,
+	}
+
+	if err := adapter.EnsureLocalMountBackend(context.Background(), descriptor); err != nil {
+		t.Fatalf("ensure local backend: %v", err)
+	}
+	if err := adapter.EnsureLocalMountBackend(context.Background(), descriptor); err != nil {
+		t.Fatalf("repeat ensure should be idempotent: %v", err)
+	}
+	if session, ok := adapter.registry.find(descriptor.BackendRef); !ok || session.BackstoreName != descriptor.BackendRef {
+		t.Fatalf("expected one registered shared worker: %+v, %v", session, ok)
+	}
+	creates := 0
+	for _, call := range runner.calls {
+		if strings.Contains(call, "create name="+descriptor.BackendRef) {
+			creates++
+		}
+	}
+	if creates != 1 {
+		t.Fatalf("expected one backstore create, saw %d calls: %v", creates, runner.calls)
+	}
+}
+
+func TestTcmuAdapterResolveLocalMountIdentityUsesHandlerProfileAndSeed(t *testing.T) {
+	dir := t.TempDir()
+	handler := filepath.Join(dir, "tcmu-handler")
+	script := "#!/bin/sh\n" +
+		"[ \"$1\" = \"--print-vpd-serial\" ] || exit 11\n" +
+		"[ \"$2\" = \"--publication-id\" ] || exit 12\n" +
+		"[ \"$3\" = \"changer:lib-a\" ] || exit 13\n" +
+		"[ \"$HOLO_SCSI_DEVICE_ROLE\" = \"changer\" ] || exit 14\n" +
+		"[ \"$HOLO_SCSI_SERIAL_SEED\" = \"drive-a\" ] || exit 15\n" +
+		"[ \"$HOLO_SCSI_CHANGER_PROFILE\" = \"ibm-03584l32\" ] || exit 16\n" +
+		"[ \"$HOLO_TAPE_DRIVE_PROFILE\" = \"ibm-ult3580-td6\" ] || exit 17\n" +
+		"printf 'IBMdrivea1230400\\n'\n"
+	if err := os.WriteFile(handler, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &TcmuAdapter{handlerBinary: handler}
+	descriptor := domain.VTLDeviceDescriptor{
+		DeviceKey: domain.ChangerDeviceKey("lib-a"), Kind: domain.LocalDeviceKindChanger,
+		LibraryID: "lib-a", DriveIDs: []string{"drive-a"}, Profile: "ibm-03584l32",
+		DriveProfile: "ibm-ult3580-td6",
+	}
+
+	identity, err := adapter.ResolveLocalMountIdentity(context.Background(), descriptor, nil)
+	if err != nil {
+		t.Fatalf("resolve local SCSI identity: %v", err)
+	}
+	if identity != "IBMdrivea1230400" {
+		t.Fatalf("unexpected VPD serial: got %q", identity)
+	}
+}
+
+func TestTcmuUnpublishKeepsBackendReferencedByLocalLoopback(t *testing.T) {
+	ctx := context.Background()
+	repository := memory.NewLocalMountRepo()
+	library := localLoopbackLibraryMapping("lib-1")
+	if err := repository.SaveLibraryMapping(ctx, library); err != nil {
+		t.Fatal(err)
+	}
+	backendRef := localMountBackendRef("drive:drv-1")
+	mapping := domain.LocalLoopbackDeviceMapping{
+		DeviceKey: domain.DriveDeviceKey("drv-1"), LibraryID: "lib-1", Kind: domain.LocalDeviceKindDrive,
+		DriveID: "drv-1", LUNIndex: 1, IdentityRef: "identity-drive-1", BackendRef: backendRef,
+		State: domain.LocalMappingStateActive,
+	}
+	if err := repository.SaveDeviceMapping(ctx, mapping); err != nil {
+		t.Fatal(err)
+	}
+	runner := newMockTcmuRunner()
+	adapter := &TcmuAdapter{cfg: normalizeTargetRuntimeConfig(TargetRuntimeConfig{Mode: "tcmu"}), runner: runner, registry: newTcmuRegistry(), localMountRepo: repository}
+	adapter.registry.save(&TcmuHandlerSession{PublicationID: "pub-tcmu-001", BackstoreName: backendRef, BackstoreSubtype: "holo"})
+
+	if err := adapter.Unpublish(ctx, tcmuTestPublication()); err != nil {
+		t.Fatalf("unpublish network target: %v", err)
+	}
+	if _, ok := adapter.registry.find(backendRef); !ok {
+		t.Fatal("network unpublish removed the worker shared with local loopback")
+	}
+	for _, call := range runner.calls {
+		if strings.Contains(call, "/backstores/user:holo delete "+backendRef) {
+			t.Fatalf("network unpublish deleted the loopback-owned backend: %v", runner.calls)
+		}
+	}
+}
+
+func TestTcmuBackstoreNameSurvivesLocalMountDisable(t *testing.T) {
+	ctx := context.Background()
+	repository := memory.NewLocalMountRepo()
+	if err := repository.SaveLibraryMapping(ctx, localLoopbackLibraryMapping("lib-1")); err != nil {
+		t.Fatal(err)
+	}
+	mapping := domain.LocalLoopbackDeviceMapping{
+		DeviceKey: domain.DriveDeviceKey("drv-1"), LibraryID: "lib-1", Kind: domain.LocalDeviceKindDrive,
+		DriveID: "drv-1", LUNIndex: 1, IdentityRef: "identity-drive-1", BackendRef: localMountBackendRef("drive:drv-1"),
+		State: domain.LocalMappingStateInactive,
+	}
+	if err := repository.SaveDeviceMapping(ctx, mapping); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &TcmuAdapter{localMountRepo: repository}
+	backstore, err := adapter.backstoreNameForPublication(ctx, tcmuTestPublication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backstore != mapping.BackendRef {
+		t.Fatalf("network publication backend changed after local detach: got %q want %q", backstore, mapping.BackendRef)
+	}
+}
+
+func hasEnvAssignment(env []string, key, value string) bool {
+	for _, item := range env {
+		if item == key+"="+value {
+			return true
+		}
+	}
+	return false
 }
 
 // noopAuditWriter satisfies audit.Writer without doing anything.

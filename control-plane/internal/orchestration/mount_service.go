@@ -34,7 +34,7 @@ func (s *MountService) MountCartridge(ctx context.Context, driveID, cartridgeID,
 		return err
 	}
 	if err := s.auditW.Write(ctx, audit.Event{
-		Actor:      actor,
+		Actor:      audit.NormalizeServiceActor(actor),
 		Action:     "mount",
 		ObjectType: "cartridge",
 		ObjectID:   cartridgeID,

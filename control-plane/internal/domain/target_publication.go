@@ -13,22 +13,31 @@ const (
 
 type TargetPublication struct {
 	Timestamped
-	PublicationID      string           `json:"publicationId"`
-	PoolID             string           `json:"poolId"`
-	LibraryID          string           `json:"libraryId"`
-	DriveID            string           `json:"driveId"`
-	CartridgeID        string           `json:"cartridgeId"`
-	TargetIQN          string           `json:"targetIqn"`
-	DeviceRole         string           `json:"deviceRole"`
-	DeviceProfile      string           `json:"deviceProfile,omitempty"`
-	DriveProfile       string           `json:"driveProfile,omitempty"`
-	Portal             string           `json:"portal"`
-	State              PublicationState `json:"state"`
-	LastError          string           `json:"lastError,omitempty"`
-	CompressionEnabled bool             `json:"compressionEnabled"`
-	DedupEnabled       bool             `json:"dedupEnabled"`
-	ConnectedHosts     *ConnectedHosts  `json:"connectedHosts,omitempty"`
+	PublicationID       string           `json:"publicationId"`
+	PoolID              string           `json:"poolId"`
+	LibraryID           string           `json:"libraryId"`
+	DriveID             string           `json:"driveId"`
+	CartridgeID         string           `json:"cartridgeId"`
+	TargetIQN           string           `json:"targetIqn"`
+	DeviceRole          string           `json:"deviceRole"`
+	DeviceProfile       string           `json:"deviceProfile,omitempty"`
+	DriveProfile        string           `json:"driveProfile,omitempty"`
+	Portal              string           `json:"portal"`
+	State               PublicationState `json:"state"`
+	LastError           string           `json:"lastError,omitempty"`
+	SecurityEnforcement string           `json:"securityEnforcement"`
+	CompressionEnabled  bool             `json:"compressionEnabled"`
+	DedupEnabled        bool             `json:"dedupEnabled"`
+	ConnectedHosts      *ConnectedHosts  `json:"connectedHosts,omitempty"`
 }
+
+const (
+	SecurityEnforcementUnprotected = "unprotected"
+	SecurityEnforcementSimulated   = "simulated"
+	SecurityEnforcementEnforcing   = "enforcing"
+	SecurityEnforcementBlocked     = "blocked"
+	SecurityEnforcementOffline     = "offline"
+)
 
 type ConnectedHosts struct {
 	Available    bool     `json:"available"`
@@ -49,15 +58,16 @@ func NewTargetPublication(id, poolID, libraryID, driveID, cartridgeID, targetIQN
 	}
 	now := time.Now().UTC()
 	return &TargetPublication{
-		Timestamped:   Timestamped{CreatedAt: now, UpdatedAt: now},
-		PublicationID: id,
-		PoolID:        poolID,
-		LibraryID:     libraryID,
-		DriveID:       driveID,
-		CartridgeID:   cartridgeID,
-		TargetIQN:     targetIQN,
-		DeviceRole:    "drive",
-		State:         PublicationCreating,
+		Timestamped:         Timestamped{CreatedAt: now, UpdatedAt: now},
+		PublicationID:       id,
+		PoolID:              poolID,
+		LibraryID:           libraryID,
+		DriveID:             driveID,
+		CartridgeID:         cartridgeID,
+		TargetIQN:           targetIQN,
+		SecurityEnforcement: SecurityEnforcementUnprotected,
+		DeviceRole:          "drive",
+		State:               PublicationCreating,
 	}, nil
 }
 

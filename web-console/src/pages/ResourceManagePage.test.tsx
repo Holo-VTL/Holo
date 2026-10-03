@@ -30,6 +30,15 @@ vi.mock("../services/api", () => ({
     storage: {
       listPools: vi.fn().mockResolvedValue([{ poolId: "pool-a", name: "Pool A", status: "active", disks: [{ devicePath: "/dev/sdb", sizeBytes: 1000, attachedAt: new Date().toISOString() }], capacity: { totalBytes: 1000, usedBytes: 0, freeBytes: 1000, usedPercent: 0, warning: false, exhausted: false, warningThresholdPct: 90 } }]),
     },
+    iscsiSecurity: {
+      getLibraryBinding: vi.fn().mockResolvedValue({ binding: { scope: "library", ownerId: "lib-a", generation: 0, auth: null }, targets: [] }),
+      getDriveBinding: vi.fn().mockResolvedValue({ binding: { scope: "drive", ownerId: "drive-a", generation: 0, auth: null }, targets: [] }),
+      previewLibraryBinding: vi.fn().mockResolvedValue({ targets: [] }),
+      putLibraryBinding: vi.fn().mockResolvedValue({ binding: { scope: "library", ownerId: "lib-a", generation: 1 } }),
+      previewDriveBinding: vi.fn().mockResolvedValue({ targets: [] }),
+      putDriveBinding: vi.fn().mockResolvedValue({ binding: { scope: "drive", ownerId: "drive-a", generation: 1 } }),
+      listCredentials: vi.fn().mockResolvedValue([]),
+    },
   },
 }));
 
@@ -60,6 +69,12 @@ describe("ResourceManagePage", () => {
     expect(await screen.findByRole("button", { name: "Add Cartridge" })).toBeEnabled();
     await userEvent.click(addSlot);
     expect(api.resources.addLibrarySlots).toHaveBeenCalledWith("lib-a", { count: 1, actor: "web-console" });
+  });
+
+  it("opens Library CHAP settings from resource management", async () => {
+    renderManagePage();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Config CHAP" }))[0]);
+    expect(await screen.findByRole("dialog", { name: "Configure CHAP" })).toBeInTheDocument();
   });
 
   it("shows erase actions and destroy wording for selected cartridge", async () => {

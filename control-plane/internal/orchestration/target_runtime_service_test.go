@@ -896,6 +896,158 @@ func TestPublishConcurrentDuplicateIQNIsAtomic(t *testing.T) {
 	}
 }
 
+type blockingPublishRuntimeAdapter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingPublishRuntimeAdapter) Publish(context.Context, *domain.TargetPublication) (string, error) {
+	close(a.started)
+	<-a.release
+	return "127.0.0.1:3260", nil
+}
+
+func (*blockingPublishRuntimeAdapter) Unpublish(context.Context, *domain.TargetPublication) error {
+	return nil
+}
+
+func (*blockingPublishRuntimeAdapter) ListSessions(context.Context) ([]TargetSession, error) {
+	return nil, nil
+}
+
+func TestAutoPublicationRacingLibrarySecurityEditSerializesAndFailsBusy(t *testing.T) {
+	svc := seededRuntimeService(t)
+	adapter := &blockingPublishRuntimeAdapter{started: make(chan struct{}), release: make(chan struct{})}
+	svc.adapter = adapter
+	securityRepo := memory.NewISCSISecurityRepo()
+	credential := domain.ISCSICredential{CredentialID: "cred-race", Label: "backup", Username: "backup-user", EncryptedSecret: make([]byte, 64), Version: 1}
+	if err := securityRepo.CreateCredential(context.Background(), credential); err != nil {
+		t.Fatal(err)
+	}
+	securityService := NewISCSISecurityService(securityRepo, nil, svc, nil)
+	svc.SetISCSISecurityService(securityService)
+
+	publishResult := make(chan error, 1)
+	go func() {
+		_, err := svc.Publish(context.Background(), PublishRequest{
+			LibraryID: "lib-1", DriveID: "drive-1", CartridgeID: "car-1",
+			TargetIQN: "iqn.2026-04.ai.holo:auto-security-race", Actor: "system", Auto: true,
+		})
+		publishResult <- err
+	}()
+	<-adapter.started
+	if svc.securityMu.TryLock() {
+		svc.securityMu.Unlock()
+		t.Fatal("auto-publication must hold the shared security coordination lock")
+	}
+	editResult := make(chan error, 1)
+	go func() {
+		editResult <- securityService.PutBinding(context.Background(), domain.ISCSISecurityBinding{
+			Scope: domain.SecurityScopeLibrary, OwnerID: "lib-1", Generation: 1,
+			Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthCHAP, CredentialID: credential.CredentialID, Initiators: []string{"iqn.1991-05.com.microsoft:backup"}},
+		}, "operator")
+	}()
+	close(adapter.release)
+	if err := <-publishResult; err != nil {
+		t.Fatalf("automatic publication should finish: %v", err)
+	}
+	if err := <-editResult; !errors.Is(err, ErrISCSISecurityBusy) {
+		t.Fatalf("policy edit racing an active auto-publication must fail busy: %v", err)
+	}
+	if _, err := securityRepo.FindBinding(context.Background(), domain.SecurityScopeLibrary, "lib-1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("rejected racing edit persisted unexpectedly: %v", err)
+	}
+}
+
+func TestTargetRuntimeAbsentDetectsResidualConfigfsAndProbeFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	svc := NewTargetRuntimeServiceWithConfig(memory.NewCoreResourcesRepo(), memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), nil, TargetRuntimeConfig{
+		Mode: "lio-shell", IscsiConfigfsRoot: root,
+	})
+	const iqn = "iqn.2026-04.ai.holo:residual-configfs"
+	absent, err := svc.TargetRuntimeAbsent(ctx, iqn)
+	if err != nil || !absent {
+		t.Fatalf("missing configfs target should be absent: absent=%v err=%v", absent, err)
+	}
+	if err := os.Mkdir(filepath.Join(root, iqn), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	absent, err = svc.TargetRuntimeAbsent(ctx, iqn)
+	if err != nil || absent {
+		t.Fatalf("residual configfs target must block a mutation: absent=%v err=%v", absent, err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.TargetRuntimeAbsent(ctx, iqn); err == nil {
+		t.Fatal("unavailable configfs probe must fail closed")
+	}
+}
+
+type failingProtectedRuntimeAdapter struct {
+	publishProtectedCalls int
+	err                   error
+}
+
+func (*failingProtectedRuntimeAdapter) Publish(context.Context, *domain.TargetPublication) (string, error) {
+	return "", errors.New("open publication path must not be used")
+}
+
+func (a *failingProtectedRuntimeAdapter) PublishProtected(context.Context, *domain.TargetPublication, ISCSIResolvedPublicationSecurity) (string, error) {
+	a.publishProtectedCalls++
+	return "", a.err
+}
+
+func (*failingProtectedRuntimeAdapter) Unpublish(context.Context, *domain.TargetPublication) error {
+	return nil
+}
+
+func (*failingProtectedRuntimeAdapter) ListSessions(context.Context) ([]TargetSession, error) {
+	return nil, nil
+}
+
+func TestProtectedPublishFailureNeverMarksTargetReadyAndRetainsOfflineIntent(t *testing.T) {
+	core := memory.NewCoreResourcesRepo()
+	library, _ := domain.NewVirtualLibrary("lib-protected-fail", "Protected Failure")
+	drive, _ := domain.NewVirtualDrive("drive-protected-fail", library.LibraryID, 1)
+	cartridge := domain.NewVirtualCartridge("cart-protected-fail", "pool-protected-fail", library.LibraryID, "VTA902L06", 1<<20)
+	if err := core.CreateLibrary(context.Background(), library); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CreateDrive(context.Background(), drive); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CreateCartridge(context.Background(), cartridge); err != nil {
+		t.Fatal(err)
+	}
+	securityRepo := memory.NewISCSISecurityRepo()
+	if err := securityRepo.SaveBinding(context.Background(), domain.ISCSISecurityBinding{
+		Scope: domain.SecurityScopeLibrary, OwnerID: library.LibraryID, Generation: 1,
+		Authentication: &domain.ISCSIAuthenticationPolicy{Mode: domain.ISCSIAuthNone, Initiators: []string{"iqn.1991-05.com.microsoft:backup-a"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &failingProtectedRuntimeAdapter{err: ErrISCSISecurityHelperUnavailable}
+	runtime := newTargetRuntimeServiceWithAdapter(core, memory.NewTargetRuntimeRepo(), audit.NewMemoryWriter(), nil, TargetRuntimeConfig{Mode: "lio-shell"}, adapter)
+	security := NewISCSISecurityService(securityRepo, nil, runtime, nil)
+	runtime.SetISCSISecurityService(security)
+	publication, err := runtime.Publish(context.Background(), PublishRequest{
+		LibraryID: library.LibraryID, DriveID: drive.DriveID, CartridgeID: cartridge.CartridgeID,
+		TargetIQN: drive.IQN, Actor: "operator",
+	})
+	if !errors.Is(err, ErrISCSISecurityHelperUnavailable) || publication == nil {
+		t.Fatalf("protected helper failure should return a failed publication: publication=%+v err=%v", publication, err)
+	}
+	if publication.State != domain.PublicationFailed || publication.SecurityEnforcement != domain.SecurityEnforcementBlocked || adapter.publishProtectedCalls != 1 {
+		t.Fatalf("incomplete protected target was exposed as ready: publication=%+v protectedCalls=%d", publication, adapter.publishProtectedCalls)
+	}
+	target, err := securityRepo.FindTarget(context.Background(), drive.IQN)
+	if err != nil || !target.AdministrativeOffline {
+		t.Fatalf("failed protected target must remain administratively offline: target=%+v err=%v", target, err)
+	}
+}
+
 func TestRuntimeModeSelection(t *testing.T) {
 	coreRepo := memory.NewCoreResourcesRepo()
 	runtimeRepo := memory.NewTargetRuntimeRepo()

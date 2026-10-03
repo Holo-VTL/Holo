@@ -1,0 +1,126 @@
+name: ci
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ripgrep
+      - run: bash scripts/lint-guardrails.sh
+
+  control-plane:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: control-plane/go.mod
+          cache: true
+          cache-dependency-path: control-plane/go.sum
+      - name: Test with coverage
+        working-directory: control-plane
+        run: go test -coverprofile=coverage.out ./...
+      - name: Keep passing core package coverage above 80 percent
+        working-directory: control-plane
+        shell: bash
+        run: |
+          for package in internal/auth internal/config internal/domain internal/audit; do
+            output="$(go test -cover "./${package}")"
+            printf '%s\n' "${output}"
+            coverage="$(printf '%s\n' "${output}" | sed -nE 's/.*coverage: ([0-9]+(\.[0-9]+)?)%.*/\1/p')"
+            awk -v value="${coverage}" 'BEGIN { exit !(value >= 80) }'
+          done
+      - name: Vet
+        working-directory: control-plane
+        run: go vet ./...
+      - name: Race detector
+        working-directory: control-plane
+        run: go test -race ./internal/api/... ./internal/orchestration/... ./internal/repo/...
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: control-plane-coverage
+          path: control-plane/coverage.out
+          if-no-files-found: ignore
+          retention-days: 14
+
+  data-plane:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: data-plane
+      - name: Test
+        working-directory: data-plane
+        run: cargo test --locked
+      - name: Clippy
+        working-directory: data-plane
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  web-console:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web-console/package-lock.json
+      - name: Install dependencies
+        working-directory: web-console
+        run: npm ci
+      - name: Test
+        working-directory: web-console
+        run: npm test
+      - name: Build
+        working-directory: web-console
+        run: npm run build
+
+  iscsi-helper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test helper
+        run: python3 -m unittest discover -s infra/iscsi -v
+      - name: Test installer
+        run: bash scripts/test-install-holo.sh
+
+  integration-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: control-plane/go.mod
+          cache: true
+          cache-dependency-path: control-plane/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: data-plane
+      - run: bash tests/integration/contract_smoke.sh
