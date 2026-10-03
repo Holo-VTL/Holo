@@ -28,7 +28,8 @@ run_installer() {
 }
 
 # 1. Detect if we are running from an extracted release package
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/control-plane" && -f "${SCRIPT_DIR}/holo-tcmu-handler" && -f "${SCRIPT_DIR}/install-holo.sh" ]]; then
     log "Running from extracted release package. Performing local installation..."
     run_installer "${SCRIPT_DIR}/install-holo.sh" "$@"

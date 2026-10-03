@@ -69,6 +69,27 @@ run_dry_action() {
     bash "${INSTALLER}" "${action}" --dry-run --bundle-dir "${bundle}" --portal-host 10.0.0.10 "$@" 2>&1
 }
 
+test_bootstrap_from_stdin() {
+  local bundle="${TMP_ROOT}/bootstrap-stdin"
+  local fake_bin="${TMP_ROOT}/bootstrap-stdin-bin"
+  mkdir -p "${bundle}" "${fake_bin}"
+  touch "${bundle}/control-plane" "${bundle}/holo-tcmu-handler"
+  cat >"${bundle}/install-holo.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '[fixture installer] %s\n' "$*"
+EOF
+  cat >"${fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exec "$@"
+EOF
+  chmod +x "${fake_bin}/sudo"
+
+  local out
+  out="$(cd "${bundle}" && PATH="${fake_bin}:${PATH}" bash -c 'cat "$1" | bash -s -- uninstall' _ "${ROOT_DIR}/scripts/install.sh" 2>&1)"
+  assert_contains "${out}" "Running from extracted release package"
+  assert_contains "${out}" "[fixture installer] uninstall"
+}
+
 test_ubuntu_plan() {
   local bundle="${TMP_ROOT}/bundle-ubuntu"
   local osr="${TMP_ROOT}/ubuntu.os-release"
@@ -502,6 +523,8 @@ test_unsupported_platform() {
 
 echo "[test] ubuntu dry-run plan"
 test_ubuntu_plan
+echo "[test] bootstrap from stdin"
+test_bootstrap_from_stdin
 echo "[test] authenticated public bind"
 test_authenticated_public_bind_plan
 echo "[test] api key file"
