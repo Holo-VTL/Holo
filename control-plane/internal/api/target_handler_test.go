@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 )
 
 type apiLocalMountSettings struct{ enabled bool }
@@ -298,12 +300,15 @@ func TestTargetLocalMountEndpointsPersistToggle(t *testing.T) {
 	if getResp.Code != http.StatusOK {
 		t.Fatalf("expected local mount status 200, got %d body=%s", getResp.Code, getResp.Body.String())
 	}
-	var initial map[string]any
+	var initial domain.LocalMountStatus
 	if err := json.Unmarshal(getResp.Body.Bytes(), &initial); err != nil {
 		t.Fatalf("unmarshal initial status: %v", err)
 	}
-	if enabled, _ := initial["enabled"].(bool); enabled {
+	if initial.Enabled {
 		t.Fatalf("expected local mount disabled by default: %s", getResp.Body.String())
+	}
+	if initial.Devices == nil || len(initial.Devices) != 0 {
+		t.Fatalf("empty devices must be a JSON array: %s", getResp.Body.String())
 	}
 
 	postReq := newAuthedRequest(http.MethodPost, "/v1/targets/local-mount", bytes.NewBufferString(`{"enabled":true,"actor":"tester"}`))
@@ -312,14 +317,14 @@ func TestTargetLocalMountEndpointsPersistToggle(t *testing.T) {
 	if postResp.Code != http.StatusAccepted {
 		t.Fatalf("expected local mount enable 202, got %d body=%s", postResp.Code, postResp.Body.String())
 	}
-	var enabledPayload map[string]any
+	var enabledPayload domain.LocalMountStatus
 	if err := json.Unmarshal(postResp.Body.Bytes(), &enabledPayload); err != nil {
 		t.Fatalf("unmarshal enabled status: %v", err)
 	}
-	if enabled, _ := enabledPayload["enabled"].(bool); !enabled {
+	if !enabledPayload.Enabled {
 		t.Fatalf("expected local mount enabled: %s", postResp.Body.String())
 	}
-	if state, _ := enabledPayload["state"].(string); state != "connecting" {
+	if enabledPayload.State != domain.LocalMountStateConnecting {
 		t.Fatalf("202 must report accepted intent, not completion: %s", postResp.Body.String())
 	}
 }

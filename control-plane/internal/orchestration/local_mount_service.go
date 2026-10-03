@@ -41,21 +41,26 @@ type LocalMountRuntime interface {
 
 type LocalMountStatus = domain.LocalMountStatus
 
+var ErrLocalMountRestartCleanup = errors.New("local mappings could not be safely detached before target restore")
+
 type LocalMountService struct {
-	settings   LocalMountSettingsRepository
-	targets    TargetRuntimeRepository
-	resources  LocalMountInventoryRepository
-	pools      LocalMountPoolReader
-	mappings   LocalMountRepository
-	runtime    LocalMountRuntime
-	auditW     audit.Writer
-	syncMu     sync.Mutex
-	lastMu     sync.RWMutex
-	last       LocalMountStatus
-	asyncMu    sync.Mutex
-	asyncRun   bool
-	asyncNext  bool
-	asyncActor string
+	settings    LocalMountSettingsRepository
+	targets     TargetRuntimeRepository
+	resources   LocalMountInventoryRepository
+	pools       LocalMountPoolReader
+	mappings    LocalMountRepository
+	runtime     LocalMountRuntime
+	auditW      audit.Writer
+	syncMu      sync.Mutex
+	lastMu      sync.RWMutex
+	last        LocalMountStatus
+	asyncMu     sync.Mutex
+	asyncRun    bool
+	asyncNext   bool
+	asyncActor  string
+	stopped     bool
+	asyncCancel context.CancelFunc
+	asyncDone   chan struct{}
 }
 
 func NewLocalMountService(settings LocalMountSettingsRepository, targets TargetRuntimeRepository, auditW audit.Writer, _ TargetRuntimeConfig) *LocalMountService {
@@ -74,15 +79,17 @@ func (s *LocalMountService) SetTargetRuntimeRepository(targets TargetRuntimeRepo
 }
 
 func (s *LocalMountService) Status(ctx context.Context) (LocalMountStatus, error) {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
 	enabled, err := s.settings.Enabled(ctx)
 	if err != nil {
 		return LocalMountStatus{}, err
 	}
 	status := s.getLast()
-	if enabled && !status.Enabled && status.LastSyncAt == nil {
+	if enabled && (!status.Enabled || s.asyncNext) {
 		status.State = domain.LocalMountStateConnecting
 	}
-	if !enabled && status.Enabled {
+	if !enabled && (status.Enabled || s.asyncNext) {
 		status.State = domain.LocalMountStateDisconnecting
 	}
 	status.Enabled = enabled
@@ -93,7 +100,13 @@ func (s *LocalMountService) Status(ctx context.Context) (LocalMountStatus, error
 }
 
 func (s *LocalMountService) SetEnabled(ctx context.Context, enabled bool, actor string) (LocalMountStatus, error) {
+	s.asyncMu.Lock()
+	if s.stopped {
+		s.asyncMu.Unlock()
+		return LocalMountStatus{}, domain.ErrInvalidState
+	}
 	if err := s.settings.SetEnabled(ctx, enabled); err != nil {
+		s.asyncMu.Unlock()
 		return LocalMountStatus{}, err
 	}
 	status := emptyLocalMountStatus()
@@ -104,28 +117,30 @@ func (s *LocalMountService) SetEnabled(ctx context.Context, enabled bool, actor 
 		status.State = domain.LocalMountStateDisconnecting
 	}
 	s.setLast(status)
+	s.scheduleSyncLocked(actor)
+	s.asyncMu.Unlock()
 	audit.EmitTargetRuntimeEvent(ctx, s.auditW, safeActor(actor), "local_mount_setting_changed", "local", "success", map[string]any{"enabled": enabled})
-	s.SyncAsync(actor)
 	return status, nil
 }
 
 func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountStatus, error) {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
-	if s.resources == nil || s.mappings == nil || s.runtime == nil {
-		status := emptyLocalMountStatus()
-		status.State = domain.LocalMountStateFailed
-		status.LastError = "local mount runtime is not configured"
-		s.setLast(status)
-		return status, ErrLocalLoopbackHelperUnavailable
+	s.asyncMu.Lock()
+	stopped := s.stopped
+	s.asyncMu.Unlock()
+	if stopped {
+		return s.getLast(), domain.ErrInvalidState
 	}
-
 	enabled, err := s.settings.Enabled(ctx)
 	if err != nil {
-		return LocalMountStatus{}, err
+		return s.failSync(ctx, actor, s.getLast().Enabled, err)
+	}
+	if s.resources == nil || s.mappings == nil || s.runtime == nil {
+		return s.failSync(ctx, actor, enabled, ErrLocalLoopbackHelperUnavailable)
 	}
 	if !enabled {
-		return s.disable(ctx, actor)
+		return s.detach(ctx, actor, false)
 	}
 
 	available, probeReason, probeErr := s.runtime.Probe(ctx)
@@ -148,7 +163,7 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 
 	descriptors, err := BuildLocalMountInventory(ctx, s.resources, s.pools)
 	if err != nil {
-		return LocalMountStatus{}, err
+		return s.failSync(ctx, actor, enabled, err)
 	}
 	publications := map[string]*domain.TargetPublication{}
 	// A network publication already owns the canonical handler/backstore. Reuse
@@ -357,16 +372,17 @@ func (s *LocalMountService) Sync(ctx context.Context, actor string) (LocalMountS
 	return status, firstErr
 }
 
-func (s *LocalMountService) disable(ctx context.Context, actor string) (LocalMountStatus, error) {
+func (s *LocalMountService) detach(ctx context.Context, actor string, enabled bool) (LocalMountStatus, error) {
 	owners, ownerErr := s.runtime.ListOwned(ctx)
+	if ownerErr != nil {
+		// Unknown kernel ownership cannot authorize releasing a shared backend.
+		return s.failSync(ctx, actor, enabled, ownerErr)
+	}
 	libraries, mappingErr := s.mappings.ListLibraryMappings(ctx)
 	status := emptyLocalMountStatus()
-	status.Enabled = false
+	status.Enabled = enabled
 	status.LastSyncAt = timePointer(time.Now().UTC())
 	var firstErr error
-	if ownerErr != nil {
-		firstErr = ownerErr
-	}
 	if mappingErr != nil && firstErr == nil {
 		firstErr = mappingErr
 	}
@@ -393,7 +409,7 @@ func (s *LocalMountService) disable(ctx context.Context, actor string) (LocalMou
 			}
 		}
 		owner := ownerByLibrary[library.LibraryID]
-		if owner.Present || ownerErr != nil {
+		if owner.Present {
 			observed, removeErr := s.runtime.Remove(ctx, library, devices)
 			if removeErr != nil {
 				if firstErr == nil {
@@ -450,6 +466,9 @@ func (s *LocalMountService) disable(ctx context.Context, actor string) (LocalMou
 		status.LastError = safeLocalMountError(firstErr)
 	} else {
 		status.State = domain.LocalMountStateDisabled
+		if enabled {
+			status.State = domain.LocalMountStateConnecting
+		}
 	}
 	s.setLast(status)
 	s.emitSyncAudit(ctx, actor, status, firstErr)
@@ -467,31 +486,137 @@ func (s *LocalMountService) targetPublications(ctx context.Context) []*domain.Ta
 
 func (s *LocalMountService) SyncAsync(actor string) {
 	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+	s.scheduleSyncLocked(actor)
+}
+
+// PrepareRestart detaches kernel references before shared backstores are rebuilt.
+// The saved intent and device identities remain available for the next sync.
+func (s *LocalMountService) PrepareRestart(ctx context.Context, actor string) error {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	enabled, err := s.settings.Enabled(ctx)
+	if err != nil {
+		return err
+	}
+	if s.mappings == nil || s.runtime == nil {
+		_, err := s.failSync(ctx, actor, enabled, ErrLocalLoopbackHelperUnavailable)
+		return err
+	}
+	_, err = s.detach(ctx, actor, enabled)
+	return err
+}
+
+// Stop prevents late requests from recreating mappings during network teardown.
+func (s *LocalMountService) Stop(ctx context.Context, actor string) error {
+	s.asyncMu.Lock()
+	s.stopped = true
+	s.asyncNext = false
+	if s.asyncCancel != nil {
+		s.asyncCancel()
+	}
+	done := s.asyncDone
+	s.asyncMu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.PrepareRestart(ctx, actor)
+}
+
+func (s *LocalMountService) scheduleSyncLocked(actor string) {
+	if s.stopped {
+		return
+	}
 	if s.asyncRun {
 		s.asyncNext = true
 		s.asyncActor = actor
-		s.asyncMu.Unlock()
 		return
 	}
 	s.asyncRun = true
 	s.asyncActor = actor
-	s.asyncMu.Unlock()
-	go s.runAsyncSync(actor)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.asyncCancel = cancel
+	s.asyncDone = done
+	go func() {
+		defer close(done)
+		defer cancel()
+		s.runAsyncSync(ctx, actor)
+	}()
 }
 
-func (s *LocalMountService) runAsyncSync(actor string) {
+func (s *LocalMountService) runAsyncSync(parent context.Context, actor string) {
+	ctx, cancel := context.WithTimeout(parent, time.Minute)
+	defer func() { cancel() }()
 	for {
-		_, _ = s.Sync(context.Background(), actor)
-		s.asyncMu.Lock()
-		if !s.asyncNext {
-			s.asyncRun = false
-			s.asyncMu.Unlock()
-			return
+		status, err := s.Sync(ctx, actor)
+		if err == nil && status.State == domain.LocalMountStateConnecting {
+			// Kernel device enumeration can lag behind a successful mapping.
+			// Confirm it without accepting concurrent loopback operations.
+			timer := time.NewTimer(2500 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			timer.Stop()
 		}
-		actor = s.asyncActor
-		s.asyncNext = false
+		s.asyncMu.Lock()
+		if s.asyncNext {
+			actor = s.asyncActor
+			s.asyncNext = false
+			cancel()
+			ctx, cancel = context.WithTimeout(parent, time.Minute)
+			if enabled, readErr := s.settings.Enabled(ctx); readErr == nil {
+				status.Enabled = enabled
+				status.State = domain.LocalMountStateConnecting
+				if !enabled {
+					status.State = domain.LocalMountStateDisconnecting
+				}
+				status.LastError = ""
+				s.setLast(status)
+			}
+			s.asyncMu.Unlock()
+			continue
+		}
+		if err == nil && status.State == domain.LocalMountStateConnecting {
+			if ctx.Err() == nil {
+				s.asyncMu.Unlock()
+				continue
+			}
+			status.State = domain.LocalMountStateFailed
+			if status.ConnectedDeviceCount > 0 {
+				status.State = domain.LocalMountStatePartial
+			}
+			status.LastError = string(domain.LocalMountReasonOperationTimeout)
+			for i := range status.Devices {
+				if status.Devices[i].State == domain.LocalMountDeviceStatePending || status.Devices[i].State == domain.LocalMountDeviceStateRemoving {
+					status.Devices[i].State = domain.LocalMountDeviceStateFailed
+					status.Devices[i].ReasonCode = domain.LocalMountReasonOperationTimeout
+				}
+			}
+			status.LastSyncAt = timePointer(time.Now().UTC())
+			s.setLast(status)
+			s.emitSyncAudit(context.Background(), actor, status, context.DeadlineExceeded)
+		}
+		s.asyncRun = false
 		s.asyncMu.Unlock()
+		return
 	}
+}
+
+func (s *LocalMountService) failSync(ctx context.Context, actor string, enabled bool, err error) (LocalMountStatus, error) {
+	status := s.getLast()
+	status.Enabled = enabled
+	status.State = domain.LocalMountStateFailed
+	status.LastError = safeLocalMountError(err)
+	status.LastSyncAt = timePointer(time.Now().UTC())
+	s.setLast(status)
+	s.emitSyncAudit(ctx, actor, status, err)
+	return status, err
 }
 
 func (s *LocalMountService) getLast() LocalMountStatus {
@@ -702,13 +827,13 @@ func resolveLocalMountState(enabled bool, desired, connected, residual int, devi
 	if connected == desired && residual == 0 {
 		return domain.LocalMountStateConnected
 	}
-	if connected > 0 {
-		return domain.LocalMountStatePartial
-	}
 	for _, device := range devices {
 		if device.State == domain.LocalMountDeviceStatePending || device.State == domain.LocalMountDeviceStateRemoving {
 			return domain.LocalMountStateConnecting
 		}
+	}
+	if connected > 0 {
+		return domain.LocalMountStatePartial
 	}
 	return domain.LocalMountStateFailed
 }
@@ -747,7 +872,7 @@ func ownedDeviceKeys(owners []LocalLoopbackOwner, libraryID string) map[string]b
 }
 
 func cloneLocalMountStatus(status LocalMountStatus) LocalMountStatus {
-	status.Devices = append([]domain.LocalMountDeviceStatus(nil), status.Devices...)
+	status.Devices = append([]domain.LocalMountDeviceStatus{}, status.Devices...)
 	status.DesiredIQNs = []string{}
 	status.MountedIQNs = []string{}
 	status.SkippedTargets = []string{}
@@ -761,6 +886,9 @@ func cloneLocalMountStatus(status LocalMountStatus) LocalMountStatus {
 func safeLocalMountError(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return string(domain.LocalMountReasonOperationTimeout)
 	}
 	if helperErr, ok := err.(LocalLoopbackHelperError); ok {
 		if knownLocalLoopbackHelperReason(helperErr.ReasonCode) {

@@ -547,6 +547,13 @@ func (s *TargetRuntimeService) Rollback(ctx context.Context, publicationID, acto
 }
 
 func (s *TargetRuntimeService) RestoreReadyPublications(ctx context.Context) error {
+	if lifecycle, ok := s.localMount.(interface {
+		PrepareRestart(context.Context, string) error
+	}); ok {
+		if err := lifecycle.PrepareRestart(ctx, "system"); err != nil {
+			return fmt.Errorf("%w: %w", ErrLocalMountRestartCleanup, err)
+		}
+	}
 	s.securityMu.Lock()
 	defer s.securityMu.Unlock()
 	publications := s.runtimeRepo.ListPublications(ctx)
@@ -660,6 +667,13 @@ func successfulSecurityEnforcement(mode string) string {
 func (s *TargetRuntimeService) Shutdown(ctx context.Context) error {
 	if s == nil || s.runtimeRepo == nil || s.adapter == nil {
 		return nil
+	}
+	if lifecycle, ok := s.localMount.(interface {
+		Stop(context.Context, string) error
+	}); ok {
+		if err := lifecycle.Stop(ctx, "system"); err != nil {
+			return fmt.Errorf("stop local mappings before target shutdown: %w", err)
+		}
 	}
 	s.securityMu.Lock()
 	defer s.securityMu.Unlock()

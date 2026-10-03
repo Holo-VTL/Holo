@@ -39,6 +39,47 @@ func TestServerPersistsRuntimePublicationsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestServerRestartCleanupFailureBlocksAutomaticPublication(t *testing.T) {
+	metadataDSN := filepath.Join(t.TempDir(), "metadata.db")
+	srv := newTestServerWithMetadata(t, metadataDSN)
+	request := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-restart","libraryId":"lib-restart","driveId":"drive-restart","driveSlot":1,"cartridgeId":"VTA903L06","barcode":"VTA903L06"}`))
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("fixture creation failed: %d %s", response.Code, response.Body.String())
+	}
+	if _, err := srv.metadataDB.Exec(`DELETE FROM target_publications`); err != nil {
+		t.Fatal(err)
+	}
+	securityHelper := filepath.Join(t.TempDir(), "security-helper")
+	loopbackHelper := filepath.Join(t.TempDir(), "loopback-helper")
+	for path, script := range map[string]string{
+		securityHelper: "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"ok\":true,\"code\":\"ok\",\"ready\":true}'\n",
+		loopbackHelper: "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":1,\"ok\":false,\"reason\":\"cleanup_failed\"}'\n",
+	} {
+		if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOLO_ISCSI_SECURITY_HELPER", securityHelper)
+	t.Setenv("HOLO_LOCAL_LOOPBACK_HELPER", loopbackHelper)
+	cfg := config.Load()
+	cfg.MetadataDSN = metadataDSN
+	cfg.LogDir = t.TempDir()
+	cfg.TargetRuntimeMode = "tcmu"
+	cfg.TargetRuntimeUseSudo = false
+	restarted, err := NewServerWithConfigE(cfg)
+	if restarted != nil {
+		_ = restarted.Close()
+	}
+	if err == nil {
+		t.Fatal("startup continued after unverified local mapping cleanup")
+	}
+	if publications := listPublications(t, srv); len(publications) != 0 {
+		t.Fatalf("startup fallback created publications after cleanup failure: %+v", publications)
+	}
+}
+
 func TestUpgradeRuntimePublicationRecoveryPreservesResourceIQNs(t *testing.T) {
 	metadataDSN := filepath.Join(t.TempDir(), "metadata.db")
 	srv := newTestServerWithMetadata(t, metadataDSN)

@@ -138,6 +138,10 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		}
 		if err := targetRuntime.RestoreReadyPublications(ctx); err != nil {
 			tracing.LogError(context.Background(), "target-runtime", "restore ready publications failed", err)
+			if errors.Is(err, orchestration.ErrLocalMountRestartCleanup) {
+				_ = metadataDB.Close()
+				return nil, orchestration.ErrLocalMountRestartCleanup
+			}
 		}
 	}
 	targetDiscovery := orchestration.NewTargetDiscoveryService(targetRepo, auditWriter)

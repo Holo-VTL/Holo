@@ -326,14 +326,87 @@ body {
 
 .targets-page-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
 
-.local-mount-toggle {
-  margin-top: 0;
+.local-mount-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  margin-left: auto;
+  min-height: 36px;
+}
+
+.local-mount-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 168px;
+  color: var(--text-body);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 600;
   white-space: nowrap;
+}
+
+.local-mount-status svg {
+  flex-shrink: 0;
+}
+
+.local-mount-status-error svg {
+  color: var(--danger);
+}
+
+.local-mount-spinner {
+  animation: local-mount-spin 1s linear infinite;
+}
+
+.local-mount-feedback {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 12px;
+  max-width: 600px;
+  margin: 12px 0 0 auto;
+  color: var(--text-body);
+  font-size: 13px;
+}
+
+.local-mount-feedback > span {
+  padding-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.local-mount-feedback .btn {
+  flex-shrink: 0;
+}
+
+@keyframes local-mount-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .local-mount-spinner { animation: none; }
+}
+
+.cdb-trace-toggle.local-mount-toggle {
+  margin-top: 0;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+@media (max-width: 420px) {
+  .local-mount-controls {
+    width: 100%;
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
 }
 
 .panel {

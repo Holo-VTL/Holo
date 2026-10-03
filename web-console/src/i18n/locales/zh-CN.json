@@ -338,8 +338,25 @@
     "actor": "操作人",
     "portal": "Portal",
     "mountLocally": "本地挂载",
-    "localMountAccepted": "本地挂载请求已提交",
+    "localMountCompleted": "本地挂载已完成",
+    "localMountDisabled": "本地挂载已关闭",
+    "localMountPartialFailure": "部分设备未能完成挂载",
+    "localMountStatusUnavailable": "暂时无法确认挂载状态，正在重新检查…",
+    "localMountCheckAgain": "重新检查",
+    "localMountRetry": "重试",
+    "localMountStates": {
+      "unavailable": "状态待确认",
+      "checking": "正在检查状态…",
+      "connecting": "正在挂载…",
+      "disconnecting": "正在卸载…",
+      "connected": "已挂载",
+      "disabled": "未挂载",
+      "partial": "部分挂载失败",
+      "failed": "挂载失败",
+      "removalFailed": "卸载未完成"
+    },
     "localMountReasons": {
+      "operation_failed": "本地挂载操作未能完成。",
       "loopback_unavailable": "本机 SCSI loopback 不可用。",
       "backend_not_ready": "设备后端未就绪。",
       "pool_unavailable": "已装载磁带所属的存储池不可用。",
@@ -366,8 +383,7 @@
     }
   },
   "security": {
-    "pageHeading": "iSCSI 连接安全",
-    "pageSummary": "创建 CHAP 凭据，并在带库、驱动器或 iSCSI 目标设置中应用。"
+    "pageHeading": "iSCSI 连接安全"
   },
   "iscsiSecurity": {
     "title": "iSCSI 连接安全",
@@ -419,8 +435,6 @@
     "savedButTargetsOffline": "设置已保存，但以下目标未能重新上线：{{targets}}。",
     "restoreFailedTargets": "以下目标恢复上线失败：{{targets}}。",
     "targetPublicationMissing": "未找到此目标的活动发布记录。请刷新目标列表后重试。",
-    "credentials": "CHAP 登录凭据",
-    "chapSectionHint": "为备份主机创建登录凭据。",
     "addCredential": "新增 CHAP 凭据",
     "newCredential": "新增 CHAP 登录凭据",
     "credentialIdHint": "创建供备份主机使用的 CHAP 用户名和密钥。",

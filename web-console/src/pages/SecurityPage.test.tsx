@@ -21,7 +21,9 @@ describe("SecurityPage", () => {
   it("shows CHAP settings without the removed policy tab", async () => {
     renderWithProviders(<SecurityPage />);
     expect(await screen.findByRole("heading", { name: "iSCSI connection security" })).toBeInTheDocument();
-    expect(await screen.findByText("CHAP login credentials")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Add CHAP credentials" })).toBeInTheDocument();
+    expect(screen.queryByText("Create CHAP credentials, then apply them in a Library, Drive, or iSCSI target settings.")).not.toBeInTheDocument();
+    expect(screen.queryByText("CHAP login credentials")).not.toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "Access & data protection" })).not.toBeInTheDocument();
   });
 

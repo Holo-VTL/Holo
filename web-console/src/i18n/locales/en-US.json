@@ -338,8 +338,25 @@
     "actor": "Actor",
     "portal": "Portal",
     "mountLocally": "Mount Locally",
-    "localMountAccepted": "Mount request accepted",
+    "localMountCompleted": "Local mount completed",
+    "localMountDisabled": "Local mount disabled",
+    "localMountPartialFailure": "Some devices could not be mounted",
+    "localMountStatusUnavailable": "Unable to check mount status. Retrying…",
+    "localMountCheckAgain": "Check status again",
+    "localMountRetry": "Retry",
+    "localMountStates": {
+      "unavailable": "Status unavailable",
+      "checking": "Checking status…",
+      "connecting": "Mounting…",
+      "disconnecting": "Unmounting…",
+      "connected": "Mounted",
+      "disabled": "Not mounted",
+      "partial": "Partially mounted",
+      "failed": "Mount failed",
+      "removalFailed": "Unmount incomplete"
+    },
     "localMountReasons": {
+      "operation_failed": "The local mount operation could not be completed.",
       "loopback_unavailable": "Local SCSI loopback is unavailable.",
       "backend_not_ready": "The device backend is not ready.",
       "pool_unavailable": "The loaded cartridge's storage pool is unavailable.",
@@ -366,8 +383,7 @@
     }
   },
   "security": {
-    "pageHeading": "iSCSI connection security",
-    "pageSummary": "Create CHAP credentials, then apply them in a Library, Drive, or iSCSI target settings."
+    "pageHeading": "iSCSI connection security"
   },
   "iscsiSecurity": {
     "title": "iSCSI connection security",
@@ -419,8 +435,6 @@
     "savedButTargetsOffline": "Settings were saved, but these targets could not be brought back online: {{targets}}.",
     "restoreFailedTargets": "Could not restore these targets online: {{targets}}.",
     "targetPublicationMissing": "No active publication was found for this target. Refresh the target list and try again.",
-    "credentials": "CHAP login credentials",
-    "chapSectionHint": "Create login credentials for a backup host.",
     "addCredential": "Add CHAP credentials",
     "newCredential": "Add CHAP login credentials",
     "credentialIdHint": "Create a CHAP username and secret for your backup host.",

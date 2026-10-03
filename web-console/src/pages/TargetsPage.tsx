@@ -1,7 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { MoreHorizontal, RefreshCw } from "lucide-react";
+import { CheckCircle2, CircleAlert, LoaderCircle, MoreHorizontal, RefreshCw } from "lucide-react";
 import { api } from "../services/api";
 import { useToast } from "../components/Toast";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -174,7 +174,11 @@ export function TargetsPage() {
   const [localMount, setLocalMount] = useState<LocalMountStatus | null>(null);
   const [error, setError] = useState("");
   const [mountBusy, setMountBusy] = useState(false);
+  const [mountStatusUnavailable, setMountStatusUnavailable] = useState(false);
   const mountPollInFlight = useRef(false);
+  const mountRequestInFlight = useRef(false);
+  const mountOperation = useRef<boolean | null>(null);
+  const mountStatusRevision = useRef(0);
   const [publicationAction, setPublicationAction] = useState<PublicationAction | null>(null);
   const [publicationActionBusy, setPublicationActionBusy] = useState(false);
 
@@ -192,16 +196,47 @@ export function TargetsPage() {
     ? t("iscsiSecurity.roleChanger")
     : t("iscsiSecurity.roleDrive");
 
+  const applyMountStatus = useCallback((status: LocalMountStatus) => {
+    setLocalMount(status);
+    setMountStatusUnavailable(false);
+    const operation = mountOperation.current;
+    if (operation === null) return;
+    if (status.enabled !== operation) {
+      mountOperation.current = null;
+      return;
+    }
+    if (status.state === "connecting" || status.state === "disconnecting") return;
+    mountOperation.current = null;
+    const completed = operation ? status.state === "connected" : status.state === "disabled" && status.residualDeviceCount === 0;
+    const message = completed
+      ? t(operation ? "targets.localMountCompleted" : "targets.localMountDisabled")
+      : t(!operation ? "targets.localMountStates.removalFailed" : status.state === "partial" ? "targets.localMountPartialFailure" : "targets.localMountStates.failed");
+    push(message, completed ? "success" : "error");
+  }, [push, t]);
+
+  const refreshMountStatus = useCallback(async () => {
+    if (mountPollInFlight.current || mountRequestInFlight.current) return;
+    mountPollInFlight.current = true;
+    const revision = mountStatusRevision.current;
+    try {
+      const status = await api.targets.localMountStatus();
+      if (revision === mountStatusRevision.current && !mountRequestInFlight.current) applyMountStatus(status);
+    } catch {
+      if (revision === mountStatusRevision.current && !mountRequestInFlight.current) setMountStatusUnavailable(true);
+    } finally {
+      mountPollInFlight.current = false;
+    }
+  }, [applyMountStatus]);
+
   async function reloadAll() {
     setError("");
     try {
-      const [pubRows, mountStatus, securityRows] = await Promise.all([
+      const [pubRows, securityRows] = await Promise.all([
         api.targets.listPublications(),
-        api.targets.localMountStatus(),
         api.iscsiSecurity.listTargets(),
+        refreshMountStatus(),
       ]);
       setPublications(pubRows);
-      setLocalMount(mountStatus);
       setSecurityTargets(securityRows);
       setSelectedSecurityEditor((current) => current && securityRows.some((row) => row.binding.targetIqn === current.targetIqn) ? current : null);
     } catch (err) {
@@ -210,16 +245,25 @@ export function TargetsPage() {
   }
 
   async function toggleLocalMount(enabled: boolean) {
+    if (mountRequestInFlight.current || mountOperation.current !== null) return;
+    mountRequestInFlight.current = true;
+    mountStatusRevision.current++;
+    mountOperation.current = enabled;
     setMountBusy(true);
+    let recheck = false;
     try {
       const status = await api.targets.setLocalMount(enabled);
-      setLocalMount(status);
-      push(t("targets.localMountAccepted"), "success");
+      applyMountStatus(status);
     } catch (err) {
+      mountOperation.current = null;
+      setMountStatusUnavailable(true);
+      recheck = true;
       push((err as Error).message || t("messages.requestFailed"), "error");
     } finally {
+      mountRequestInFlight.current = false;
       setMountBusy(false);
     }
+    if (recheck) await refreshMountStatus();
   }
 
   async function confirmPublicationAction() {
@@ -255,18 +299,21 @@ export function TargetsPage() {
     void reloadAll();
   }, []);
   useEffect(() => {
-    if (!localMount || (!localMount.enabled && localMount.state !== "disconnecting")) return undefined;
-    const timer = window.setInterval(() => {
-      if (mountPollInFlight.current) return;
-      mountPollInFlight.current = true;
-      void api.targets.localMountStatus()
-        .then(setLocalMount)
-        .catch(() => undefined)
-        .finally(() => { mountPollInFlight.current = false; });
-    }, 2500);
+    const timer = window.setInterval(() => { void refreshMountStatus(); }, 2500);
     return () => window.clearInterval(timer);
-  }, [localMount?.enabled, localMount?.state]);
+  }, [refreshMountStatus]);
   const targetRows = makeTargetRows(publications, securityTargets);
+  const mountProcessing = mountBusy || localMount?.state === "connecting" || localMount?.state === "disconnecting";
+  const mountFailed = localMount?.state === "partial" || localMount?.state === "failed";
+  const mountState = mountBusy
+    ? mountOperation.current ? "connecting" : "disconnecting"
+    : mountStatusUnavailable ? "unavailable" : !localMount ? "checking" : localMount.state === "failed" && !localMount.enabled ? "removalFailed" : localMount.state;
+  const mountFailureReasons = (localMount?.devices ?? [])
+    .filter((device) => device.state !== "connected" && device.reasonCode)
+    .map((device) => `${device.displayName}: ${t(`targets.localMountReasons.${device.reasonCode}`, { defaultValue: t("targets.localMountReasons.operation_failed") })}`);
+  if (localMount?.lastError) {
+    mountFailureReasons.unshift(t(`targets.localMountReasons.${localMount.lastError}`, { defaultValue: t("targets.localMountReasons.operation_failed") }));
+  }
 
   const connectedHostsLabels = {
     activeHosts: (count: number) => t("targets.activeHosts", { count }),
@@ -279,20 +326,37 @@ export function TargetsPage() {
       <div className="page-header">
         <div className="targets-page-head">
           <h1 className="page-title">{t("targets.title")}</h1>
-          <label className="cdb-trace-toggle local-mount-toggle">
-            <input
-              type="checkbox"
-              checked={Boolean(localMount?.enabled)}
-              disabled={mountBusy}
-              onChange={(event) => void toggleLocalMount(event.target.checked)}
-            />
-            <span className="switch-track" aria-hidden="true">
-              <span className="switch-thumb" />
+          <div className="local-mount-controls">
+            <span className={`local-mount-status${mountFailed || mountStatusUnavailable ? " local-mount-status-error" : ""}`} role="status" aria-live="polite">
+              {mountStatusUnavailable ? <CircleAlert size={15} aria-hidden="true" />
+                : mountProcessing || !localMount ? <LoaderCircle size={15} className="local-mount-spinner" aria-hidden="true" />
+                : mountFailed ? <CircleAlert size={15} aria-hidden="true" />
+                : localMount.state === "connected" ? <CheckCircle2 size={15} aria-hidden="true" /> : null}
+              {t(`targets.localMountStates.${mountState}`)}
             </span>
-            <span className="switch-label">{t("targets.mountLocally")}</span>
-          </label>
+            <label className="cdb-trace-toggle local-mount-toggle">
+              <input
+                type="checkbox"
+                checked={mountBusy && mountOperation.current !== null ? mountOperation.current : Boolean(localMount?.enabled)}
+                disabled={mountProcessing || !localMount || mountStatusUnavailable}
+                onChange={(event) => void toggleLocalMount(event.target.checked)}
+              />
+              <span className="switch-track" aria-hidden="true">
+                <span className="switch-thumb" />
+              </span>
+              <span className="switch-label">{t("targets.mountLocally")}</span>
+            </label>
+          </div>
         </div>
-        {localMount?.lastError ? <p className="notice notice-error">{t(`targets.localMountReasons.${localMount.lastError}`, { defaultValue: localMount.lastError })}</p> : null}
+        {mountStatusUnavailable || mountFailed ? (
+          <div className="local-mount-feedback" role="alert">
+            <span>{mountStatusUnavailable ? t("targets.localMountStatusUnavailable") : [...new Set(mountFailureReasons)].join(" ") || t("targets.localMountReasons.operation_failed")}</span>
+            <button className="btn btn-quiet" type="button" disabled={mountBusy} onClick={() => void (mountStatusUnavailable ? refreshMountStatus() : toggleLocalMount(Boolean(localMount?.enabled)))}>
+              <RefreshCw size={14} aria-hidden="true" />
+              {t(mountStatusUnavailable ? "targets.localMountCheckAgain" : "targets.localMountRetry")}
+            </button>
+          </div>
+        ) : null}
       </div>
 
       {error ? <p className="notice notice-error">{error}</p> : null}

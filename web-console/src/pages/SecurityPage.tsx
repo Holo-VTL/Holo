@@ -190,27 +190,16 @@ export function SecurityPage() {
 
   return (
     <section className="security-page">
-      <header className="page-header security-page-header">
-        <div>
+      <header className="page-header">
+        <div className="inline-actions" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
           <h1 className="page-title">{t("security.pageHeading")}</h1>
-          <p className="security-page-subtitle">{t("security.pageSummary")}</p>
+          {!credentialFormOpen ? <button className="btn btn-primary" type="button" onClick={() => { setCredentialFormOpen(true); setSecurityError(""); }}><Plus size={16} aria-hidden="true" />{t("iscsiSecurity.addCredential")}</button> : null}
         </div>
       </header>
 
       {securityError && !credentialFormOpen ? <p className="notice notice-error" role="alert">{securityError}</p> : null}
 
-      <section className="security-section" aria-labelledby="chap-section-title">
-        <div className="security-section-header">
-          <div className="security-section-title-wrap">
-            <KeyRound size={19} aria-hidden="true" />
-            <div>
-              <h2 id="chap-section-title">{t("iscsiSecurity.credentials")}</h2>
-              <p>{t("iscsiSecurity.chapSectionHint")}</p>
-            </div>
-          </div>
-          {!credentialFormOpen ? <button className="btn btn-primary" type="button" onClick={() => { setCredentialFormOpen(true); setSecurityError(""); }}><Plus size={16} aria-hidden="true" />{t("iscsiSecurity.addCredential")}</button> : null}
-        </div>
-
+      <section className="security-section" aria-label={t("security.pageHeading")}>
         {credentialFormOpen ? (
           <AppModal open title={t("iscsiSecurity.newCredential")} description={t("iscsiSecurity.credentialIdHint")} busy={securityBusy} onClose={closeCredentialForm}>
             {securityError ? <p className="notice notice-error" role="alert">{securityError}</p> : null}
