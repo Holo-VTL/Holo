@@ -604,6 +604,7 @@ func (s *LocalMountService) runAsyncSync(parent context.Context, actor string) {
 		}
 		s.asyncRun = false
 		s.asyncMu.Unlock()
+		cancel()
 		return
 	}
 }

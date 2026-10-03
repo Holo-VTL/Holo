@@ -6,6 +6,7 @@ describe("api.storage", () => {
     sessionStorage.clear();
     resetRuntimeConfigForTest();
     vi.unstubAllGlobals();
+    vi.stubEnv("BASE_URL", "/ui/");
   });
 
   it("calls storage API without login headers", async () => {

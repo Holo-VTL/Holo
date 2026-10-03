@@ -1284,24 +1284,6 @@ fn active_partition_capacity_limit(state: &TapeState) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
-mod block_index_tests {
-    use super::record_block;
-    use crate::scsi_tape::state::TapeState;
-
-    #[test]
-    fn record_block_keeps_append_and_out_of_order_indexes_sorted_and_unique() {
-        let mut state = TapeState::new("record-block-index-test".to_string());
-        for start in [0, 8, 16, 4, 8] {
-            record_block(&mut state, start, 4);
-        }
-
-        assert_eq!(state.block_starts, vec![0, 4, 8, 16]);
-        assert_eq!(state.block_lengths.len(), 4);
-        assert_eq!(state.block_lengths.get(&8), Some(&4));
-    }
-}
-
 fn ensure_capacity_available(state: &TapeState, bytes_to_advance: u64) -> Result<(), TapeError> {
     let Some(capacity_limit) = active_partition_capacity_limit(state) else {
         return Ok(());
@@ -1348,4 +1330,22 @@ fn is_addressable_position(state: &TapeState, target_position: u64) -> bool {
         return target_position.is_multiple_of(block);
     }
     false
+}
+
+#[cfg(test)]
+mod block_index_tests {
+    use super::record_block;
+    use crate::scsi_tape::state::TapeState;
+
+    #[test]
+    fn record_block_keeps_append_and_out_of_order_indexes_sorted_and_unique() {
+        let mut state = TapeState::new("record-block-index-test".to_string());
+        for start in [0, 8, 16, 4, 8] {
+            record_block(&mut state, start, 4);
+        }
+
+        assert_eq!(state.block_starts, vec![0, 4, 8, 16]);
+        assert_eq!(state.block_lengths.len(), 4);
+        assert_eq!(state.block_lengths.get(&8), Some(&4));
+    }
 }
