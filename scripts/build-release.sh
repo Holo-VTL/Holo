@@ -60,6 +60,13 @@ if [[ -z "${VERSION}" ]]; then
   VERSION="${VERSION#v}"
 fi
 
+# The remote build directory intentionally excludes .git; pass the local source
+# revision explicitly so the control-plane can report the commit used to build it.
+SOURCE_COMMIT="$(git -C "${PROJECT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "${PROJECT_DIR}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  SOURCE_COMMIT="${SOURCE_COMMIT}-dirty"
+fi
+
 PACKAGE_DIR_NAME="holo-vtl-${VERSION}-linux-x86_64"
 TARBALL_NAME="${PACKAGE_DIR_NAME}.tar.gz"
 
@@ -108,7 +115,7 @@ fi
 
 # ── Build ─────────────────────────────────────────────────────────
 echo "[3/7] Building on remote host..."
-ssh ${SSH_OPTS} "${BUILD_HOST}" "export VERSION=${VERSION}; bash -s" << REMOTE_BUILD
+ssh ${SSH_OPTS} "${BUILD_HOST}" "export VERSION=${VERSION}; export BUILD_COMMIT=${SOURCE_COMMIT}; bash -s" << REMOTE_BUILD
 set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR}"
@@ -256,7 +263,7 @@ source "\$HOME/.cargo/env" 2>/dev/null || true
 echo "  Building control-plane (static)..."
 cd "\${BUILD_DIR}/control-plane"
 VERSION_PKG="github.com/Holo-VTL/Holo/control-plane/internal/config"
-COMMIT="\$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+COMMIT="\${BUILD_COMMIT:-\$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 BUILD_DATE="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X \${VERSION_PKG}.Version=${VERSION} -X \${VERSION_PKG}.Commit=\${COMMIT} -X \${VERSION_PKG}.BuildDate=\${BUILD_DATE}" \
   -o "\${OUTPUT_DIR}/control-plane" ./cmd/api
