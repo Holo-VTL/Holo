@@ -145,8 +145,10 @@ pub fn reclaim_one_segment_with_cursor_and_progress(
         pool_root,
         library_id,
         cartridge_id,
-        runtime_dir,
-        &media_state_dir,
+        ReclaimRuntimeDirs {
+            runtime_dir,
+            media_state_dir: &media_state_dir,
+        },
         scan_cursor,
         progress,
     )
@@ -168,11 +170,18 @@ pub(super) fn reclaim_one_segment_with_media_state_dir(
         pool_root,
         library_id,
         cartridge_id,
-        runtime_dir,
-        media_state_dir,
+        ReclaimRuntimeDirs {
+            runtime_dir,
+            media_state_dir,
+        },
         scan_cursor,
         &mut progress,
     )
+}
+
+pub(super) struct ReclaimRuntimeDirs<'a> {
+    runtime_dir: &'a Path,
+    media_state_dir: &'a Path,
 }
 
 pub(super) fn reclaim_one_segment_with_media_state_dir_and_progress(
@@ -180,17 +189,16 @@ pub(super) fn reclaim_one_segment_with_media_state_dir_and_progress(
     pool_root: &Path,
     library_id: &str,
     cartridge_id: &str,
-    runtime_dir: &Path,
-    media_state_dir: &Path,
+    dirs: ReclaimRuntimeDirs<'_>,
     scan_cursor: Option<&str>,
     progress: &mut MaintenanceProgress<'_>,
 ) -> Result<OfflineReclaimReport, StorageError> {
-    let layout_lease = LayoutLease::acquire(pool_root, cartridge_id, runtime_dir)
+    let layout_lease = LayoutLease::acquire(pool_root, cartridge_id, dirs.runtime_dir)
         .map_err(super::layout_lease::storage_error_from_lease)?;
     layout_lease
         .verify_pool_root(pool_root)
         .map_err(super::layout_lease::storage_error_from_lease)?;
-    if shared_state_reports_loaded(media_state_dir, library_id, cartridge_id)? {
+    if shared_state_reports_loaded(dirs.media_state_dir, library_id, cartridge_id)? {
         return Err(StorageError::Conflict(
             "cartridge is busy because shared media state reports it loaded".to_string(),
         ));
@@ -198,7 +206,7 @@ pub(super) fn reclaim_one_segment_with_media_state_dir_and_progress(
     layout_lease
         .verify_pool_root(pool_root)
         .map_err(super::layout_lease::storage_error_from_lease)?;
-    reclaim_one_segment_under_lease(paths, pool_root, runtime_dir, scan_cursor, progress)
+    reclaim_one_segment_under_lease(paths, pool_root, dirs.runtime_dir, scan_cursor, progress)
 }
 
 fn shared_state_reports_loaded(
@@ -934,12 +942,9 @@ fn rebuild_dedup_refcounts(
     let (_sequence, entries) = load_dedup_index(&paths.dedup_file)?;
     let mut rebuilt = Vec::new();
     for mut entry in entries {
-        match refcounts.remove(&entry.entry_id) {
-            Some(count) => {
-                entry.ref_count = count;
-                rebuilt.push(entry);
-            }
-            None => {}
+        if let Some(count) = refcounts.remove(&entry.entry_id) {
+            entry.ref_count = count;
+            rebuilt.push(entry);
         }
     }
     if !refcounts.is_empty() {

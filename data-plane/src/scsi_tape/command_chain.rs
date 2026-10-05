@@ -1408,7 +1408,7 @@ fn acquire_space_admission(
         eprintln!("[space_guard] active reservations could not be read reason={err}");
         TapeError::Storage(StorageError::SpaceAdmission(err))
     })?;
-    let peak_with_in_flight = in_flight.checked_add(peak).ok_or_else(|| {
+    let peak_with_in_flight = in_flight.checked_add(peak).ok_or({
         TapeError::Storage(StorageError::SpaceAdmission(
             crate::storage::space_guard::SpaceGuardError::ArithmeticOverflow,
         ))

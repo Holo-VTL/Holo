@@ -409,8 +409,7 @@ fn next_lookup_id(records: &[MapLookupRecord]) -> u64 {
         .map(|record| record.lookup_id)
         .max()
         .unwrap_or(0)
-        .checked_add(1)
-        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 pub fn sync_lookup(path: &Path) -> Result<(), StorageError> {

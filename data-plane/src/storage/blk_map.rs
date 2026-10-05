@@ -684,8 +684,7 @@ fn next_record_id(records: &[BlkMapRecord]) -> u64 {
         .map(|record| record.record_id)
         .max()
         .unwrap_or(0)
-        .checked_add(1)
-        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 pub fn sync_blk_map(path: &Path) -> Result<(), StorageError> {
