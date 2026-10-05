@@ -103,14 +103,11 @@ fn reverse_space_filemarks_positions_at_previous_files_last_record() {
         },
     )
     .expect("load should pass");
-    execute(&mut state, CoreCommand::SetBlockModeFixed { block_size: 4 })
-        .expect("fixed mode");
+    execute(&mut state, CoreCommand::SetBlockModeFixed { block_size: 4 }).expect("fixed mode");
     for payload in [b"AAAA".to_vec(), b"BBBB".to_vec()] {
-        execute(&mut state, CoreCommand::WriteData { payload })
-            .expect("write first file record");
+        execute(&mut state, CoreCommand::WriteData { payload }).expect("write first file record");
     }
-    execute(&mut state, CoreCommand::WriteFilemarks { count: 1 })
-        .expect("write filemark");
+    execute(&mut state, CoreCommand::WriteFilemarks { count: 1 }).expect("write filemark");
     execute(
         &mut state,
         CoreCommand::WriteData {
@@ -119,12 +116,14 @@ fn reverse_space_filemarks_positions_at_previous_files_last_record() {
     )
     .expect("write next file record");
 
-    execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 })
-        .expect("backspace one filemark");
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 }).expect("backspace one filemark");
     assert_eq!(state.current_position, 4);
     let previous_file_last_record =
         execute(&mut state, CoreCommand::ReadData).expect("read previous file's last record");
-    assert_eq!(previous_file_last_record, CoreResponse::Data(b"BBBB".to_vec()));
+    assert_eq!(
+        previous_file_last_record,
+        CoreResponse::Data(b"BBBB".to_vec())
+    );
 
     cleanup(&state);
 }

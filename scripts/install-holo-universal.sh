@@ -25,8 +25,10 @@ PORTAL_HOST="${HOLO_TARGET_PORTAL_HOST:-}"
 PORTAL_PORT="${HOLO_TARGET_PORTAL_PORT:-3260}"
 CONTROL_PLANE_PATH=""
 TCMU_HANDLER_PATH=""
+MAINTENANCE_PATH=""
 WEB_DIST_PATH=""
 HANDLER_SO_PATH=""
+STORAGE_HELPER_PATH=""
 PLUGIN_SOURCE_DIR="${TCMU_SOURCE_DIR:-}"
 
 OS_ID=""
@@ -87,8 +89,10 @@ Options:
 Required bundle layout (beside this script):
   ./control-plane
   ./holo-tcmu-handler
+  ./holo_storage_maintenance
   ./web-console/dist/index.html
   ./handler_holo.so          (unless --build-tcmu-plugin)
+  ./holo-storage-helper.py
   ./holo-local-loopback-helper.py
 USAGE
 }
@@ -230,8 +234,10 @@ canonicalize_inputs() {
   fi
   CONTROL_PLANE_PATH="${CONTROL_PLANE_PATH:-${BUNDLE_DIR}/control-plane}"
   TCMU_HANDLER_PATH="${TCMU_HANDLER_PATH:-${BUNDLE_DIR}/holo-tcmu-handler}"
+  MAINTENANCE_PATH="${MAINTENANCE_PATH:-${BUNDLE_DIR}/holo_storage_maintenance}"
   WEB_DIST_PATH="${WEB_DIST_PATH:-${BUNDLE_DIR}/web-console/dist}"
   HANDLER_SO_PATH="${HANDLER_SO_PATH:-${BUNDLE_DIR}/handler_holo.so}"
+  STORAGE_HELPER_PATH="${STORAGE_HELPER_PATH:-${BUNDLE_DIR}/holo-storage-helper.py}"
 }
 
 validate_action_options() {
@@ -293,6 +299,9 @@ validate_absolute_path_value() {
   if [[ "${value}" == *..* ]]; then
     die_usage "${label} must not contain '..'"
   fi
+  if [[ "${value}" == *//* || "${value}" == */ ]]; then
+    die_usage "${label} must use a canonical path without repeated or trailing slashes"
+  fi
   if [[ ! "${value}" =~ ^/[-A-Za-z0-9._/+@=]*$ ]]; then
     die_usage "${label} contains unsupported characters"
   fi
@@ -318,6 +327,7 @@ validate_artifacts() {
   local missing=()
   [[ -f "${CONTROL_PLANE_PATH}" ]] || missing+=("${CONTROL_PLANE_PATH}")
   [[ -f "${TCMU_HANDLER_PATH}" ]] || missing+=("${TCMU_HANDLER_PATH}")
+  [[ -f "${MAINTENANCE_PATH}" ]] || missing+=("${MAINTENANCE_PATH}")
   [[ -d "${WEB_DIST_PATH}" && -f "${WEB_DIST_PATH}/index.html" ]] || missing+=("${WEB_DIST_PATH}/index.html")
   if [[ "${BUILD_TCMU_PLUGIN}" != "1" && ! -f "${HANDLER_SO_PATH}" ]]; then
     missing+=("${HANDLER_SO_PATH}")
@@ -327,6 +337,11 @@ validate_artifacts() {
   fi
   if [[ ! -f "${BUNDLE_DIR}/holo-local-loopback-helper.py" && ! -f "${SCRIPT_DIR}/../infra/iscsi/holo-local-loopback-helper.py" ]]; then
     missing+=("holo-local-loopback-helper.py")
+  fi
+  if [[ ! -f "${STORAGE_HELPER_PATH}" && ! -f "${SCRIPT_DIR}/../infra/storage/holo-storage-helper.py" ]]; then
+    missing+=("holo-storage-helper.py")
+  elif [[ ! -f "${STORAGE_HELPER_PATH}" ]]; then
+    STORAGE_HELPER_PATH="${SCRIPT_DIR}/../infra/storage/holo-storage-helper.py"
   fi
   if [[ "${#missing[@]}" -gt 0 ]]; then
     printf '[holo-install][error] missing required release artifacts:\n' >&2
@@ -518,7 +533,7 @@ build_package_plan() {
       REPO_ACTIONS=("apt-get update")
       RUNTIME_PACKAGES=(kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi sg3-utils)
       VALIDATION_PACKAGES=(curl jq lsscsi open-iscsi)
-      BUILD_PACKAGES=(gcc make pkg-config dpkg-dev libtcmu-dev)
+      BUILD_PACKAGES=(gcc make pkg-config dpkg-dev)
       ;;
     dnf)
       if has_bundled_tcmu_packages; then
@@ -718,6 +733,28 @@ validate_dnf_package_sources() {
   die "missing required runtime packages and no enabled DNF repository is available: ${missing[*]}; enable the OS repositories that provide these packages, then rerun install"
 }
 
+ensure_tape_character_device_driver() {
+  [[ "${PKG_MANAGER}" == "apt" ]] || return 0
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "Ubuntu/Debian tape character-device module check deferred in dry-run"
+    return 0
+  fi
+
+  local package="linux-modules-extra-$(uname -r)"
+  if ! modinfo st >/dev/null 2>&1 && apt-cache show "${package}" >/dev/null 2>&1; then
+    log "Installing the running-kernel SCSI tape module package: ${package}"
+    if ! run_cmd apt-get install -y "${package}"; then
+      warn "Could not install ${package}; local tape access may be limited to SCSI generic devices"
+    fi
+  fi
+
+  if modinfo st >/dev/null 2>&1; then
+    run_cmd modprobe st || warn "Could not load the SCSI tape module; local tape access may be limited to SCSI generic devices"
+  else
+    warn "The SCSI tape module is unavailable for kernel $(uname -r); local tape access may be limited to SCSI generic devices"
+  fi
+}
+
 install_packages() {
   log "Installing package dependencies"
 
@@ -775,6 +812,8 @@ install_packages() {
       fi
       ;;
   esac
+
+  ensure_tape_character_device_driver
 }
 
 # ── Distro-specific package fixups ──────────────────────────────────
@@ -886,6 +925,56 @@ verify_runtime_capabilities() {
 
 # ── User & directories ──────────────────────────────────────────────
 
+reject_symlinked_path_components() {
+  local path="$1" current="/" component index
+  local -a components=()
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '[dry-run][path-check] reject symlink components under %s\n' "${path}"
+    return 0
+  fi
+  IFS='/' read -r -a components <<< "${path#/}"
+  for index in "${!components[@]}"; do
+    component="${components[index]}"
+    [[ -n "${component}" ]] || continue
+    current="${current%/}/${component}"
+    [[ ! -L "${current}" ]] || die "refusing symlink in managed path: ${current}"
+    if [[ -e "${current}" ]] && (( index < ${#components[@]} - 1 )) && [[ ! -d "${current}" ]]; then
+      die "managed path component is not a directory: ${current}"
+    fi
+  done
+}
+
+require_root_controlled_ancestors() {
+  local path="$1" current="/" component index owner group mode permissions
+  local -a components=()
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '[dry-run][path-check] require root-controlled ancestors of %s\n' "${path}"
+    return 0
+  fi
+  IFS='/' read -r -a components <<< "${path#/}"
+  for index in "${!components[@]}"; do
+    component="${components[index]}"
+    [[ -n "${component}" ]] || continue
+    current="${current%/}/${component}"
+    if [[ ! -e "${current}" ]]; then
+      break
+    fi
+    [[ -d "${current}" && ! -L "${current}" ]] || die "managed path ancestor is not a directory: ${current}"
+    if (( index == ${#components[@]} - 1 )); then
+      break
+    fi
+    read -r owner group mode < <(stat -c '%u %G %a' -- "${current}") || die "cannot inspect managed path ancestor: ${current}"
+    [[ "${owner}" == "0" ]] || die "managed path ancestor is not root-owned: ${current}"
+    # Ubuntu and Debian ship /var/log as root:syslog 0775; accept that exact
+    # standard ancestor for Holo's conventional log directory.
+    if [[ "${path}" == "/var/log/holo" && "${current}" == "/var/log" && "${group}" == "syslog" && "${mode}" == "775" ]]; then
+      continue
+    fi
+    permissions=$((8#${mode}))
+    (( (permissions & 8#22) == 0 )) || die "managed path ancestor is writable by group or other: ${current}"
+  done
+}
+
 ensure_user_and_dirs() {
   log "Creating service user and directories"
   if ! getent group "${SERVICE_GROUP}" >/dev/null 2>&1; then
@@ -894,16 +983,34 @@ ensure_user_and_dirs() {
   if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
     run_cmd useradd --system --gid "${SERVICE_GROUP}" --home-dir "${DATA_DIR}" --shell /sbin/nologin "${SERVICE_USER}"
   fi
-  run_cmd mkdir -p "${PREFIX}/bin" "${PREFIX}/web-console" "${CONFIG_DIR}" "${CONFIG_DIR}/iscsi" "${DATA_DIR}/storage-pools" "${DATA_DIR}/targets" "${DATA_DIR}/media-state" "${LOG_DIR}" "${PLUGIN_DIR}"
+  reject_symlinked_path_components "${PREFIX}"
+  reject_symlinked_path_components "${CONFIG_DIR}"
+  reject_symlinked_path_components "${CONFIG_DIR}/iscsi"
+  reject_symlinked_path_components "${DATA_DIR}"
+  reject_symlinked_path_components "${DATA_DIR}/storage-pools"
+  reject_symlinked_path_components "${DATA_DIR}/targets"
+  reject_symlinked_path_components "${DATA_DIR}/media-state"
+  reject_symlinked_path_components "${LOG_DIR}"
+  require_root_controlled_ancestors "${PREFIX}"
+  require_root_controlled_ancestors "${CONFIG_DIR}"
+  require_root_controlled_ancestors "${DATA_DIR}"
+  require_root_controlled_ancestors "${LOG_DIR}"
+  run_cmd mkdir -p "${PREFIX}/bin" "${PREFIX}/libexec" "${PREFIX}/web-console" "${CONFIG_DIR}" "${CONFIG_DIR}/iscsi" "${DATA_DIR}/storage-pools" "${DATA_DIR}/targets" "${DATA_DIR}/media-state" "${LOG_DIR}" "${PLUGIN_DIR}"
+  run_cmd chown root:root "${PREFIX}" "${PREFIX}/bin" "${PREFIX}/libexec" "${PREFIX}/web-console"
+  run_cmd chmod 0755 "${PREFIX}" "${PREFIX}/bin" "${PREFIX}/web-console"
+  run_cmd chmod 0750 "${PREFIX}/libexec"
+  run_cmd chown root:"${SERVICE_GROUP}" "${DATA_DIR}"
+  run_cmd chmod 1770 "${DATA_DIR}"
   run_cmd chown root:root "${CONFIG_DIR}/iscsi"
   run_cmd chmod 0700 "${CONFIG_DIR}/iscsi"
   run_cmd chown root:"${SERVICE_GROUP}" "${CONFIG_DIR}"
-  run_cmd chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}" "${LOG_DIR}"
   run_cmd mkdir -p "${DATA_DIR}/local-loopback"
   run_cmd chown root:root "${DATA_DIR}/local-loopback"
   run_cmd chmod 0700 "${DATA_DIR}/local-loopback"
   run_cmd find "${DATA_DIR}/local-loopback" -maxdepth 1 -type f -name '*.json' -exec chown root:root {} +
   run_cmd find "${DATA_DIR}/local-loopback" -maxdepth 1 -type f -name '*.json' -exec chmod 0600 {} +
+  run_cmd chown "${SERVICE_USER}:${SERVICE_GROUP}" "${LOG_DIR}"
+  run_cmd chmod 0750 "${LOG_DIR}"
   run_cmd chmod 0750 "${CONFIG_DIR}"
 }
 
@@ -936,6 +1043,7 @@ install_artifacts() {
   log "Installing Holo-VTL artifacts"
   run_cmd install -m 0755 "${CONTROL_PLANE_PATH}" "${PREFIX}/bin/control-plane"
   run_cmd install -m 0755 "${TCMU_HANDLER_PATH}" "${PREFIX}/bin/holo-tcmu-handler"
+  run_cmd install -m 0755 "${MAINTENANCE_PATH}" "${PREFIX}/bin/holo_storage_maintenance"
   run_cmd rm -rf "${PREFIX}/web-console/dist"
   run_cmd mkdir -p "${PREFIX}/web-console"
   run_cmd cp -a "${WEB_DIST_PATH}" "${PREFIX}/web-console/dist"
@@ -947,104 +1055,57 @@ install_artifacts() {
   fi
 
   if command -v getenforce >/dev/null 2>&1 || [[ "${DRY_RUN}" == "1" ]]; then
-    run_cmd chcon -t bin_t "${PREFIX}/bin/control-plane" "${PREFIX}/bin/holo-tcmu-handler" || warn "SELinux chcon for binaries failed"
+    run_cmd chcon -t bin_t "${PREFIX}/bin/control-plane" "${PREFIX}/bin/holo-tcmu-handler" "${PREFIX}/bin/holo_storage_maintenance" || warn "SELinux chcon for binaries failed"
     run_cmd chcon -t lib_t "${PLUGIN_DIR}/handler_holo.so" || warn "SELinux chcon for handler_holo.so failed"
   fi
 }
 
 write_storage_helper() {
   log "Writing storage privilege helper"
-  local helper_tmp helper_path
-  helper_tmp="$(mktemp)"
-  helper_path="${PREFIX}/bin/holo-storage-helper"
-  cat >"${helper_tmp}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
+  local helper_path="${PREFIX}/bin/holo-storage-helper"
+  local helper_script="${PREFIX}/libexec/holo-storage-helper.py"
+  local config_path="${CONFIG_DIR}/storage-helper.json"
+  local wrapper_tmp config_tmp service_uid service_gid
 
-STORAGE_POOL_ROOT_BASE="${DATA_DIR}/storage-pools"
+  run_cmd mkdir -p "${PREFIX}/libexec"
+  run_cmd install -m 0750 -o root -g root "${STORAGE_HELPER_PATH}" "${helper_script}"
 
-die() {
-  printf 'holo-storage-helper: %s\n' "\$*" >&2
-  exit 1
-}
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    service_uid="$(id -u "${SERVICE_USER}" 2>/dev/null || printf '1000')"
+    service_gid="$(getent group "${SERVICE_GROUP}" 2>/dev/null | cut -d: -f3 || printf '1000')"
+  else
+    service_uid="$(id -u "${SERVICE_USER}")"
+    service_gid="$(getent group "${SERVICE_GROUP}" | cut -d: -f3)"
+    [[ "${service_uid}" =~ ^[1-9][0-9]*$ && "${service_gid}" =~ ^[1-9][0-9]*$ ]] || die "invalid Holo service UID/GID"
+  fi
 
-run_cmd() {
-  local name="\$1"
-  shift
-  local candidate
-  for candidate in "/usr/sbin/\${name}" "/sbin/\${name}" "/usr/bin/\${name}" "/bin/\${name}"; do
-    if [[ -x "\${candidate}" ]]; then
-      exec "\${candidate}" "\$@"
-    fi
-  done
-  die "\${name} not found"
-}
-
-pool_path() {
-  local path="\$1"
-  [[ "\${path}" = /* ]] || die "pool path must be absolute"
-  [[ "\${path}" != *..* ]] || die "pool path must not contain traversal"
-  path="\${path%/}"
-  [[ "\${path}" == "\${STORAGE_POOL_ROOT_BASE}/"* ]] || die "pool path outside storage pool root"
-  printf '%s\n' "\${path}"
-}
-
-device_path() {
-  local path="\$1"
-  [[ "\${path}" =~ ^/dev/[-A-Za-z0-9._/]+$ ]] || die "invalid device path"
-  [[ "\${path}" != *..* ]] || die "device path must not contain traversal"
-  printf '%s\n' "\${path}"
-}
-
-cmd="\${1:-}"
-[[ -n "\${cmd}" ]] || die "missing command"
-shift
-
-case "\${cmd}" in
-  mkdir)
-    [[ "\$#" -eq 2 && "\$1" == "-p" ]] || die "mkdir only supports: -p <pool-path>"
-    run_cmd mkdir -p "\$(pool_path "\$2")"
-    ;;
-  chown)
-    [[ "\$#" -eq 2 && "\$1" =~ ^[0-9]+:[0-9]+$ ]] || die "chown only supports: <uid:gid> <pool-path>"
-    run_cmd chown "\$1" "\$(pool_path "\$2")"
-    ;;
-  mkfs.xfs)
-    [[ "\$#" -eq 2 && "\$1" == "-f" ]] || die "mkfs.xfs only supports: -f <device>"
-    run_cmd mkfs.xfs -f "\$(device_path "\$2")"
-    ;;
-  mount)
-    [[ "\$#" -eq 4 && "\$1" == "-o" && "\$2" == "noatime,nodiratime" ]] || die "mount only supports Holo pool mount options"
-    run_cmd mount -o noatime,nodiratime "\$(device_path "\$3")" "\$(pool_path "\$4")"
-    ;;
-  umount)
-    [[ "\$#" -eq 1 ]] || die "umount only supports: <pool-path>"
-    run_cmd umount "\$(pool_path "\$1")"
-    ;;
-  lsblk)
-    [[ "\$#" -eq 3 && "\$1" == "-no" && "\$2" == "FSTYPE" ]] || die "lsblk only supports filesystem probing"
-    run_cmd lsblk -no FSTYPE "\$(device_path "\$3")"
-    ;;
-  findmnt)
-    if [[ "\$#" -eq 5 && "\$1" == "-rn" && "\$2" == "-S" && "\$4" == "-o" && "\$5" == "TARGET" ]]; then
-      run_cmd findmnt -rn -S "\$(device_path "\$3")" -o TARGET
-    elif [[ "\$#" -eq 5 && "\$1" == "-rn" && "\$2" == "-M" && "\$4" == "-o" && "\$5" == "SOURCE" ]]; then
-      run_cmd findmnt -rn -M "\$(pool_path "\$3")" -o SOURCE
-    else
-      die "unsupported findmnt invocation"
-    fi
-    ;;
-  *)
-    die "unsupported command: \${cmd}"
-    ;;
-esac
+  config_tmp="$(mktemp)"
+  cat >"${config_tmp}" <<EOF
+{"data_dir":"${DATA_DIR}","storage_pool_root_base":"${DATA_DIR}/storage-pools","runtime_dir":"/run/holo-privileged","service_uid":${service_uid},"service_gid":${service_gid}}
 EOF
   if [[ "${DRY_RUN}" == "1" ]]; then
-    sed 's/^/[dry-run][helper] /' "${helper_tmp}"
+    sed 's/^/[dry-run][storage-config] /' "${config_tmp}"
+    printf '[dry-run] install -m 0600 -o root -g root %s %s\n' "${config_tmp}" "${config_path}"
   else
-    install -m 0750 -o root -g root "${helper_tmp}" "${helper_path}"
+    install -m 0600 -o root -g root "${config_tmp}" "${config_path}"
   fi
-  rm -f "${helper_tmp}"
+  rm -f "${config_tmp}"
+
+  wrapper_tmp="$(mktemp)"
+  cat >"${wrapper_tmp}" <<EOF
+#!/bin/sh
+set -eu
+exec /usr/bin/python3 -I "${helper_script}" --config "${config_path}" "\$@"
+EOF
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    sed 's/^/[dry-run][storage-helper] /' "${wrapper_tmp}"
+    printf '[dry-run] install -m 0750 -o root -g root %s %s\n' "${wrapper_tmp}" "${helper_path}"
+  else
+    install -m 0750 -o root -g root "${wrapper_tmp}" "${helper_path}"
+  fi
+  rm -f "${wrapper_tmp}"
+
+  run_cmd "${helper_path}" prepare-directories
 }
 
 write_targetcli_helper() {
@@ -1498,7 +1559,7 @@ EOF
 stop_control_plane_for_upgrade() {
   if [[ "${ACTION}" != "upgrade" ]]; then return 0; fi
   log "Stopping control-plane before upgrade"
-  run_shell "systemctl stop holo-control-plane 2>/dev/null || true"
+  run_shell "systemctl stop holo-control-plane && ! systemctl is-active --quiet holo-control-plane"
 }
 
 build_tcmu_plugin() {
@@ -1612,6 +1673,7 @@ HOLO_ISCSI_SECRET_KEY=${CONFIG_DIR}/iscsi-secrets.key
 HOLO_STORAGE_PRIVILEGED_HELPER=${PREFIX}/bin/holo-storage-helper
 HOLO_SUPPORT_PRIVILEGED_HELPER=${PREFIX}/bin/holo-support-helper
 HOLO_STORAGE_POOL_ROOT_BASE=${DATA_DIR}/storage-pools
+HOLO_RUN_DIR=/run/holo
 HOLO_STRICT_STORAGE_FLOW=1
 HOLO_MEDIA_STATE_DIR=${DATA_DIR}/media-state
 HOLO_TCMU_SOCKET_DIR=/run/holo
@@ -1959,13 +2021,66 @@ if not isinstance(remaining, list) or remaining:
 PY
 }
 
+list_holo_backstores() {
+  local output
+  if output="$(targetcli /backstores/user:holo ls 2>&1)"; then
+    printf '%s\n' "${output}"
+    return 0
+  fi
+  if grep -Fq 'No such path /backstores/user:holo' <<<"${output}"; then
+    return 0
+  fi
+  printf '%s\n' "${output}" >&2
+  return 1
+}
+
 cleanup_runtime_targets() {
   cleanup_local_loopback_mappings
   log "Cleaning Holo-VTL runtime targets"
-  run_shell "if command -v targetcli >/dev/null 2>&1; then targetcli /iscsi ls 2>/dev/null | grep -oE 'iqn\\.2026-04\\.[a-z.]+\\.holo:[^ ]+' | while read -r iqn; do targetcli /iscsi delete \"\$iqn\" >/dev/null 2>&1 || true; done; fi"
-  run_shell "if command -v targetcli >/dev/null 2>&1; then targetcli /backstores/user:holo ls 2>/dev/null | grep -oE 'holo_pub_[A-Za-z0-9_.:-]+' | while read -r bs; do targetcli /backstores/user:holo delete \"\$bs\" >/dev/null 2>&1 || true; done; fi"
-  run_shell "pgrep -f '^${PREFIX}/bin/holo-tcmu-handler( |$)' | xargs -r kill -TERM 2>/dev/null || true"
-  run_shell "sleep 1; pgrep -f '^${PREFIX}/bin/holo-tcmu-handler( |$)' | xargs -r kill -KILL 2>/dev/null || true"
+  log "Verifying Holo iSCSI targets, backstores, local mappings, and TCMU handlers are drained"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] delete Holo iSCSI targets and verify no Holo IQNs remain"
+    log "[dry-run] delete Holo backstores and verify none remain"
+    log "[dry-run] terminate and verify no ${PREFIX}/bin/holo-tcmu-handler processes remain"
+    return 0
+  fi
+
+  command -v targetcli >/dev/null 2>&1 || die "targetcli is unavailable; cannot verify runtime target drain"
+  local iscsi_tree backstore_tree iqn backstore handler_pattern
+  local -a iqns=() backstores=() handler_pids=()
+  iscsi_tree="$(targetcli /iscsi ls)" || die "could not inspect iSCSI targets before upgrade"
+  mapfile -t iqns < <(printf '%s\n' "${iscsi_tree}" | grep -oE 'iqn\.2026-04\.[A-Za-z0-9.-]+\.holo:[^[:space:]]+' || true)
+  for iqn in "${iqns[@]}"; do
+    targetcli /iscsi delete "${iqn}" >/dev/null || die "could not remove an Holo iSCSI target before upgrade"
+  done
+  iscsi_tree="$(targetcli /iscsi ls)" || die "could not verify iSCSI target cleanup"
+  if grep -Eq 'iqn\.2026-04\.[A-Za-z0-9.-]+\.holo:' <<<"${iscsi_tree}"; then
+    die "Holo iSCSI targets remain after cleanup"
+  fi
+
+  backstore_tree="$(list_holo_backstores)" || die "could not inspect Holo backstores before upgrade"
+  mapfile -t backstores < <(printf '%s\n' "${backstore_tree}" | grep -oE 'holo_pub_[A-Za-z0-9_.:-]+' || true)
+  for backstore in "${backstores[@]}"; do
+    targetcli /backstores/user:holo delete "${backstore}" >/dev/null || die "could not remove a Holo backstore before upgrade"
+  done
+  backstore_tree="$(list_holo_backstores)" || die "could not verify Holo backstore cleanup"
+  if grep -Eq 'holo_pub_[A-Za-z0-9_.:-]+' <<<"${backstore_tree}"; then
+    die "Holo published backstores remain after cleanup"
+  fi
+
+  printf -v handler_pattern '^%s/bin/holo-tcmu-handler( |$)' "${PREFIX}"
+  mapfile -t handler_pids < <(pgrep -f "${handler_pattern}" || true)
+  if ((${#handler_pids[@]})); then
+    kill -TERM "${handler_pids[@]}" || die "could not stop Holo TCMU handlers"
+    sleep 1
+    mapfile -t handler_pids < <(pgrep -f "${handler_pattern}" || true)
+    if ((${#handler_pids[@]})); then
+      kill -KILL "${handler_pids[@]}" || die "could not terminate remaining Holo TCMU handlers"
+      sleep 1
+    fi
+  fi
+  mapfile -t handler_pids < <(pgrep -f "${handler_pattern}" || true)
+  ((${#handler_pids[@]} == 0)) || die "Holo TCMU handlers remain after cleanup"
 }
 
 unmount_storage_pools() {
@@ -1978,7 +2093,7 @@ if ! command -v findmnt >/dev/null 2>&1; then
   echo '[holo-install][warn] findmnt not found; skipping storage pool unmount discovery' >&2
   exit 0
 fi
-findmnt -R -n -o TARGET --target \"\${base}\" 2>/dev/null \
+findmnt -R -l -n -o TARGET --target \"\${base}\" 2>/dev/null \
   | while IFS= read -r target; do printf '%s %s\n' \"\${#target}\" \"\${target}\"; done \
   | sort -rn \
   | cut -d' ' -f2- \
@@ -2063,11 +2178,11 @@ install_or_upgrade_holo() {
   verify_runtime_capabilities
   resolve_plugin_source_dir
   load_kernel_modules
-  ensure_user_and_dirs
   stop_control_plane_for_upgrade
   if [[ "${ACTION}" == "upgrade" ]]; then
     cleanup_runtime_targets
   fi
+  ensure_user_and_dirs
   install_artifacts
   write_storage_helper
   write_targetcli_helper

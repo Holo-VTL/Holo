@@ -6,10 +6,13 @@ use std::sync::{Mutex, OnceLock};
 use super::compression::CompressionCodec;
 use super::layout::SegmentKind;
 use super::metadata::{
-    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+    checked_metadata_record_count, checked_usize_from_u64, lock_storage_mutex,
+    modified_nanos_from_result, StorageError, MAX_MAINTENANCE_METADATA_BYTES,
 };
+#[cfg(test)]
+use super::segment::read_segment_file;
 use super::segment::{
-    append_segment_payload, read_segment_file, sync_segment_file, write_segment_file,
+    append_segment_payload, read_segment_file_bounded, sync_segment_file, write_segment_file,
 };
 
 pub const MAX_RECORDS_PER_SEGMENT: usize = 1024;
@@ -331,7 +334,8 @@ fn ensure_cache_fresh(path: &Path) -> Result<(), StorageError> {
         }
     }
 
-    let (header, payload) = read_segment_file(path, SegmentKind::BlkMap)?;
+    let (header, payload) =
+        read_segment_file_bounded(path, SegmentKind::BlkMap, MAX_MAINTENANCE_METADATA_BYTES)?;
     let records = decode_payload(&payload)?;
     let log_version = block_map_log_version(&payload);
     lock_storage_mutex(cache(), "blk_map")?.insert(
@@ -381,6 +385,11 @@ pub fn append_blk_map_record(
             ));
         }
         if record.record_id == 0 {
+            if entry.next_record_id == u64::MAX {
+                return Err(StorageError::Conflict(
+                    "blk map record ID space is exhausted".to_string(),
+                ));
+            }
             record.record_id = entry.next_record_id;
         }
     }
@@ -415,7 +424,11 @@ pub fn append_blk_map_record(
         .get_mut(path)
         .ok_or_else(|| StorageError::NotFound("blk map cache not initialized".to_string()))?;
     entry.sequence = header.sequence;
-    entry.next_record_id = entry.next_record_id.max(record.record_id.saturating_add(1));
+    entry.next_record_id = entry
+        .next_record_id
+        .max(record.record_id.checked_add(1).ok_or_else(|| {
+            StorageError::Conflict("blk map record ID space is exhausted".to_string())
+        })?);
     if entry
         .records
         .last()
@@ -530,6 +543,7 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageErr
             .map_err(|_| StorageError::Corrupt("blk map count parse failed".to_string()))?,
     );
     let count = checked_usize_from_u64(raw_count, "blk map count")?;
+    let count = checked_metadata_record_count(count)?;
     let mut offset = 8;
     if count == 0 {
         return Ok(Vec::new());
@@ -580,6 +594,13 @@ fn decode_log_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageError>
             "blk map log payload too short".to_string(),
         ));
     }
+    let log_records = (payload.len() - prefix.len()) / record_size;
+    if !(payload.len() - prefix.len()).is_multiple_of(record_size) {
+        return Err(StorageError::Corrupt(
+            "blk map log payload length mismatch".to_string(),
+        ));
+    }
+    checked_metadata_record_count(log_records)?;
     let mut offset = prefix.len();
     let mut latest = HashMap::<u64, BlkMapRecord>::new();
     while offset < payload.len() {
@@ -598,7 +619,8 @@ fn decode_log_payload(payload: &[u8]) -> Result<Vec<BlkMapRecord>, StorageError>
 }
 
 fn ensure_log_format(path: &Path, records: &[BlkMapRecord]) -> Result<(), StorageError> {
-    let (_, payload) = read_segment_file(path, SegmentKind::BlkMap)?;
+    let (_, payload) =
+        read_segment_file_bounded(path, SegmentKind::BlkMap, MAX_MAINTENANCE_METADATA_BYTES)?;
     if payload.starts_with(LOG_PREFIX) {
         return Ok(());
     }

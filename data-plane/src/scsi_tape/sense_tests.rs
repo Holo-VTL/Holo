@@ -9,6 +9,13 @@ fn maps_baseline_sense_contexts() {
     let not_ready = sense_for_context(SenseContext::NotReady);
     assert_eq!(not_ready.status, 0x02);
     assert_eq!(not_ready.sense_key, 0x02);
+    assert_eq!(not_ready.asc, 0x3A);
+
+    let recovery_required = resolve_sense_for_error(&TapeError::RecoveryRequired);
+    assert_eq!(recovery_required.status, 0x02);
+    assert_eq!(recovery_required.sense_key, 0x02);
+    assert_eq!(recovery_required.asc, 0x04);
+    assert_eq!(recovery_required.ascq, 0x00);
 
     let illegal = sense_for_context(SenseContext::IllegalRequest);
     assert_eq!(illegal.sense_key, 0x05);
@@ -93,6 +100,36 @@ fn resolves_sense_for_errors() {
     assert_eq!(storage.sense_key, 0x03);
     assert_eq!(storage.asc, 0x11);
     assert_eq!(storage.ascq, 0x00);
+}
+
+#[test]
+fn physical_write_admission_reports_known_full_residual_without_eom() {
+    let frame = resolve_sense_for_error(&TapeError::PhysicalWriteAdmission {
+        requested_units: 7,
+        source: crate::storage::StorageError::SpaceAdmission(
+            crate::storage::space_guard::SpaceGuardError::InsufficientSpace {
+                available: 1,
+                required: 2,
+            },
+        ),
+    });
+    assert_eq!(frame.status, 0x02);
+    assert_eq!(frame.sense_key, 0x03);
+    assert_eq!((frame.asc, frame.ascq), (0x0C, 0x00));
+    assert!(!frame.end_of_medium);
+    assert!(frame.information_valid);
+    assert_eq!(frame.information, 7);
+}
+
+#[test]
+fn actual_physical_write_error_has_invalid_information_and_no_eom() {
+    let frame = resolve_sense_for_error(&TapeError::Storage(
+        crate::storage::StorageError::SpaceExhausted("disk full".to_string()),
+    ));
+    assert_eq!(frame.sense_key, 0x03);
+    assert_eq!((frame.asc, frame.ascq), (0x0C, 0x00));
+    assert!(!frame.end_of_medium);
+    assert!(!frame.information_valid);
 }
 
 #[test]

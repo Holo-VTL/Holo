@@ -1,14 +1,18 @@
 use std::fs;
 
+use super::blk_map::{
+    load_blk_map_records, persist_blk_map_records, BlkMapState, PayloadChecksumAlgorithm,
+};
 use super::compression::CompressionCodec;
 use super::data_path::{
     current_checkpoint, current_dedup_refcounts, discard_layout_caches, flush_pending_writes,
-    read_logical_block, recover_dirty_state, run_unmap, write_logical_block, IngestFailpoint,
-    WriteOptions,
+    mark_checkpoint_dirty, read_logical_block, recover_dirty_state, run_unmap, write_logical_block,
+    IngestFailpoint, WriteOptions,
 };
 use super::dedup::{fingerprint128, load_dedup_index, persist_dedup_entries};
 use super::layout::checksum32;
 use super::layout::{initialize_layout, LayoutPaths};
+use super::maintenance_progress::MaintenancePhase;
 use super::metadata::CheckpointFlags;
 use super::segment_index::{data_segment_path, load_segment_index, persist_segment_index};
 
@@ -294,6 +298,47 @@ fn recovers_dirty_checkpoint_after_failpoint() {
 }
 
 #[test]
+fn cancelled_recovery_keeps_dirty_checkpoint_and_source_segment() {
+    let paths = test_paths("recover-cancelled-progress");
+    initialize_layout(&paths).expect("layout init should pass");
+    let payload = vec![b'R'; 2 * 1024 * 1024];
+    let error = write_logical_block(
+        &paths,
+        0,
+        &payload,
+        0,
+        WriteOptions::throughput_default(),
+        Some(IngestFailpoint::AfterLookupAppend),
+    )
+    .expect_err("failpoint should leave the checkpoint dirty");
+    assert!(format!("{error}").contains("interrupted"));
+    let source = data_segment_path(&paths, 0);
+    let source_before = fs::read(&source).expect("read source segment");
+    let mut saw_verified_work = false;
+    let result = super::data_path::recover_dirty_state_with_progress(
+        &paths,
+        &mut |phase, bytes, _records| {
+            if phase == MaintenancePhase::Scan && bytes > 0 {
+                saw_verified_work = true;
+                return Err(super::metadata::StorageError::Cancelled);
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err(), "recovery should observe cancellation");
+    assert!(saw_verified_work, "recovery did not report checked work");
+    assert_eq!(
+        current_checkpoint(&paths)
+            .expect("checkpoint after cancellation")
+            .flags,
+        CheckpointFlags::Dirty,
+        "cancelled recovery must not mark the layout clean"
+    );
+    assert_eq!(fs::read(&source).expect("source remains"), source_before);
+    let _ = fs::remove_dir_all(&paths.root);
+}
+
+#[test]
 fn recovery_rebuilds_unflushed_segment_index_after_restart() {
     let paths = test_paths("recover-unflushed-segment-index");
     initialize_layout(&paths).expect("layout init should pass");
@@ -362,4 +407,225 @@ fn flush_pending_writes_marks_checkpoint_clean() {
 
     let after = current_checkpoint(&paths).expect("checkpoint should load");
     assert_eq!(after.flags, CheckpointFlags::Clean);
+}
+
+#[test]
+fn recovery_keeps_checkpoint_dirty_when_an_active_blob_reference_is_missing() {
+    let paths = test_paths("recover-missing-active-blob");
+    initialize_layout(&paths).expect("layout init should pass");
+    write_logical_block(
+        &paths,
+        0,
+        b"active-reference",
+        0,
+        WriteOptions::throughput_default(),
+        None,
+    )
+    .expect("write active record");
+    let original_segment = fs::read(data_segment_path(&paths, 0)).expect("read source segment");
+    let (_, mut records) = load_blk_map_records(&paths.blk_map_file).expect("load block map");
+    let active = records
+        .iter_mut()
+        .find(|record| record.state == BlkMapState::Active)
+        .expect("active record");
+    active.physical_offset = active.physical_offset.saturating_add(1000);
+    persist_blk_map_records(&paths.blk_map_file, &records).expect("persist broken reference");
+    mark_checkpoint_dirty(&paths).expect("mark dirty");
+    discard_layout_caches(&paths);
+
+    let result = recover_dirty_state(&paths);
+
+    assert!(result.is_err(), "missing active blob must fail recovery");
+    assert_eq!(
+        current_checkpoint(&paths)
+            .expect("checkpoint after failure")
+            .flags,
+        CheckpointFlags::Dirty,
+        "recovery must not mark invalid references clean"
+    );
+    assert_eq!(
+        fs::read(data_segment_path(&paths, 0)).expect("source segment remains"),
+        original_segment
+    );
+    let _ = fs::remove_dir_all(&paths.root);
+}
+
+#[test]
+fn recovery_rejects_active_codec_and_decoded_length_mismatches() {
+    for (suffix, mutate) in [
+        (
+            "codec",
+            Box::new(|record: &mut super::blk_map::BlkMapRecord| {
+                record.compression = CompressionCodec::Lz4;
+            }) as Box<dyn Fn(&mut super::blk_map::BlkMapRecord)>,
+        ),
+        (
+            "decoded-length",
+            Box::new(|record: &mut super::blk_map::BlkMapRecord| {
+                record.logical_len = record.logical_len.saturating_add(1);
+            }),
+        ),
+    ] {
+        let paths = test_paths(&format!("recover-invalid-{suffix}"));
+        initialize_layout(&paths).expect("layout init should pass");
+        write_logical_block(
+            &paths,
+            0,
+            b"active-reference-shape",
+            0,
+            WriteOptions::throughput_default(),
+            None,
+        )
+        .expect("write active record");
+        let (_, mut records) = load_blk_map_records(&paths.blk_map_file).expect("load block map");
+        let active = records
+            .iter_mut()
+            .find(|record| record.state == BlkMapState::Active)
+            .expect("active record");
+        mutate(active);
+        persist_blk_map_records(&paths.blk_map_file, &records).expect("persist invalid reference");
+        mark_checkpoint_dirty(&paths).expect("mark dirty");
+        discard_layout_caches(&paths);
+
+        assert!(
+            recover_dirty_state(&paths).is_err(),
+            "invalid {suffix} reference must not recover"
+        );
+        assert_eq!(
+            current_checkpoint(&paths)
+                .expect("checkpoint after invalid reference")
+                .flags,
+            CheckpointFlags::Dirty
+        );
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+}
+
+#[test]
+fn recovery_accepts_legacy_v1_fnv_payload_and_zero_segment_checksum_sentinel() {
+    let paths = test_paths("recover-legacy-v1-fnv-zero-sentinel");
+    initialize_layout(&paths).expect("layout init should pass");
+    let payload = b"legacy-v1-payload";
+    write_logical_block(
+        &paths,
+        0,
+        payload,
+        0,
+        WriteOptions::throughput_default(),
+        None,
+    )
+    .expect("write active record");
+    let (_, mut records) = load_blk_map_records(&paths.blk_map_file).expect("load block map");
+    let active = records
+        .iter_mut()
+        .find(|record| record.state == BlkMapState::Active)
+        .expect("active record");
+    active.payload_checksum_algorithm = PayloadChecksumAlgorithm::Fnv1a32;
+    active.payload_checksum = checksum32(payload);
+    persist_blk_map_records(&paths.blk_map_file, &records).expect("persist FNV checksum");
+
+    let segment = data_segment_path(&paths, 0);
+    let original = fs::read(&segment).expect("read segment");
+    let header = super::segment::read_segment_header(&segment, super::layout::SegmentKind::Data)
+        .expect("read v2 header");
+    let payload_offset = super::segment::segment_payload_offset(&header) as usize;
+    let segment_payload = &original[payload_offset..];
+    let legacy_header = super::layout::SegmentHeader {
+        version: super::layout::STORAGE_LAYOUT_VERSION_V1,
+        checksum: 0,
+        payload_len: segment_payload.len() as u64,
+        ..header
+    };
+    let mut legacy = legacy_header.encode();
+    legacy.extend_from_slice(segment_payload);
+    fs::write(&segment, legacy).expect("rewrite as v1 with zero sentinel");
+    mark_checkpoint_dirty(&paths).expect("mark dirty");
+    discard_layout_caches(&paths);
+
+    let report = recover_dirty_state(&paths).expect("legacy v1 should remain readable");
+    assert!(report.dirty_detected);
+    assert_eq!(
+        current_checkpoint(&paths)
+            .expect("checkpoint after v1 recovery")
+            .flags,
+        CheckpointFlags::Clean
+    );
+    let readback = read_logical_block(&paths, 0)
+        .expect("legacy read succeeds")
+        .expect("legacy data exists");
+    assert_eq!(readback.payload, payload);
+    let _ = fs::remove_dir_all(&paths.root);
+}
+
+#[test]
+fn recovery_streams_raw_blob_larger_than_compressed_decode_limit() {
+    let paths = test_paths("recover-large-raw-active");
+    initialize_layout(&paths).expect("layout init should pass");
+    let payload = vec![b'Q'; 20 * 1024 * 1024];
+    write_logical_block(
+        &paths,
+        0,
+        &payload,
+        0,
+        WriteOptions::throughput_default(),
+        None,
+    )
+    .expect("write large raw blob");
+    mark_checkpoint_dirty(&paths).expect("mark dirty");
+    discard_layout_caches(&paths);
+
+    let report = recover_dirty_state(&paths).expect("large raw data is streamed");
+    assert!(report.dirty_detected);
+    assert_eq!(
+        current_checkpoint(&paths)
+            .expect("checkpoint after large raw recovery")
+            .flags,
+        CheckpointFlags::Clean
+    );
+    let readback = read_logical_block(&paths, 0)
+        .expect("read large raw data")
+        .expect("large raw data exists");
+    assert_eq!(readback.payload, payload);
+    let _ = fs::remove_dir_all(&paths.root);
+}
+
+#[test]
+fn recovery_keeps_checkpoint_dirty_when_active_payload_integrity_fails() {
+    let paths = test_paths("recover-corrupt-active-payload");
+    initialize_layout(&paths).expect("layout init should pass");
+    write_logical_block(
+        &paths,
+        0,
+        b"active-payload-integrity",
+        0,
+        WriteOptions::throughput_default(),
+        None,
+    )
+    .expect("write active record");
+    let segment = data_segment_path(&paths, 0);
+    let mut original = fs::read(&segment).expect("read source segment");
+    let last = original
+        .last_mut()
+        .expect("segment contains encoded payload");
+    *last ^= 0x55;
+    fs::write(&segment, &original).expect("corrupt payload");
+    mark_checkpoint_dirty(&paths).expect("mark dirty");
+    discard_layout_caches(&paths);
+
+    let result = recover_dirty_state(&paths);
+
+    assert!(result.is_err(), "corrupt active payload must fail recovery");
+    assert_eq!(
+        current_checkpoint(&paths)
+            .expect("checkpoint after failure")
+            .flags,
+        CheckpointFlags::Dirty,
+        "corrupt payload must never be committed as clean"
+    );
+    assert_eq!(
+        fs::read(&segment).expect("source segment remains"),
+        original,
+        "failed recovery preserves its source segment"
+    );
+    let _ = fs::remove_dir_all(&paths.root);
 }

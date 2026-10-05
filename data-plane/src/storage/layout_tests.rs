@@ -1,8 +1,8 @@
 use std::fs;
 
 use super::layout::{
-    initialize_layout, load_layout, LayoutPaths, SegmentHeader, SegmentKind, STORAGE_LAYOUT_MAGIC,
-    STORAGE_LAYOUT_VERSION,
+    initialize_layout, load_layout, resolve_layout_paths, LayoutPaths, SegmentHeader, SegmentKind,
+    STORAGE_LAYOUT_MAGIC, STORAGE_LAYOUT_VERSION,
 };
 use super::segment::{encode_v2_header_copy, read_segment_file, SEGMENT_HEADER_V2_TOTAL_SIZE};
 
@@ -104,4 +104,47 @@ fn storage_format_v2_checksum_zero_is_not_disabled_for_payloads() {
     let err = read_segment_file(&paths.lookup_file, SegmentKind::Lookup)
         .expect_err("v2 checksum zero must not disable payload validation");
     assert!(format!("{err}").contains("checksum"));
+}
+
+#[test]
+fn unique_legacy_layout_resolves_without_relabeling() {
+    let root =
+        std::env::temp_dir().join(format!("holo-layout-legacy-unique-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let legacy = root.join("drive-a").join("vta000l06");
+    fs::create_dir_all(&legacy).expect("create legacy layout");
+
+    let resolved = resolve_layout_paths(&root, "library-a", "drive-a", "VTA000L06")
+        .expect("unique legacy layout resolves");
+    assert_eq!(resolved.root, legacy);
+}
+
+#[test]
+fn ambiguous_legacy_layouts_are_rejected_and_preserved() {
+    let root = std::env::temp_dir().join(format!(
+        "holo-layout-legacy-ambiguous-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let first = root.join("drive-a").join("vta000l06");
+    let second = root.join("drive-b").join("vta000l06");
+    for path in [&first, &second] {
+        fs::create_dir_all(path).expect("create legacy layout");
+    }
+    let first_data = first.join("data.segment");
+    let second_data = second.join("data.segment");
+    fs::write(&first_data, b"first layout").expect("write first layout");
+    fs::write(&second_data, b"second layout").expect("write second layout");
+
+    let err = resolve_layout_paths(&root, "library-a", "drive-b", "VTA000L06")
+        .expect_err("ambiguous legacy layouts must be rejected");
+    assert_eq!(err.to_string(), "conflict: ambiguous_layout");
+    assert_eq!(
+        fs::read(&first_data).expect("read first layout"),
+        b"first layout"
+    );
+    assert_eq!(
+        fs::read(&second_data).expect("read second layout"),
+        b"second layout"
+    );
 }

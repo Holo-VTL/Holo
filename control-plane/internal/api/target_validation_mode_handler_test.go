@@ -12,14 +12,9 @@ import (
 func TestValidationRunModesEndpoint(t *testing.T) {
 	srv := newTestServer(t)
 
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-1","poolName":"pool-1","capacityBytes":1073741824,"libraryId":"lib-1","libraryName":"lib-1","driveId":"drive-1","driveSlot":1,"cartridgeId":"car-1","barcode":"B001"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d", chainResp.Code)
-	}
+	createResourceFlowFixture(t, srv, "pool-1", "lib-1", "drive-1", "VTA001L06", "VTA001L06")
 
-	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"poolId":"pool-1","libraryId":"lib-1","driveId":"drive-1","cartridgeId":"car-1","targetIqn":"iqn.2026-04.ai.holo:validation-mode-test","actor":"tester"}`))
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"poolId":"pool-1","libraryId":"lib-1","driveId":"drive-1","cartridgeId":"VTA001L06","targetIqn":"iqn.2026-04.ai.holo:validation-mode-test","actor":"tester"}`))
 	pubResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(pubResp, pubReq)
 	if pubResp.Code != http.StatusAccepted {
@@ -82,14 +77,9 @@ func TestValidationRunModesEndpoint(t *testing.T) {
 func TestValidationRunRejectsNonReadyPublication(t *testing.T) {
 	srv := newTestServer(t)
 
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-1","poolName":"pool-1","capacityBytes":1073741824,"libraryId":"lib-1","libraryName":"lib-1","driveId":"drive-1","driveSlot":1,"cartridgeId":"car-1","barcode":"B001"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d", chainResp.Code)
-	}
+	createResourceFlowFixture(t, srv, "pool-1", "lib-1", "drive-1", "VTA001L06", "VTA001L06")
 
-	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"poolId":"pool-1","libraryId":"lib-1","driveId":"drive-1","cartridgeId":"car-1","targetIqn":"iqn.2026-04.ai.holo:validation-non-ready","actor":"tester"}`))
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"poolId":"pool-1","libraryId":"lib-1","driveId":"drive-1","cartridgeId":"VTA001L06","targetIqn":"iqn.2026-04.ai.holo:validation-non-ready","actor":"tester"}`))
 	pubResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(pubResp, pubReq)
 	if pubResp.Code != http.StatusAccepted {

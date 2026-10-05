@@ -85,6 +85,31 @@ func TestOSStorageCommandRunnerIgnoresSuccessfulStderr(t *testing.T) {
 	}
 }
 
+func TestOSStorageCommandRunnerBoundsOutputAndCancelsProcessTree(t *testing.T) {
+	dir := t.TempDir()
+	largeOutput := filepath.Join(dir, "large-output")
+	if err := os.WriteFile(largeOutput, []byte("#!/bin/sh\n/usr/bin/head -c 1048577 /dev/zero\n"), 0o700); err != nil {
+		t.Fatalf("write output fixture: %v", err)
+	}
+	if out, err := (&osStorageCommandRunner{}).Run(context.Background(), largeOutput); err == nil || !strings.Contains(err.Error(), "output exceeds") {
+		t.Fatalf("expected bounded-output error, got %v with %d stdout bytes", err, len(out))
+	}
+
+	slowCommand := filepath.Join(dir, "slow-command")
+	if err := os.WriteFile(slowCommand, []byte("#!/bin/sh\nsleep 10\n"), 0o700); err != nil {
+		t.Fatalf("write cancellation fixture: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := (&osStorageCommandRunner{}).Run(ctx, slowCommand); err == nil {
+		t.Fatal("expected cancelled command error")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("cancelled command tree did not stop promptly: %s", elapsed)
+	}
+}
+
 const sampleLsblk = `{
   "blockdevices": [
     {
@@ -344,10 +369,35 @@ func TestStorageManagementService_RejectsUnsafeDevicePath(t *testing.T) {
 		t.Fatalf("create pool failed: %v", err)
 	}
 
-	for _, path := range []string{"../sdb", "/dev/disk/by-id/example", "/tmp/sdb", "sdb/../sdc"} {
+	for _, path := range []string{"../sdb", "/dev/disk/by-id/example", "/tmp/sdb", "sdb/../sdc", "/dev/.", "/dev/.."} {
 		if _, err := svc.AttachDisk(ctx, "pool-unsafe", path, "tester"); !errors.Is(err, domain.ErrInvalidInput) {
 			t.Fatalf("expected invalid input for %q, got %v", path, err)
 		}
+	}
+}
+
+func TestStorageManagementService_AuditsPrivilegedAttachRejectionWithoutRawError(t *testing.T) {
+	writer := audit.NewMemoryWriter()
+	repo := memory.NewStoragePoolRepo()
+	runner := &fakeStorageRunner{output: sampleLsblk, failCommand: "mkfs.xfs"}
+	svc := NewStorageManagementService(repo, writer, runner)
+	ctx := context.Background()
+	if _, err := svc.CreatePool(ctx, CreateStoragePoolRequest{PoolID: "pool-audit", Name: "Pool Audit", WarningThresholdPct: 90, Actor: "tester"}); err != nil {
+		t.Fatalf("create pool failed: %v", err)
+	}
+	if _, err := svc.AttachDisk(ctx, "pool-audit", "/dev/sdb", "tester"); err == nil {
+		t.Fatal("expected privileged formatting failure")
+	}
+	events := writer.Events()
+	if len(events) < 2 {
+		t.Fatalf("expected pool creation and attach failure audit events, got %d", len(events))
+	}
+	got := events[len(events)-1]
+	if got.Action != "storage_disk_attach" || got.Result != "failure" || got.Actor != "self-asserted:tester" {
+		t.Fatalf("unexpected failure audit event: %+v", got)
+	}
+	if got.Details["reason"] != "privileged_storage_operation_rejected" {
+		t.Fatalf("expected fixed helper rejection reason, got %+v", got.Details)
 	}
 }
 
@@ -455,6 +505,31 @@ func TestStorageManagementService_EnsureAttachedPoolsMountedRemountsExistingXFS(
 	}
 }
 
+func TestStorageManagementService_MountPoolRootIsIdempotentForExpectedXFSDevice(t *testing.T) {
+	runner := &fakeStorageRunner{
+		output:      sampleLsblkWholeDiskXfs,
+		fstype:      "xfs",
+		mountSource: "/dev/sdb",
+		mountTarget: "/var/lib/holo/storage-pools/pool-idempotent",
+	}
+	svc := NewStorageManagementService(memory.NewStoragePoolRepo(), audit.NewMemoryWriter(), runner)
+	if err := svc.mountPoolRootToDisk(context.Background(), "pool-idempotent", "/dev/sdb"); err != nil {
+		t.Fatalf("expected existing XFS pool mount to be idempotent: %v", err)
+	}
+	if hasRecordedCommand(runner.commands, "sudo mount -o noatime,nodiratime /dev/sdb /var/lib/holo/storage-pools/pool-idempotent") {
+		t.Fatalf("did not expect a second mount command: %#v", runner.commands)
+	}
+	ownershipChecked := false
+	for _, command := range runner.commands {
+		if strings.HasPrefix(command, "sudo chown ") && strings.HasSuffix(command, "/var/lib/holo/storage-pools/pool-idempotent") {
+			ownershipChecked = true
+		}
+	}
+	if !ownershipChecked {
+		t.Fatalf("expected ownership check after recognizing the existing mount: %#v", runner.commands)
+	}
+}
+
 func TestStorageManagementService_AttachUnmountsWhenMountSetupFails(t *testing.T) {
 	repo := memory.NewStoragePoolRepo()
 	runner := &fakeStorageRunner{output: sampleLsblk, failCommand: "chown"}
@@ -467,7 +542,7 @@ func TestStorageManagementService_AttachUnmountsWhenMountSetupFails(t *testing.T
 	if _, err := svc.AttachDisk(ctx, "pool-rollback", "/dev/sdb", "tester"); err == nil {
 		t.Fatalf("expected attach failure")
 	}
-	if !hasRecordedCommand(runner.commands, "sudo umount /var/lib/holo/storage-pools/pool-rollback") {
+	if !hasRecordedCommand(runner.commands, "sudo umount /var/lib/holo/storage-pools/pool-rollback /dev/sdb") {
 		t.Fatalf("expected mount rollback umount, got %#v", runner.commands)
 	}
 }

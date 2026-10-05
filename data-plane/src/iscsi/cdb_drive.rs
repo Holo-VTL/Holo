@@ -87,7 +87,16 @@ pub(crate) fn load_unload_drive(state: &mut TapeState, cdb: &[u8]) -> CdbRespons
         }
 
         let media_state_key = media_state_key_for_state(state);
-        let desired = read_shared_loaded_cartridge(&media_state_key).unwrap_or_default();
+        let desired = match read_shared_loaded_cartridge_fresh(&media_state_key) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "[cdb_sync] shared media state read failed drive_id={} error={err}",
+                    state.drive_id
+                );
+                return CdbResponse::check_condition(build_sense_fixed(0x02, 0x3A, 0x00));
+            }
+        };
         let Some(cartridge) = desired else {
             return CdbResponse::check_condition(build_sense_fixed(0x02, 0x3A, 0x00));
         };
@@ -113,7 +122,15 @@ pub(crate) fn load_unload_drive(state: &mut TapeState, cdb: &[u8]) -> CdbRespons
     }
 
     sync_loaded_cartridge_usage_to_shared(state);
-    crate::media::mount_bridge::detach_cartridge(state);
+    if let Err(err) = crate::media::mount_bridge::detach_cartridge(state) {
+        eprintln!(
+            "[cdb_sync] unload failed drive_id={} error={err}",
+            state.drive_id
+        );
+        return CdbResponse::check_condition(sense_frame_to_bytes(
+            &crate::scsi_tape::sense::resolve_sense_for_error(&err),
+        ));
+    }
     state.push_unit_attention(0x28, 0x00);
     CdbResponse::good(vec![])
 }
@@ -2652,10 +2669,7 @@ pub(crate) fn medium_type_for_loaded_media(
     medium_type_for_profile(state, profile)
 }
 
-pub(crate) fn medium_type_for_profile(
-    state: &TapeState,
-    profile: &DeviceIdentityProfile,
-) -> u8 {
+pub(crate) fn medium_type_for_profile(state: &TapeState, profile: &DeviceIdentityProfile) -> u8 {
     let generation = lto_generation_for_profile(profile);
     let base = match generation {
         1..=9 => generation.saturating_mul(0x10).saturating_add(0x08),

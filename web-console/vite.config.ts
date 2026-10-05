@@ -1,6 +1,7 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { loadEnv } from "vite";
+import { createDevelopmentProxy } from "./src/developmentProxy";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
@@ -12,16 +13,7 @@ export default defineConfig(({ mode }) => {
     server: {
       host: "127.0.0.1",
       port: 5173,
-      proxy: {
-        "/v1": {
-          target: devBackend,
-          changeOrigin: true,
-        },
-        "/healthz": {
-          target: devBackend,
-          changeOrigin: true,
-        },
-      },
+      proxy: createDevelopmentProxy(devBackend),
     },
     test: {
       environment: "jsdom",

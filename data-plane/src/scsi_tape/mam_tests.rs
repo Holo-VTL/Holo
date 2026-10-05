@@ -7,7 +7,7 @@ fn builds_mam_baseline_when_media_loaded() {
     let mut state = TapeState::new("drive-1");
     let root = std::env::temp_dir().join("holo-scsi-mam-tests-loaded");
     let _ = std::fs::remove_dir_all(&root);
-    let paths = LayoutPaths::for_cartridge(&root, "drive-1", "cart-001");
+    let paths = LayoutPaths::for_cartridge(&root, "library-1", "cart-001");
     let snapshot = initialize_layout(&paths).expect("layout init should pass");
     state.mount("cart-001", snapshot.paths);
 

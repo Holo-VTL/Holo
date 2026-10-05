@@ -49,6 +49,25 @@ describe("api.storage", () => {
     expect((init.headers as Record<string, string>)["X-HOLO-API-Key"]).toBe("secret-key");
   });
 
+  it("marks structured management writes as JSON", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ apiBaseUrl: "" }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ poolId: "pool-test", name: "Test Pool" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.storage.createPool({ poolId: "pool-test", name: "Test Pool" });
+
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe("/v1/storage/pools");
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
+  });
+
   it("uses runtime API base URL when configured", async () => {
     const fetchMock = vi
       .fn()

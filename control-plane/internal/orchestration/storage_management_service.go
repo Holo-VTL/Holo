@@ -1,8 +1,10 @@
 package orchestration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/audit"
@@ -24,19 +27,65 @@ type storageCommandRunner interface {
 
 type osStorageCommandRunner struct{}
 
+const (
+	storageCommandStdoutLimit = 1 << 20
+	storageCommandStderrLimit = 64 << 10
+)
+
+type cappedStorageOutput struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (b *cappedStorageOutput) Write(data []byte) (int, error) {
+	remaining := b.limit - b.buffer.Len()
+	if remaining > 0 {
+		if remaining > len(data) {
+			remaining = len(data)
+		}
+		_, _ = b.buffer.Write(data[:remaining])
+	}
+	if remaining < len(data) {
+		b.exceeded = true
+	}
+	return len(data), nil
+}
+
+func (b *cappedStorageOutput) String() string {
+	return b.buffer.String()
+}
+
 func (r *osStorageCommandRunner) Run(ctx context.Context, command string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
+	stdout := &cappedStorageOutput{limit: storageCommandStdoutLimit}
+	stderr := &cappedStorageOutput{limit: storageCommandStderrLimit}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if stdout.exceeded || stderr.exceeded {
+		return "", errors.New("storage command output exceeds the configured limit")
+	}
 	if err != nil {
-		trimmed := strings.TrimSpace(strings.Join([]string{string(out), stderr.String()}, "\n"))
+		trimmed := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
 		if trimmed == "" {
 			return "", err
 		}
 		return "", fmt.Errorf("%w: %s", err, trimmed)
 	}
-	return string(out), nil
+	return stdout.String(), nil
 }
 
 type CreateStoragePoolRequest struct {
@@ -237,26 +286,32 @@ func (s *StorageManagementService) DeletePool(ctx context.Context, poolID, actor
 func (s *StorageManagementService) AttachDisk(ctx context.Context, poolID, devicePath, actor string) (*domain.StoragePoolRuntime, error) {
 	devicePath = storageutil.NormalizeDevicePath(devicePath)
 	if devicePath == "" || !storageutil.IsSafeDevicePath(devicePath) {
+		s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "invalid_device_path")
 		return nil, domain.ErrInvalidInput
 	}
 	pool, err := s.repo.FindPool(ctx, poolID)
 	if err != nil {
+		s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "pool_unavailable")
 		return nil, err
 	}
 	available, reason, sizeBytes, err := s.ensureDiskAttachable(ctx, devicePath)
 	if err != nil {
+		s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "disk_discovery_failed")
 		return nil, err
 	}
 	if !available {
+		s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "disk_unavailable")
 		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidState, reason)
 	}
 	needsMount := len(pool.Disks) == 0
 	if storageutil.StrictStorageFlowEnabled() && !needsMount {
+		s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "pool_configuration_conflict")
 		return nil, fmt.Errorf("%w: strict storage flow supports one mounted disk per pool", domain.ErrInvalidState)
 	}
 	if storageutil.StrictStorageFlowEnabled() && needsMount {
 		if err := s.mountPoolRootToDisk(ctx, pool.PoolID, devicePath); err != nil {
 			_ = s.unmountPoolRoot(ctx, pool.PoolID, devicePath)
+			s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "privileged_storage_operation_rejected")
 			return nil, err
 		}
 	}
@@ -269,6 +324,7 @@ func (s *StorageManagementService) AttachDisk(ctx context.Context, poolID, devic
 		if storageutil.StrictStorageFlowEnabled() && needsMount {
 			_ = s.unmountPoolRoot(ctx, pool.PoolID, devicePath)
 		}
+		s.emitStorageFailure(ctx, actor, "storage_disk_attach", poolID, "disk_metadata_update_failed")
 		return nil, err
 	}
 	s.emitStorageAudit(ctx, safeActor(actor), "storage_disk_attach", strings.TrimSpace(poolID), "success", map[string]any{
@@ -281,22 +337,27 @@ func (s *StorageManagementService) AttachDisk(ctx context.Context, poolID, devic
 func (s *StorageManagementService) DetachDisk(ctx context.Context, poolID, devicePath, actor string) (*domain.StoragePoolRuntime, error) {
 	devicePath = storageutil.NormalizeDevicePath(devicePath)
 	if devicePath == "" || !storageutil.IsSafeDevicePath(devicePath) {
+		s.emitStorageFailure(ctx, actor, "storage_disk_detach", poolID, "invalid_device_path")
 		return nil, domain.ErrInvalidInput
 	}
 	pool, err := s.repo.FindPool(ctx, poolID)
 	if err != nil {
+		s.emitStorageFailure(ctx, actor, "storage_disk_detach", poolID, "pool_unavailable")
 		return nil, err
 	}
 	if pool.Capacity.UsedBytes > 0 && len(pool.Disks) <= 1 {
+		s.emitStorageFailure(ctx, actor, "storage_disk_detach", poolID, "pool_not_empty")
 		return nil, domain.ErrInvalidState
 	}
 	if storageutil.StrictStorageFlowEnabled() && len(pool.Disks) == 1 && storageutil.NormalizeDevicePath(pool.Disks[0].DevicePath) == devicePath {
 		if err := s.unmountPoolRoot(ctx, poolID, devicePath); err != nil {
+			s.emitStorageFailure(ctx, actor, "storage_disk_detach", poolID, "privileged_storage_operation_rejected")
 			return nil, err
 		}
 	}
 	updated, err := s.repo.DetachDisk(ctx, poolID, devicePath)
 	if err != nil {
+		s.emitStorageFailure(ctx, actor, "storage_disk_detach", poolID, "disk_metadata_update_failed")
 		return nil, err
 	}
 	s.emitStorageAudit(ctx, safeActor(actor), "storage_disk_detach", strings.TrimSpace(poolID), "success", map[string]any{
@@ -456,6 +517,16 @@ func (s *StorageManagementService) emitStorageAudit(ctx context.Context, actor, 
 	}
 }
 
+func (s *StorageManagementService) emitStorageFailure(ctx context.Context, actor, action, objectID, reason string) {
+	objectID = strings.TrimSpace(objectID)
+	if len(objectID) > 128 {
+		objectID = "invalid"
+	}
+	s.emitStorageAudit(ctx, safeActor(actor), action, objectID, "failure", map[string]any{
+		"reason": reason,
+	})
+}
+
 func parseSizeBytes(raw any) int64 {
 	switch v := raw.(type) {
 	case float64:
@@ -576,7 +647,7 @@ func (s *StorageManagementService) unmountPoolRoot(ctx context.Context, poolID, 
 	if expectedDevice != "" && currentSource != expectedDevice {
 		return fmt.Errorf("%w: pool root mounted by %s", domain.ErrInvalidState, currentSource)
 	}
-	if _, err := s.runPrivileged(ctx, "umount", poolRoot); err != nil {
+	if _, err := s.runPrivileged(ctx, "umount", poolRoot, expectedDevice); err != nil {
 		return fmt.Errorf("unmount pool root %s: %w", poolRoot, err)
 	}
 	return nil

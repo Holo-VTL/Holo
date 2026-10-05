@@ -2,7 +2,9 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
@@ -32,6 +34,41 @@ func TestStoragePoolRepo_CreateAndList(t *testing.T) {
 	}
 	if reloaded.Name != "Pool A" {
 		t.Fatalf("expected cloned pool value, got %q", reloaded.Name)
+	}
+}
+
+func TestStoragePoolRepoRejectsProjectedPoolRootAliasesConcurrently(t *testing.T) {
+	repo := NewStoragePoolRepo()
+	ctx := context.Background()
+	ids := []string{"pool.alias", "pool_alias"}
+	start := make(chan struct{})
+	results := make(chan error, len(ids))
+	var workers sync.WaitGroup
+	for _, id := range ids {
+		workers.Add(1)
+		go func(id string) {
+			defer workers.Done()
+			pool, _ := domain.NewStoragePoolRuntime(id, id, 90)
+			<-start
+			results <- repo.CreatePool(ctx, pool)
+		}(id)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	created, conflicts := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, domain.ErrConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent create error: %v", err)
+		}
+	}
+	if created != 1 || conflicts != 1 {
+		t.Fatalf("expected one pool root and one conflict, created=%d conflicts=%d", created, conflicts)
 	}
 }
 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -118,7 +119,13 @@ func (h *OpsHandler) handleCDBTrace(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req cdbTraceUpdateRequest
 		if err := decodeRequiredJSONBody(r, &req); err != nil {
-			respondError(w, http.StatusBadRequest, "invalid cdb trace request", err)
+			status := http.StatusBadRequest
+			message := "invalid cdb trace request"
+			if errors.Is(err, errUnsupportedJSONMediaType) {
+				status = http.StatusUnsupportedMediaType
+				message = "content type must be application/json"
+			}
+			respondError(w, status, message, err)
 			return
 		}
 		if err := h.setCDBTraceEnabled(req.Enabled); err != nil {

@@ -164,7 +164,13 @@ fn dispatch_raw_cdb_with_context_inner(
         return response;
     }
     if drive_opcode_requires_media_sync(opcode, state) {
-        sync_drive_mount_from_shared(state);
+        if let Err(err) = sync_drive_mount_from_shared(state) {
+            let response = CdbResponse::check_condition(sense_frame_to_bytes(
+                &crate::scsi_tape::sense::resolve_sense_for_error(&err),
+            ));
+            trace_cdb_if_enabled("drive", cdb, data_out, &response);
+            return response;
+        }
     }
     if opcode == 0x00 {
         // TEST UNIT READY
@@ -354,8 +360,10 @@ pub(crate) fn is_data_transfer_opcode(opcode: u8) -> bool {
 }
 
 pub(crate) fn drive_opcode_requires_media_sync(opcode: u8, state: &TapeState) -> bool {
-    state.mount_state != crate::scsi_tape::state::MountState::Loaded
-        || !is_data_transfer_opcode(opcode)
+    (state.mount_state == crate::scsi_tape::state::MountState::Loaded
+        && !is_data_transfer_opcode(opcode))
+        // Poll while empty so management-initiated cartridge loads become visible.
+        || (state.mount_state == crate::scsi_tape::state::MountState::Empty && opcode == 0x00)
 }
 
 pub(crate) fn is_fixed_block_transfer(cdb: &[u8]) -> bool {
@@ -532,7 +540,7 @@ pub(crate) fn shared_media_state_dir() -> PathBuf {
     PathBuf::from("/run/holo/media-state")
 }
 
-pub(crate) fn media_state_key_for_state(state: &TapeState) -> String {
+pub fn media_state_key_for_state(state: &TapeState) -> String {
     if let Ok(raw) = env::var("HOLO_MEDIA_STATE_KEY") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -757,7 +765,7 @@ pub(crate) fn apply_shared_cartridge_metadata(state: &mut TapeState) {
     }
 }
 
-pub(crate) fn sync_loaded_cartridge_usage_to_shared(state: &TapeState) {
+pub fn sync_loaded_cartridge_usage_to_shared(state: &TapeState) {
     sync_loaded_cartridge_usage_to_shared_throttled(state, true);
 }
 
@@ -854,25 +862,6 @@ fn sync_loaded_cartridge_usage_to_shared_throttled(state: &TapeState, force: boo
     );
 }
 
-#[derive(Debug, Clone)]
-struct CachedLoadedState {
-    value: Option<String>,
-    loaded_at: Instant,
-}
-
-fn shared_loaded_state_cache() -> &'static Mutex<HashMap<PathBuf, CachedLoadedState>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedLoadedState>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn shared_loaded_state_ttl() -> Duration {
-    let ms = env::var("HOLO_MEDIA_STATE_CACHE_MS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(200);
-    Duration::from_millis(ms)
-}
-
 pub(crate) fn shared_changer_slots_path(serial_seed: &str) -> PathBuf {
     let key = sanitize_id(serial_seed);
     shared_media_state_dir().join(format!("{key}.slots"))
@@ -885,13 +874,6 @@ pub(crate) fn read_shared_changer_slots(
     let raw = match fs::read_to_string(&path) {
         Ok(v) => v,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            lock_io_mutex(shared_loaded_state_cache(), "media state")?.insert(
-                path,
-                CachedLoadedState {
-                    value: None,
-                    loaded_at: Instant::now(),
-                },
-            );
             return Ok(None);
         }
         Err(err) => return Err(err),
@@ -1148,21 +1130,7 @@ pub(crate) fn changer_opcode_requires_slot_bootstrap(opcode: u8) -> bool {
     matches!(opcode, 0x1A | 0x5A | 0xA5 | 0xA6 | 0xB8)
 }
 
-pub(crate) fn read_shared_loaded_cartridge(serial_seed: &str) -> io::Result<Option<String>> {
-    let path = shared_media_state_path(serial_seed);
-    let ttl = shared_loaded_state_ttl();
-    if !ttl.is_zero() {
-        let guard = lock_io_mutex(shared_loaded_state_cache(), "media state")?;
-        if let Some(cached) = guard.get(&path) {
-            if cached.loaded_at.elapsed() <= ttl {
-                return Ok(cached.value.clone());
-            }
-        }
-    }
-    read_shared_loaded_cartridge_from_path(path)
-}
-
-pub(crate) fn read_shared_loaded_cartridge_fresh(serial_seed: &str) -> io::Result<Option<String>> {
+pub fn read_shared_loaded_cartridge_fresh(serial_seed: &str) -> io::Result<Option<String>> {
     read_shared_loaded_cartridge_from_path(shared_media_state_path(serial_seed))
 }
 
@@ -1170,52 +1138,40 @@ fn read_shared_loaded_cartridge_from_path(path: PathBuf) -> io::Result<Option<St
     let raw = match fs::read_to_string(&path) {
         Ok(v) => v,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            lock_io_mutex(shared_loaded_state_cache(), "media state")?.insert(
-                path,
-                CachedLoadedState {
-                    value: None,
-                    loaded_at: Instant::now(),
-                },
-            );
             return Ok(None);
         }
         Err(err) => return Err(err),
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        lock_io_mutex(shared_loaded_state_cache(), "media state")?.insert(
-            path,
-            CachedLoadedState {
-                value: None,
-                loaded_at: Instant::now(),
-            },
-        );
         return Ok(None);
     }
-    if let Some(value) = trimmed.strip_prefix("cartridge=") {
+    if trimmed.contains(['\r', '\n']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared media state contains multiple lines",
+        ));
+    }
+    let value = if let Some(value) = trimmed.strip_prefix("cartridge=") {
         let value = value.trim();
         if value.is_empty() {
             return Ok(None);
         }
-        let next = Some(value.to_string());
-        lock_io_mutex(shared_loaded_state_cache(), "media state")?.insert(
-            path,
-            CachedLoadedState {
-                value: next.clone(),
-                loaded_at: Instant::now(),
-            },
-        );
-        return Ok(next);
+        value
+    } else {
+        trimmed
+    };
+    if value.contains('=')
+        || value.len() > 128
+        || value.contains(['/', '\\', '\0'])
+        || value.contains("..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared media state contains an invalid cartridge ID",
+        ));
     }
-    let next = Some(trimmed.to_string());
-    lock_io_mutex(shared_loaded_state_cache(), "media state")?.insert(
-        path,
-        CachedLoadedState {
-            value: next.clone(),
-            loaded_at: Instant::now(),
-        },
-    );
-    Ok(next)
+    Ok(Some(value.to_string()))
 }
 
 pub(crate) fn write_shared_loaded_cartridge(
@@ -1235,17 +1191,6 @@ pub(crate) fn write_shared_loaded_cartridge(
     };
     fs::write(&tmp, payload)?;
     fs::rename(tmp, &path)?;
-    let cached = cartridge
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    lock_io_mutex(shared_loaded_state_cache(), "media state")?.insert(
-        path,
-        CachedLoadedState {
-            value: cached,
-            loaded_at: Instant::now(),
-        },
-    );
     Ok(())
 }
 
@@ -1377,7 +1322,9 @@ fn restore_changer_medium_label(state: &mut TapeState, label: String, source_slo
     }
 }
 
-pub(crate) fn sync_drive_mount_from_shared(state: &mut TapeState) {
+pub(crate) fn sync_drive_mount_from_shared(
+    state: &mut TapeState,
+) -> Result<(), crate::scsi_tape::error::TapeError> {
     let media_state_key = media_state_key_for_state(state);
     let desired = match read_shared_loaded_cartridge_fresh(&media_state_key) {
         Ok(v) => v,
@@ -1386,7 +1333,11 @@ pub(crate) fn sync_drive_mount_from_shared(state: &mut TapeState) {
                 "[cdb_sync] failed to read shared media state drive_id={} error={err}",
                 state.drive_id
             );
-            return;
+            return Err(crate::scsi_tape::error::TapeError::Storage(
+                crate::storage::StorageError::Internal(
+                    "shared media state could not be read".to_string(),
+                ),
+            ));
         }
     };
     let current = state.cartridge_id.clone();
@@ -1394,37 +1345,24 @@ pub(crate) fn sync_drive_mount_from_shared(state: &mut TapeState) {
         (Some(cur), Some(next)) if cur == next => {}
         (Some(_), Some(next)) => {
             sync_loaded_cartridge_usage_to_shared(state);
-            crate::media::mount_bridge::detach_cartridge(state);
-            if let Err(err) = crate::media::mount_bridge::attach_cartridge(state, next) {
-                eprintln!(
-                    "[cdb_sync] failed to switch mounted cartridge drive_id={} cartridge={} error={err}",
-                    state.drive_id, next
-                );
-            } else {
-                apply_shared_cartridge_metadata(state);
-                sync_loaded_cartridge_usage_to_shared(state);
-                state.push_unit_attention(0x28, 0x00);
-            }
+            crate::media::mount_bridge::detach_cartridge(state)?;
+            crate::media::mount_bridge::attach_cartridge(state, next)?;
+            apply_shared_cartridge_metadata(state);
+            sync_loaded_cartridge_usage_to_shared(state);
         }
         (None, Some(next)) => {
-            if let Err(err) = crate::media::mount_bridge::attach_cartridge(state, next) {
-                eprintln!(
-                    "[cdb_sync] failed to mount cartridge from shared state drive_id={} cartridge={} error={err}",
-                    state.drive_id, next
-                );
-            } else {
-                apply_shared_cartridge_metadata(state);
-                sync_loaded_cartridge_usage_to_shared(state);
-                state.push_unit_attention(0x28, 0x00);
-            }
+            crate::media::mount_bridge::attach_cartridge(state, next)?;
+            apply_shared_cartridge_metadata(state);
+            sync_loaded_cartridge_usage_to_shared(state);
         }
         (Some(_), None) => {
             sync_loaded_cartridge_usage_to_shared(state);
-            crate::media::mount_bridge::detach_cartridge(state);
+            crate::media::mount_bridge::detach_cartridge(state)?;
             state.push_unit_attention(0x28, 0x00);
         }
         (None, None) => {}
     }
+    Ok(())
 }
 
 pub(crate) fn trace_cdb_if_enabled(
@@ -1465,7 +1403,9 @@ pub(crate) fn read_attribute_trace_suffix(cdb: &[u8], payload: &[u8]) -> String 
     while offset < payload.len() {
         let remaining = payload.len() - offset;
         if remaining < 5 {
-            entries.push(format!("truncated_header_at={offset} remaining={remaining}"));
+            entries.push(format!(
+                "truncated_header_at={offset} remaining={remaining}"
+            ));
             break;
         }
         let id = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
@@ -1487,7 +1427,10 @@ pub(crate) fn read_attribute_trace_suffix(cdb: &[u8], payload: &[u8]) -> String 
         ));
         offset += value_len;
     }
-    format!(" read_attr_declared_len={declared_len} read_attr=[{}]", entries.join("; "))
+    format!(
+        " read_attr_declared_len={declared_len} read_attr=[{}]",
+        entries.join("; ")
+    )
 }
 
 pub(crate) fn trace_ascii(bytes: &[u8]) -> String {

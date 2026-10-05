@@ -673,6 +673,7 @@ func tcmuHandlerEnv(publication *domain.TargetPublication) []string {
 	env := os.Environ()
 	env = withEnvAssignment(env, "HOLO_SCSI_DEVICE_ROLE", role)
 	env = withEnvAssignment(env, "HOLO_SCSI_SERIAL_SEED", serialSeed)
+	env = withEnvAssignment(env, "HOLO_LAYOUT_LIBRARY_ID", publication.LibraryID)
 	env = withEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", storageutil.MediaStateKey(publication.LibraryID, publication.DriveID))
 	env = withEnvAssignment(env, "HOLO_STORAGE_ROOT", storageutil.PoolStorageRoot(publication.PoolID))
 	env = withEnvAssignment(env, "HOLO_STORAGE_POOL_ROOT_BASE", storageutil.ResolvePoolStorageBaseDir())

@@ -24,21 +24,22 @@ import (
 )
 
 type Server struct {
-	mux        *http.ServeMux
-	uiDistDir  string
-	resources  *ResourcesHandler
-	storage    *StorageHandler
-	ops        *OpsHandler
-	targets    *TargetHandler
-	discovery  *TargetDiscoveryHandler
-	metricsHD  *MetricsHandler
-	auditHD    *AuditHandler
-	security   *iscsiSecurityHandler
-	runtime    *orchestration.TargetRuntimeService
-	apiKey     string
-	metadataDB *sql.DB
-	limiter    *rateLimiter
-	journal    *audit.JournalStore
+	mux         *http.ServeMux
+	uiDistDir   string
+	resources   *ResourcesHandler
+	storage     *StorageHandler
+	ops         *OpsHandler
+	targets     *TargetHandler
+	discovery   *TargetDiscoveryHandler
+	metricsHD   *MetricsHandler
+	auditHD     *AuditHandler
+	security    *iscsiSecurityHandler
+	runtime     *orchestration.TargetRuntimeService
+	maintenance *orchestration.StorageMaintenanceService
+	apiKey      string
+	metadataDB  *sql.DB
+	limiter     *rateLimiter
+	journal     *audit.JournalStore
 }
 
 func NewServer() *Server {
@@ -160,23 +161,26 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		cfg.MetadataDSN,
 		cfg.TargetRuntimeMode,
 	)
+	ops := NewOpsHandler(health, query, cfg.TargetPortalPort, registry)
+	ops.support.ISCSISecretKeyPath = securityKeyPath
 
 	s := &Server{
-		mux:        http.NewServeMux(),
-		uiDistDir:  strings.TrimSpace(cfg.WebUIDistDir),
-		resources:  resourcesHandler,
-		storage:    NewStorageHandler(storageSvc, resourcesHandler),
-		ops:        NewOpsHandler(health, query, cfg.TargetPortalPort, registry),
-		discovery:  discoveryHandler,
-		targets:    NewTargetHandlerWithLocalMount(targetRuntime, localMount),
-		metricsHD:  NewMetricsHandler(registry, storageutil.ResolvePoolStorageBaseDir()),
-		auditHD:    NewAuditHandler(query, auditWriter),
-		security:   securityHandler,
-		runtime:    targetRuntime,
-		apiKey:     strings.TrimSpace(cfg.APIKey),
-		metadataDB: metadataDB,
-		limiter:    newRateLimiter(cfg.TrustedProxyCIDRs),
-		journal:    journal,
+		mux:         http.NewServeMux(),
+		uiDistDir:   strings.TrimSpace(cfg.WebUIDistDir),
+		resources:   resourcesHandler,
+		storage:     NewStorageHandler(storageSvc, resourcesHandler),
+		ops:         ops,
+		discovery:   discoveryHandler,
+		targets:     NewTargetHandlerWithLocalMount(targetRuntime, localMount),
+		metricsHD:   NewMetricsHandler(registry, storageutil.ResolvePoolStorageBaseDir()),
+		auditHD:     NewAuditHandler(query, auditWriter),
+		security:    securityHandler,
+		runtime:     targetRuntime,
+		maintenance: orchestration.NewStorageMaintenanceService(resourcesHandler.repo, storageSvc, auditWriter, registry),
+		apiKey:      strings.TrimSpace(cfg.APIKey),
+		metadataDB:  metadataDB,
+		limiter:     newRateLimiter(cfg.TrustedProxyCIDRs),
+		journal:     journal,
 	}
 	if s.apiKey == "" {
 		tracing.LogInfo(context.Background(), "control-plane", "management API key is not configured; internal no-login mode is enabled")
@@ -193,11 +197,18 @@ func NewServerWithConfigE(cfg config.Config) (*Server, error) {
 		tracing.LogError(context.Background(), "audit", "write startup audit event failed", err)
 	}
 	s.registerRoutes()
+	if strings.TrimSpace(strings.ToLower(cfg.TargetRuntimeMode)) != "in-memory" {
+		s.maintenance.Start(context.Background())
+	}
 	return s, nil
 }
 
 func (s *Server) Router() http.Handler {
-	return tracing.TraceMiddleware(s.metricsMiddleware(s.securityHeadersMiddleware(s.rateLimitMiddleware(s.authMiddleware(s.mux)))))
+	return tracing.TraceMiddleware(s.metricsMiddleware(s.securityHeadersMiddleware(
+		s.requestTargetMiddleware(s.rateLimitMiddleware(s.authMiddleware(
+			s.writeOriginMiddleware(s.jsonBodyContentTypeMiddleware(s.mux)),
+		))),
+	)))
 }
 
 func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
@@ -213,10 +224,19 @@ func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s == nil || s.runtime == nil {
+	if s == nil {
 		return nil
 	}
-	return s.runtime.Shutdown(ctx)
+	var firstErr error
+	if s.maintenance != nil {
+		firstErr = s.maintenance.Shutdown(ctx)
+	}
+	if s.runtime != nil {
+		if err := s.runtime.Shutdown(ctx); firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *Server) Close() error {
@@ -269,7 +289,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/iscsi-security/credentials/{id}", s.security.handleCredential)
 	s.mux.HandleFunc("/v1/cartridges", s.resources.handleCartridges)
 	s.mux.HandleFunc("/v1/cartridges/", s.resources.handleCartridgeByID)
-	s.mux.HandleFunc("/v1/resources/chain", s.resources.handleCreateChain)
 	s.mux.HandleFunc("/v1/targets/publications", s.targets.handlePublications)
 	s.mux.HandleFunc("/v1/targets/publications/", s.targets.handlePublicationSubresource)
 	s.mux.HandleFunc("/v1/targets/local-mount", s.targets.handleLocalMount)
@@ -322,6 +341,7 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 		if s.limiter != nil {
 			allowed, retryAfter := s.limiter.allow(s.limiter.clientIDFromRequest(r), r.URL.Path, time.Now())
 			if !allowed {
+				s.recordManagementRejection("rate_limit")
 				w.Header().Set("Retry-After", retryAfterSeconds(retryAfter))
 				respondError(w, http.StatusTooManyRequests, "rate limit exceeded", nil)
 				return
@@ -338,7 +358,7 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'")
-		if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		if requestIsHTTPS(r, s.limiter) {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		next.ServeHTTP(w, r)

@@ -15,7 +15,7 @@ fn test_paths(name: &str) -> LayoutPaths {
         .as_nanos();
     let root = std::env::temp_dir().join(format!("holo-segment-index-{name}-{nanos}"));
     fs::create_dir_all(&root).expect("create root");
-    LayoutPaths::for_cartridge(&root, "drive-a", "cart-a")
+    LayoutPaths::for_cartridge(&root, "library-a", "cart-a")
 }
 
 #[test]

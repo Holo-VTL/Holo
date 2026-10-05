@@ -23,14 +23,9 @@ func (s *apiLocalMountSettings) SetEnabled(_ context.Context, enabled bool) erro
 func TestTargetPublicationEndpoints(t *testing.T) {
 	srv := newTestServer(t)
 
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-1","poolName":"pool-1","capacityBytes":1073741824,"libraryId":"lib-1","libraryName":"lib-1","driveId":"drive-1","driveSlot":1,"cartridgeId":"car-1","barcode":"B001"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d", chainResp.Code)
-	}
+	createResourceFlowFixture(t, srv, "pool-1", "lib-1", "drive-1", "VTA001L06", "VTA001L06")
 
-	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"poolId":"pool-1","libraryId":"lib-1","driveId":"drive-1","cartridgeId":"car-1","targetIqn":"iqn.2026-04.ai.holo:test-handler-drive","actor":"tester"}`))
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"poolId":"pool-1","libraryId":"lib-1","driveId":"drive-1","cartridgeId":"VTA001L06","targetIqn":"iqn.2026-04.ai.holo:test-handler-drive","actor":"tester"}`))
 	pubResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(pubResp, pubReq)
 	if pubResp.Code != http.StatusAccepted {
@@ -69,14 +64,9 @@ func TestTargetPublicationEndpoints(t *testing.T) {
 
 func TestTargetPublicationActorClaimIsNotTrustedSystemAndUnsafeClaimIsRejected(t *testing.T) {
 	srv := newTestServer(t)
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-audit-actor","poolName":"pool-audit-actor","capacityBytes":1073741824,"libraryId":"lib-audit-actor","libraryName":"lib-audit-actor","driveId":"drive-audit-actor","driveSlot":1,"cartridgeId":"car-audit-actor","barcode":"B901"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-audit-actor", "lib-audit-actor", "drive-audit-actor", "VTA901L06", "VTA901L06")
 
-	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-audit-actor","driveId":"drive-audit-actor","cartridgeId":"car-audit-actor","targetIqn":"iqn.2026-04.ai.holo:audit-actor","actor":"system"}`))
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-audit-actor","driveId":"drive-audit-actor","cartridgeId":"VTA901L06","targetIqn":"iqn.2026-04.ai.holo:audit-actor","actor":"system"}`))
 	pubResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(pubResp, pubReq)
 	if pubResp.Code != http.StatusAccepted {
@@ -90,7 +80,7 @@ func TestTargetPublicationActorClaimIsNotTrustedSystemAndUnsafeClaimIsRejected(t
 		t.Fatalf("expected user-supplied system claim to be marked self-asserted, status=%d body=%s", auditResp.Code, auditResp.Body.String())
 	}
 
-	badReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-audit-actor","driveId":"drive-audit-actor","cartridgeId":"car-audit-actor","targetIqn":"iqn.2026-04.ai.holo:bad-audit-actor","actor":"bad\nactor"}`))
+	badReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-audit-actor","driveId":"drive-audit-actor","cartridgeId":"VTA901L06","targetIqn":"iqn.2026-04.ai.holo:bad-audit-actor","actor":"bad\nactor"}`))
 	badResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(badResp, badReq)
 	if badResp.Code != http.StatusBadRequest {
@@ -106,14 +96,9 @@ func TestTargetPublicationActorClaimIsNotTrustedSystemAndUnsafeClaimIsRejected(t
 
 func TestTargetRollbackLabelsActorClaim(t *testing.T) {
 	srv := newTestServer(t)
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-rollback-actor","poolName":"pool-rollback-actor","capacityBytes":1073741824,"libraryId":"lib-rollback-actor","libraryName":"lib-rollback-actor","driveId":"drive-rollback-actor","driveSlot":1,"cartridgeId":"car-rollback-actor","barcode":"B902"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-rollback-actor", "lib-rollback-actor", "drive-rollback-actor", "VTA902L06", "VTA902L06")
 
-	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-rollback-actor","driveId":"drive-rollback-actor","cartridgeId":"car-rollback-actor","targetIqn":"iqn.2026-04.ai.holo:rollback-actor","actor":"tester"}`))
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-rollback-actor","driveId":"drive-rollback-actor","cartridgeId":"VTA902L06","targetIqn":"iqn.2026-04.ai.holo:rollback-actor","actor":"tester"}`))
 	pubResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(pubResp, pubReq)
 	if pubResp.Code != http.StatusAccepted {
@@ -152,7 +137,7 @@ func TestTargetPublicationRejectsNilBody(t *testing.T) {
 
 func TestTargetPublicationRejectsMalformedIQNAndProfile(t *testing.T) {
 	srv := newTestServer(t)
-	req := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-1","driveId":"drive-1","cartridgeId":"car-1","targetIqn":"iqn.2026-04.ai.holo:../../bad","deviceProfile":"bad\nprofile","actor":"tester"}`))
+	req := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-1","driveId":"drive-1","cartridgeId":"VTA001L06","targetIqn":"iqn.2026-04.ai.holo:../../bad","deviceProfile":"bad\nprofile","actor":"tester"}`))
 	resp := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(resp, req)
@@ -179,14 +164,9 @@ func TestTargetValidationRunsUsesSafeNotFoundMessage(t *testing.T) {
 func TestTargetPublicationDeleteActionEndpoint(t *testing.T) {
 	srv := newTestServer(t)
 
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-del-action","poolName":"pool-del-action","capacityBytes":1073741824,"libraryId":"lib-del-action","libraryName":"lib-del-action","driveId":"drive-del-action","driveSlot":1,"cartridgeId":"car-del-action","barcode":"B101"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-del-action", "lib-del-action", "drive-del-action", "VTA101L06", "VTA101L06")
 
-	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-del-action","driveId":"drive-del-action","cartridgeId":"car-del-action","targetIqn":"iqn.2026-04.ai.holo:test-delete-action","actor":"tester"}`))
+	pubReq := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-del-action","driveId":"drive-del-action","cartridgeId":"VTA101L06","targetIqn":"iqn.2026-04.ai.holo:test-delete-action","actor":"tester"}`))
 	pubResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(pubResp, pubReq)
 	if pubResp.Code != http.StatusAccepted {
@@ -212,15 +192,10 @@ func TestTargetPublicationDeleteActionEndpoint(t *testing.T) {
 func TestTargetPublicationListReturnsLatestPerIQNByDefault(t *testing.T) {
 	srv := newTestServer(t)
 
-	chainReq := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-dedupe","poolName":"pool-dedupe","capacityBytes":1073741824,"libraryId":"lib-dedupe","libraryName":"lib-dedupe","driveId":"drive-dedupe","driveSlot":1,"cartridgeId":"car-dedupe","barcode":"B201"}`))
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-dedupe", "lib-dedupe", "drive-dedupe", "VTA201L06", "VTA201L06")
 
 	publish := func() string {
-		req := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-dedupe","driveId":"drive-dedupe","cartridgeId":"car-dedupe","targetIqn":"iqn.2026-04.ai.holo:test-dedupe","actor":"tester"}`))
+		req := newAuthedRequest(http.MethodPost, "/v1/targets/publications", bytes.NewBufferString(`{"libraryId":"lib-dedupe","driveId":"drive-dedupe","cartridgeId":"VTA201L06","targetIqn":"iqn.2026-04.ai.holo:test-dedupe","actor":"tester"}`))
 		resp := httptest.NewRecorder()
 		srv.Router().ServeHTTP(resp, req)
 		if resp.Code != http.StatusAccepted {

@@ -9,19 +9,29 @@ import (
 var APIRequestDurationBucketMicros = [...]uint64{5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000}
 
 type MetricsRegistry struct {
-	PublicationsActive              int64
-	PublicationsTotal               int64
-	AuditEventsTotal                int64
-	AuditWriteFailures              int64
-	AuditJournalFailed              int64
-	AuditParseFailures              int64
-	AuditJournalSizeBytes           int64
-	AuditJournalLastWriteUnix       int64
-	ISCSISecurityApplyFailures      int64
-	ScsiSenseErrors                 int64
-	DedupHitsTotal                  int64
-	CompressionRatio                uint64 // stored as float64 bits
-	HealthStatus                    int64
+	PublicationsActive           int64
+	PublicationsTotal            int64
+	AuditEventsTotal             int64
+	AuditWriteFailures           int64
+	AuditJournalFailed           int64
+	AuditParseFailures           int64
+	AuditJournalSizeBytes        int64
+	AuditJournalLastWriteUnix    int64
+	ISCSISecurityApplyFailures   int64
+	ScsiSenseErrors              int64
+	DedupHitsTotal               int64
+	CompressionRatio             uint64 // stored as float64 bits
+	HealthStatus                 int64
+	StorageReclaimCompletedTotal int64
+	StorageReclaimDeferredTotal  int64
+	StorageReclaimFailedTotal    int64
+	StorageReclaimNetFreedBytes  int64
+	StorageReclaimDurationCount  int64
+	StorageReclaimDurationSumMS  int64
+	ManagementRejectedTarget     int64
+	ManagementRejectedRateLimit  int64
+	ManagementRejectedOrigin    int64
+	ManagementRejectedMediaType int64
 
 	APIRequestDurationBuckets [len(APIRequestDurationBucketMicros)]uint64
 	APIRequestDurationCount   uint64
@@ -57,8 +67,57 @@ func (r *MetricsRegistry) RecordScsiSenseError() {
 	atomic.AddInt64(&r.ScsiSenseErrors, 1)
 }
 
+func (r *MetricsRegistry) RecordStorageReclaim(status string, netFreedBytes, durationMS uint64) {
+	switch status {
+	case "completed":
+		atomic.AddInt64(&r.StorageReclaimCompletedTotal, 1)
+	case "deferred":
+		atomic.AddInt64(&r.StorageReclaimDeferredTotal, 1)
+	case "failed":
+		atomic.AddInt64(&r.StorageReclaimFailedTotal, 1)
+	default:
+		return
+	}
+	if status != "completed" {
+		return
+	}
+	atomicSaturatingAdd(&r.StorageReclaimNetFreedBytes, netFreedBytes)
+	atomicSaturatingAdd(&r.StorageReclaimDurationSumMS, durationMS)
+	atomic.AddInt64(&r.StorageReclaimDurationCount, 1)
+}
+
+func atomicSaturatingAdd(target *int64, amount uint64) {
+	for {
+		current := atomic.LoadInt64(target)
+		if current >= math.MaxInt64 {
+			return
+		}
+		remaining := uint64(math.MaxInt64 - current)
+		next := int64(math.MaxInt64)
+		if amount < remaining {
+			next = current + int64(amount)
+		}
+		if atomic.CompareAndSwapInt64(target, current, next) {
+			return
+		}
+	}
+}
+
 func (r *MetricsRegistry) RecordISCSISecurityApplyFailure() {
 	atomic.AddInt64(&r.ISCSISecurityApplyFailures, 1)
+}
+
+func (r *MetricsRegistry) RecordManagementRejection(reason string) {
+	switch reason {
+	case "request_target":
+		atomic.AddInt64(&r.ManagementRejectedTarget, 1)
+	case "rate_limit":
+		atomic.AddInt64(&r.ManagementRejectedRateLimit, 1)
+	case "request_origin":
+		atomic.AddInt64(&r.ManagementRejectedOrigin, 1)
+	case "json_content_type":
+		atomic.AddInt64(&r.ManagementRejectedMediaType, 1)
+	}
 }
 
 func (r *MetricsRegistry) RecordPublicationPublish() {

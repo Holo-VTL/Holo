@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
+	"github.com/Holo-VTL/Holo/control-plane/internal/storageutil"
 )
 
 type CoreResourcesRepo struct {
@@ -37,13 +38,22 @@ func (r *CoreResourcesRepo) CreateLibrary(_ context.Context, library *domain.Vir
 	if _, exists := r.libraries[library.LibraryID]; exists {
 		return domain.ErrConflict
 	}
+	if r.libraryProjectionConflictLocked(library, "") {
+		return domain.ErrConflict
+	}
 	r.libraries[library.LibraryID] = cloneLibrary(library)
 	return nil
 }
 
 func (r *CoreResourcesRepo) SaveLibrary(_ context.Context, library *domain.VirtualLibrary) error {
+	if library == nil {
+		return domain.ErrInvalidInput
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.libraryProjectionConflictLocked(library, library.LibraryID) {
+		return domain.ErrConflict
+	}
 	r.libraries[library.LibraryID] = cloneLibrary(library)
 	return nil
 }
@@ -57,13 +67,22 @@ func (r *CoreResourcesRepo) CreateDrive(_ context.Context, drive *domain.Virtual
 	if _, exists := r.drives[drive.DriveID]; exists {
 		return domain.ErrConflict
 	}
+	if r.driveProjectionConflictLocked(drive, "") {
+		return domain.ErrConflict
+	}
 	r.drives[drive.DriveID] = cloneDrive(drive)
 	return nil
 }
 
 func (r *CoreResourcesRepo) SaveDrive(_ context.Context, drive *domain.VirtualDrive) error {
+	if drive == nil {
+		return domain.ErrInvalidInput
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.driveProjectionConflictLocked(drive, drive.DriveID) {
+		return domain.ErrConflict
+	}
 	r.drives[drive.DriveID] = cloneDrive(drive)
 	return nil
 }
@@ -80,6 +99,9 @@ func (r *CoreResourcesRepo) CreateCartridge(_ context.Context, c *domain.Virtual
 	if _, exists := r.cartridges[c.CartridgeID]; exists {
 		return domain.ErrConflict
 	}
+	if r.cartridgeProjectionConflictLocked(c, "") {
+		return domain.ErrConflict
+	}
 	barcodeKey := normalizeBarcodeKey(c.Barcode)
 	if _, exists := r.barcodeIndex[barcodeKey]; exists {
 		return domain.ErrConflict
@@ -90,8 +112,14 @@ func (r *CoreResourcesRepo) CreateCartridge(_ context.Context, c *domain.Virtual
 }
 
 func (r *CoreResourcesRepo) SaveCartridge(_ context.Context, c *domain.VirtualCartridge) error {
+	if c == nil {
+		return domain.ErrInvalidInput
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cartridgeProjectionConflictLocked(c, c.CartridgeID) {
+		return domain.ErrConflict
+	}
 	barcodeKey := normalizeBarcodeKey(c.Barcode)
 	if _, ok := r.destroyed[barcodeKey]; ok {
 		return domain.ErrConflict
@@ -108,6 +136,75 @@ func (r *CoreResourcesRepo) SaveCartridge(_ context.Context, c *domain.VirtualCa
 	r.cartridges[c.CartridgeID] = cloneCartridge(c)
 	r.barcodeIndex[barcodeKey] = c.CartridgeID
 	return nil
+}
+
+func (r *CoreResourcesRepo) libraryProjectionConflictLocked(candidate *domain.VirtualLibrary, excludeID string) bool {
+	if candidate == nil {
+		return true
+	}
+	component := storageutil.LibraryDirectoryProjection(candidate.LibraryID)
+	iqn := normalizedResourceIQN(candidate.IQN)
+	for id, existing := range r.libraries {
+		if id == excludeID {
+			continue
+		}
+		if storageutil.LibraryDirectoryProjection(existing.LibraryID) == component || normalizedResourceIQN(existing.IQN) == iqn {
+			return true
+		}
+	}
+	for id, existing := range r.drives {
+		if id != "" && normalizedResourceIQN(existing.IQN) == iqn {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *CoreResourcesRepo) driveProjectionConflictLocked(candidate *domain.VirtualDrive, excludeID string) bool {
+	if candidate == nil {
+		return true
+	}
+	component := storageutil.DriveDirectoryProjection(candidate.DriveID)
+	statePath := storageutil.MediaStatePathProjection(candidate.LibraryID, candidate.DriveID)
+	iqn := normalizedResourceIQN(candidate.IQN)
+	for id, existing := range r.drives {
+		if id == excludeID {
+			continue
+		}
+		if storageutil.DriveDirectoryProjection(existing.DriveID) == component ||
+			storageutil.MediaStatePathProjection(existing.LibraryID, existing.DriveID) == statePath ||
+			normalizedResourceIQN(existing.IQN) == iqn {
+			return true
+		}
+	}
+	for _, existing := range r.libraries {
+		if normalizedResourceIQN(existing.IQN) == iqn {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *CoreResourcesRepo) cartridgeProjectionConflictLocked(candidate *domain.VirtualCartridge, excludeID string) bool {
+	if candidate == nil {
+		return true
+	}
+	metadata := storageutil.CartridgeMetadataProjection(candidate.CartridgeID)
+	layout := storageutil.CartridgeLayoutProjection(candidate.LibraryID, candidate.CartridgeID)
+	for id, existing := range r.cartridges {
+		if id == excludeID {
+			continue
+		}
+		if storageutil.CartridgeMetadataProjection(existing.CartridgeID) == metadata ||
+			storageutil.CartridgeLayoutProjection(existing.LibraryID, existing.CartridgeID) == layout {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedResourceIQN(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func (r *CoreResourcesRepo) RetireCartridgeBarcode(_ context.Context, barcode, cartridgeID, _ string) error {

@@ -6,12 +6,28 @@ import (
 	"errors"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"strings"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
 )
 
 const maxJSONBodyBytes = 1 << 20
+
+var errUnsupportedJSONMediaType = errors.New("unsupported JSON media type")
+
+func validateJSONContentType(header http.Header) error {
+	values := header.Values("Content-Type")
+	if len(values) != 1 || strings.Contains(values[0], ",") {
+		return errUnsupportedJSONMediaType
+	}
+	mediaType, _, err := mime.ParseMediaType(values[0])
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return errUnsupportedJSONMediaType
+	}
+	return nil
+}
 
 func decodeRequiredJSONBody(r *http.Request, out any) error {
 	if r == nil || r.Body == nil {

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +52,7 @@ type coreResourcesRepo interface {
 type resourceStoragePoolService interface {
 	CreatePool(ctx context.Context, req orchestration.CreateStoragePoolRequest) (*domain.StoragePoolRuntime, error)
 	GetPool(ctx context.Context, poolID string) (*domain.StoragePoolRuntime, error)
+	ListPools(ctx context.Context) []*domain.StoragePoolRuntime
 	ReconcilePoolUsedBytes(ctx context.Context, poolID string, usedBytes int64) error
 }
 
@@ -161,25 +164,6 @@ type resourceActorRequest struct {
 type eraseCartridgeRequest struct {
 	Mode  string `json:"mode"`
 	Actor string `json:"actor,omitempty"`
-}
-
-type resourceChainRequest struct {
-	PoolID        string `json:"poolId"`
-	PoolName      string `json:"poolName"`
-	CapacityBytes int64  `json:"capacityBytes,omitempty"`
-	LibraryID     string `json:"libraryId"`
-	LibraryName   string `json:"libraryName"`
-	DriveID       string `json:"driveId"`
-	DriveSlot     int    `json:"driveSlot"`
-	CartridgeID   string `json:"cartridgeId"`
-	Barcode       string `json:"barcode"`
-}
-
-type resourceChainResponse struct {
-	Pool      *domain.StoragePool      `json:"pool"`
-	Library   *domain.VirtualLibrary   `json:"library"`
-	Drive     *domain.VirtualDrive     `json:"drive"`
-	Cartridge *domain.VirtualCartridge `json:"cartridge"`
 }
 
 func (h *ResourcesHandler) handleLibraries(w http.ResponseWriter, r *http.Request) {
@@ -646,8 +630,22 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			respondResourceError(w, err)
 			return
 		}
+		if err := h.validateCartridgeIdentity(r.Context(), existing); err != nil {
+			respondResourceError(w, err)
+			return
+		}
 		unlock := h.lockLibrarySlots(existing.LibraryID)
 		defer unlock()
+		storageLease, lockErr := acquireCartridgeMutationLeases(existing)
+		if lockErr != nil {
+			if errors.Is(lockErr, storageutil.ErrStorageLockBusy) {
+				respondResourceError(w, domain.ErrConflict)
+			} else {
+				respondResourceError(w, lockErr)
+			}
+			return
+		}
+		defer storageLease.Release()
 		if err := h.reconcileMediaState(r.Context()); err != nil {
 			respondResourceError(w, err)
 			return
@@ -664,6 +662,10 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 			}
 		}
 		if err := h.unpublishDependentPublications(r.Context(), "", "", cartridge.CartridgeID); err != nil {
+			respondResourceError(w, err)
+			return
+		}
+		if err := storageLease.VerifyPoolRoot(); err != nil {
 			respondResourceError(w, err)
 			return
 		}
@@ -812,101 +814,6 @@ func (h *ResourcesHandler) handleCartridgeByID(w http.ResponseWriter, r *http.Re
 	respondError(w, http.StatusNotFound, "not found", nil)
 }
 
-func (h *ResourcesHandler) handleCreateChain(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
-		return
-	}
-	var req resourceChainRequest
-	if err := decodeOptionalJSONBody(r, &req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request", err)
-		return
-	}
-	if req.PoolID == "" {
-		req = resourceChainRequest{
-			PoolID:      "pool-demo",
-			PoolName:    "demo-pool",
-			LibraryID:   "lib-demo",
-			LibraryName: "demo-library",
-			DriveID:     "drive-demo",
-			DriveSlot:   1,
-			CartridgeID: "car-demo",
-			Barcode:     "B001",
-		}
-	}
-	req.PoolID = strings.TrimSpace(req.PoolID)
-	req.PoolName = strings.TrimSpace(req.PoolName)
-	req.LibraryID = strings.TrimSpace(req.LibraryID)
-	req.LibraryName = strings.TrimSpace(req.LibraryName)
-	req.DriveID = strings.TrimSpace(req.DriveID)
-	req.CartridgeID = strings.TrimSpace(req.CartridgeID)
-	req.Barcode = strings.TrimSpace(req.Barcode)
-
-	if h.storage == nil {
-		respondResourceError(w, domain.ErrInvalidState)
-		return
-	}
-	poolName := nonEmpty(req.PoolName, req.PoolID)
-	storagePool, err := h.storage.GetPool(r.Context(), req.PoolID)
-	if errors.Is(err, domain.ErrNotFound) {
-		storagePool, err = h.storage.CreatePool(r.Context(), orchestration.CreateStoragePoolRequest{
-			PoolID:              req.PoolID,
-			Name:                poolName,
-			WarningThresholdPct: 90,
-			Actor:               "self-asserted:unspecified",
-		})
-	}
-	if err != nil {
-		respondResourceError(w, err)
-		return
-	}
-	lib, err := domain.NewVirtualLibrary(req.LibraryID, nonEmpty(req.LibraryName, req.LibraryID))
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request", err)
-		return
-	}
-	drive, err := domain.NewVirtualDrive(req.DriveID, lib.LibraryID, nonZeroInt(req.DriveSlot, 1))
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request", err)
-		return
-	}
-	if h.wouldExceedLibraryDriveLimit(r.Context(), drive.LibraryID, drive.DriveID) {
-		respondResourceError(w, domain.ErrInvalidInput)
-		return
-	}
-	cart := domain.NewVirtualCartridge(req.CartridgeID, req.PoolID, lib.LibraryID, nonEmpty(req.Barcode, "B001"), 1<<30)
-	cart.UpdatedAt = time.Now().UTC()
-
-	ctx := r.Context()
-	if err := h.repo.SaveLibrary(ctx, lib); err != nil {
-		respondResourceError(w, err)
-		return
-	}
-	if err := h.repo.SaveDrive(ctx, drive); err != nil {
-		respondResourceError(w, err)
-		return
-	}
-	if err := h.repo.SaveCartridge(ctx, cart); err != nil {
-		respondResourceError(w, err)
-		return
-	}
-	if err := h.syncLibrarySlotsToSharedState(ctx, lib.LibraryID); err != nil {
-		respondResourceError(w, err)
-		return
-	}
-	if err := h.ensureLibraryAutoPublications(ctx, lib.LibraryID); err != nil {
-		respondResourceError(w, err)
-		return
-	}
-
-	respondJSON(w, http.StatusCreated, resourceChainResponse{
-		Pool:      legacyPoolFromStoragePool(storagePool),
-		Library:   lib,
-		Drive:     drive,
-		Cartridge: cart,
-	})
-}
-
 func resourceIDFromPath(path, prefix string) string {
 	id := strings.Trim(strings.TrimPrefix(path, prefix), "/")
 	if id == "" || strings.Contains(id, "/") {
@@ -927,6 +834,21 @@ func (h *ResourcesHandler) eraseCartridge(ctx context.Context, cartridgeID strin
 	if err != nil {
 		return nil, err
 	}
+	if err := h.validateCartridgeIdentity(ctx, cartridge); err != nil {
+		return nil, err
+	}
+	storageLease, err := acquireCartridgeMutationLeases(cartridge)
+	if err != nil {
+		return nil, err
+	}
+	defer storageLease.Release()
+	if err := h.reconcileMediaState(ctx); err != nil {
+		return nil, err
+	}
+	cartridge, err = h.repo.FindCartridge(ctx, cartridgeID)
+	if err != nil {
+		return nil, err
+	}
 	actor := nonEmpty(strings.TrimSpace(req.Actor), "web-console")
 	for _, drive := range h.repo.ListDrives(ctx) {
 		if drive != nil && strings.TrimSpace(drive.MountedCartridgeID) == cartridge.CartridgeID {
@@ -942,6 +864,10 @@ func (h *ResourcesHandler) eraseCartridge(ctx context.Context, cartridgeID strin
 		h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "failure", map[string]any{"mode": mode, "reason": "unpublish"})
 		return nil, err
 	}
+	if err := storageLease.VerifyPoolRoot(); err != nil {
+		h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "failure", map[string]any{"mode": mode, "reason": "identity_conflict"})
+		return nil, err
+	}
 	var cleanupErr error
 	if mode == "long" {
 		cleanupErr = removeCartridgeLayoutArtifacts(cartridge)
@@ -949,7 +875,13 @@ func (h *ResourcesHandler) eraseCartridge(ctx context.Context, cartridgeID strin
 		cleanupErr = resetCartridgeLayoutArtifacts(cartridge)
 	}
 	if cleanupErr != nil {
-		h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "failure", map[string]any{"mode": mode, "reason": "remove_artifacts"})
+		reason := "remove_artifacts"
+		if errors.Is(cleanupErr, domain.ErrAmbiguousLayout) {
+			reason = "ambiguous_layout"
+		} else if errors.Is(cleanupErr, domain.ErrIdentityConflict) {
+			reason = "identity_conflict"
+		}
+		h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "failure", map[string]any{"mode": mode, "reason": reason})
 		return nil, cleanupErr
 	}
 	cartridge.UsedBytes = 0
@@ -972,6 +904,100 @@ func (h *ResourcesHandler) eraseCartridge(ctx context.Context, cartridgeID strin
 	}
 	h.emitCartridgeAudit(ctx, actor, "cartridge_erase", cartridge, "success", map[string]any{"mode": mode})
 	return cartridge, nil
+}
+
+type cartridgeMutationLeases struct {
+	root        string
+	poolID      string
+	cartridgeID string
+	layout      *storageutil.StorageLease
+	filesystem  *storageutil.StorageLease
+}
+
+func (leases *cartridgeMutationLeases) VerifyPoolRoot() error {
+	if leases == nil || leases.layout == nil || leases.root == "" {
+		return nil
+	}
+	if err := leases.layout.VerifyPoolRoot(leases.root); err != nil {
+		return domain.ErrIdentityConflict
+	}
+	return nil
+}
+
+func (leases *cartridgeMutationLeases) Release() {
+	if leases == nil {
+		return
+	}
+	if leases.filesystem != nil {
+		if err := leases.filesystem.Release(); err != nil {
+			log.Printf("storage filesystem lock release failed: %v", err)
+		}
+	}
+	if leases.layout != nil {
+		if err := leases.layout.Release(); err != nil {
+			log.Printf("storage layout lock release failed pool=%s cartridge=%s err=%v", leases.poolID, leases.cartridgeID, err)
+		}
+	}
+}
+
+func acquireCartridgeMutationLeases(cartridge *domain.VirtualCartridge) (*cartridgeMutationLeases, error) {
+	if cartridge == nil || strings.TrimSpace(cartridge.PoolID) == "" {
+		return nil, domain.ErrInvalidInput
+	}
+	targets, err := cartridgeLayoutArtifactDirs(cartridge)
+	if err != nil {
+		return nil, err
+	}
+	var target string
+	for candidate := range targets {
+		target = candidate
+		break
+	}
+	root, err := approvedRootContainingArtifact(target, approvedCartridgeLayoutRoots(cartridge.PoolID))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		// A missing approved root cannot contain a cartridge layout.
+		return &cartridgeMutationLeases{}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	layout, err := storageutil.AcquireLayoutLease(root, cartridge.CartridgeID)
+	if err != nil {
+		if errors.Is(err, storageutil.ErrStorageLockBusy) {
+			return nil, domain.ErrConflict
+		}
+		return nil, err
+	}
+	filesystem, err := storageutil.AcquireFilesystemLock(root)
+	if err != nil {
+		_ = layout.Release()
+		if errors.Is(err, storageutil.ErrStorageLockBusy) {
+			return nil, domain.ErrConflict
+		}
+		return nil, err
+	}
+	leases := &cartridgeMutationLeases{
+		root: root, poolID: cartridge.PoolID, cartridgeID: cartridge.CartridgeID,
+		layout: layout, filesystem: filesystem,
+	}
+	if err := leases.VerifyPoolRoot(); err != nil {
+		leases.Release()
+		return nil, err
+	}
+	return leases, nil
+}
+
+func approvedRootContainingArtifact(target string, roots []string) (string, error) {
+	target = filepath.Clean(strings.TrimSpace(target))
+	for _, root := range roots {
+		root = filepath.Clean(strings.TrimSpace(root))
+		if target == root || strings.HasPrefix(target, root+string(filepath.Separator)) {
+			return root, nil
+		}
+	}
+	return "", domain.ErrIdentityConflict
 }
 
 func (h *ResourcesHandler) emitCartridgeAudit(ctx context.Context, actor, action string, cartridge *domain.VirtualCartridge, result string, details map[string]any) {
@@ -1026,12 +1052,18 @@ func respondResourceError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	message := "internal server error"
 	switch {
+	case errors.Is(err, errUnsupportedJSONMediaType):
+		status = http.StatusUnsupportedMediaType
+		message = "content type must be application/json"
 	case errors.Is(err, domain.ErrInvalidInput), errors.Is(err, domain.ErrInvalidState):
 		status = http.StatusBadRequest
 		message = "invalid request"
 	case errors.Is(err, domain.ErrNotFound):
 		status = http.StatusNotFound
 		message = "resource not found"
+	case errors.Is(err, domain.ErrIdentityConflict), errors.Is(err, domain.ErrAmbiguousLayout):
+		status = http.StatusConflict
+		message = "resource identity conflict"
 	case errors.Is(err, domain.ErrConflict):
 		status = http.StatusConflict
 		message = "resource conflict"
@@ -1333,20 +1365,6 @@ func librarySlotStart(library *domain.VirtualLibrary) int {
 	return library.SlotStartAddress
 }
 
-func legacyPoolFromStoragePool(pool *domain.StoragePoolRuntime) *domain.StoragePool {
-	if pool == nil {
-		return nil
-	}
-	return &domain.StoragePool{
-		Timestamped:  pool.Timestamped,
-		PoolID:       pool.PoolID,
-		Name:         pool.Name,
-		CapacityByte: pool.Capacity.TotalBytes,
-		UsedByte:     pool.Capacity.UsedBytes,
-		Status:       domain.PoolStatus(pool.Status),
-	}
-}
-
 func (h *ResourcesHandler) loadCartridgeIntoDrive(ctx context.Context, driveID, cartridgeID, _ string) (*domain.VirtualDrive, error) {
 	driveID = strings.TrimSpace(driveID)
 	cartridgeID = strings.TrimSpace(cartridgeID)
@@ -1368,6 +1386,9 @@ func (h *ResourcesHandler) loadCartridgeIntoDrive(ctx context.Context, driveID, 
 	}
 	cartridge, err := h.repo.FindCartridge(ctx, cartridgeID)
 	if err != nil {
+		return nil, err
+	}
+	if err := h.validateCartridgeIdentity(ctx, cartridge, driveID); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(drive.LibraryID) != strings.TrimSpace(cartridge.LibraryID) {

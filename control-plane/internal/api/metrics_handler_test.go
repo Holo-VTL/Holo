@@ -82,6 +82,22 @@ func TestMetricsHandler_RejectsUnsupportedMethod(t *testing.T) {
 	}
 }
 
+func TestMetricsHandler_ReportsOnlyBoundedManagementRejectionReasons(t *testing.T) {
+	registry := metrics.NewMetricsRegistry()
+	for _, reason := range []string{"request_target", "rate_limit", "request_origin", "json_content_type", "/attacker/path?secret=value"} {
+		registry.RecordManagementRejection(reason)
+	}
+	output := PrometheusText(registry)
+	for _, reason := range []string{"request_target", "rate_limit", "request_origin", "json_content_type"} {
+		if !strings.Contains(output, `reason="`+reason+`"} 1`) {
+			t.Errorf("missing bounded rejection reason %q", reason)
+		}
+	}
+	if strings.Contains(output, "/attacker/path") || strings.Contains(output, "secret=value") {
+		t.Fatal("request path or query appeared in management rejection metrics")
+	}
+}
+
 func TestMetricsRegistry_PublishIncrements(t *testing.T) {
 	registry := metrics.NewMetricsRegistry()
 	registry.RecordPublicationPublish()

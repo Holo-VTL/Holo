@@ -80,7 +80,9 @@ func TestTcmuAdapterEnsureLocalMountBackendReusesOneWorkerAndBackstore(t *testin
 			if publication.DeviceRole != "changer" || socketPath == "" {
 				t.Fatalf("unexpected local handler identity/socket: %+v %q", publication, socketPath)
 			}
-			if !hasEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", "lib-a") || !hasEnvAssignment(env, "HOLO_CHANGER_DRIVE_IDS", "drive-a,drive-b") {
+			if !hasEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", "lib-a") ||
+				!hasEnvAssignment(env, "HOLO_LAYOUT_LIBRARY_ID", "lib-a") ||
+				!hasEnvAssignment(env, "HOLO_CHANGER_DRIVE_IDS", "drive-a,drive-b") {
 				t.Fatalf("changer handler missing library/drive topology: %v", env)
 			}
 			return 0, nil

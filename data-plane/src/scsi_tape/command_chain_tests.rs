@@ -67,6 +67,66 @@ fn media_lifecycle_chain_load_rewind_erase_unload() {
 }
 
 #[test]
+fn erase_failure_after_dirty_checkpoint_requires_recovery() {
+    let mut state = new_state("erase-recovery-required");
+    execute(
+        &mut state,
+        CoreCommand::Load {
+            cartridge_id: "cart-erase-recovery-required".to_string(),
+        },
+    )
+    .expect("load should pass");
+    let layout = state
+        .active_layout
+        .clone()
+        .expect("layout should be active");
+    fs::remove_file(&layout.blk_map_file).expect("remove block map fixture");
+    fs::create_dir(&layout.blk_map_file).expect("replace block map with directory");
+
+    let result = execute(
+        &mut state,
+        CoreCommand::Erase {
+            mode: EraseMode::Short,
+        },
+    );
+    assert!(result.is_err(), "erase should surface its metadata failure");
+    assert!(
+        state.requires_recovery,
+        "partial erase must prevent further writes until recovery"
+    );
+    assert_eq!(
+        current_checkpoint(&layout).expect("read checkpoint").flags,
+        CheckpointFlags::Dirty
+    );
+
+    cleanup(&state);
+}
+
+#[test]
+fn recovery_required_blocks_data_reads_and_preserves_position() {
+    let mut state = new_state("recovery-read-gate");
+    execute(
+        &mut state,
+        CoreCommand::Load {
+            cartridge_id: "cart-recovery-read-gate".to_string(),
+        },
+    )
+    .expect("load should pass");
+    state.requires_recovery = true;
+    let position = state.current_position;
+    let read_ops = state.command_counters.read_ops;
+
+    let variable_result = super::command_chain::read_data(&mut state);
+    let fixed_result = read_fixed_blocks(&mut state, 1, 1);
+
+    assert!(matches!(variable_result, Err(error) if error.to_string().contains("recovery")));
+    assert!(matches!(fixed_result, Err(error) if error.to_string().contains("recovery")));
+    assert_eq!(state.current_position, position);
+    assert_eq!(state.command_counters.read_ops, read_ops);
+    cleanup(&state);
+}
+
+#[test]
 fn erase_clears_cached_layout_before_rewrite_at_bot() {
     let mut state = new_state("erase-rewrite-bot");
 
@@ -152,7 +212,10 @@ fn fixed_block_write_succeeds_when_prefetch_invalidation_degrades() {
     let first = read_fixed_blocks(&mut state, 4, 1).expect("read first block");
     assert_eq!(first, b"aaaa");
 
-    let layout = state.active_layout.clone().expect("layout should be active");
+    let layout = state
+        .active_layout
+        .clone()
+        .expect("layout should be active");
     fail_next_read_prefetch_invalidation_for_test();
     write_fixed_blocks(&mut state, b"ZZZZ", 4, None)
         .expect("committed write should not fail on prefetch invalidation");
@@ -189,7 +252,10 @@ fn prefetch_degradation_bypasses_stale_cached_read() {
     let first = read_fixed_blocks(&mut state, 4, 1).expect("read first block");
     assert_eq!(first, b"aaaa");
 
-    let layout = state.active_layout.clone().expect("layout should be active");
+    let layout = state
+        .active_layout
+        .clone()
+        .expect("layout should be active");
     fail_next_read_prefetch_invalidation_for_test();
     write_fixed_blocks(&mut state, b"ZZZZ", 4, None).expect("overwrite second block");
 

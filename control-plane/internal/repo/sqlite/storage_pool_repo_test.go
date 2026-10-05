@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
@@ -18,6 +19,56 @@ func openStorageRepo(t *testing.T, path string) *StoragePoolRepo {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return NewStoragePoolRepo(db)
+}
+
+func TestSQLiteStoragePoolRepoRejectsProjectedPoolRootAliases(t *testing.T) {
+	ctx := context.Background()
+	repo := openStorageRepo(t, filepath.Join(t.TempDir(), "metadata.db"))
+	first, _ := domain.NewStoragePoolRuntime("pool.alias", "Pool A", 90)
+	second, _ := domain.NewStoragePoolRuntime("pool_alias", "Pool B", 90)
+	if err := repo.CreatePool(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreatePool(ctx, second); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected projected pool root conflict, got %v", err)
+	}
+}
+
+func TestSQLiteStoragePoolRepoSerializesProjectedPoolRootCollisionsAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "metadata.db")
+	repos := []*StoragePoolRepo{openStorageRepo(t, path), openStorageRepo(t, path)}
+	ids := []string{"pool.concurrent", "pool_concurrent"}
+	start := make(chan struct{})
+	results := make(chan error, len(repos))
+	var workers sync.WaitGroup
+	for index, repo := range repos {
+		id := ids[index]
+		workers.Add(1)
+		go func(repo *StoragePoolRepo, id string) {
+			defer workers.Done()
+			pool, _ := domain.NewStoragePoolRuntime(id, id, 90)
+			<-start
+			results <- repo.CreatePool(ctx, pool)
+		}(repo, id)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	created, conflicts := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, domain.ErrConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent create error: %v", err)
+		}
+	}
+	if created != 1 || conflicts != 1 {
+		t.Fatalf("expected one pool and one conflict, created=%d conflicts=%d", created, conflicts)
+	}
 }
 
 func TestStoragePoolRepoPersistsAcrossReopen(t *testing.T) {

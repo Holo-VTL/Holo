@@ -41,6 +41,9 @@ func (r *StoragePoolRepo) CreatePool(_ context.Context, pool *domain.StoragePool
 	if _, ok := r.pools[pool.PoolID]; ok {
 		return domain.ErrConflict
 	}
+	if r.poolProjectionConflictLocked(pool.PoolID, "") {
+		return domain.ErrConflict
+	}
 	if len(r.pools) >= maxStoragePools {
 		return domain.ErrInvalidState
 	}
@@ -54,8 +57,24 @@ func (r *StoragePoolRepo) SavePool(_ context.Context, pool *domain.StoragePoolRu
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.poolProjectionConflictLocked(pool.PoolID, pool.PoolID) {
+		return domain.ErrConflict
+	}
 	r.pools[pool.PoolID] = cloneStoragePool(pool)
 	return nil
+}
+
+func (r *StoragePoolRepo) poolProjectionConflictLocked(poolID, excludeID string) bool {
+	projection := storageutil.PoolRootProjection(poolID)
+	for existingID := range r.pools {
+		if existingID == excludeID {
+			continue
+		}
+		if storageutil.PoolRootProjection(existingID) == projection {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *StoragePoolRepo) FindPool(_ context.Context, poolID string) (*domain.StoragePoolRuntime, error) {

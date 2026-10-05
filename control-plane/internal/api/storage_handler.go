@@ -242,6 +242,9 @@ func respondStorageError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	message := "internal server error"
 	switch {
+	case errors.Is(err, errUnsupportedJSONMediaType):
+		status = http.StatusUnsupportedMediaType
+		message = "content type must be application/json"
 	case errors.Is(err, domain.ErrInvalidInput), errors.Is(err, domain.ErrInvalidState):
 		status = http.StatusBadRequest
 		message = "invalid request"

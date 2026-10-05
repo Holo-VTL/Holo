@@ -1,10 +1,14 @@
 package storageutil
 
 import (
+	"errors"
 	"os"
 	"regexp"
 	"strings"
 )
+
+var ErrAmbiguousLayout = errors.New("ambiguous_layout")
+var ErrStorageIdentityConflict = errors.New("identity_conflict")
 
 var devicePathRE = regexp.MustCompile(`^/dev/[A-Za-z0-9._-]+$`)
 
@@ -23,7 +27,12 @@ func NormalizeDevicePath(raw string) string {
 }
 
 func IsSafeDevicePath(path string) bool {
-	return devicePathRE.MatchString(strings.TrimSpace(path))
+	path = strings.TrimSpace(path)
+	if !devicePathRE.MatchString(path) {
+		return false
+	}
+	name := strings.TrimPrefix(path, "/dev/")
+	return name != "." && name != ".."
 }
 
 func MediaStateKey(libraryID, driveID string) string {

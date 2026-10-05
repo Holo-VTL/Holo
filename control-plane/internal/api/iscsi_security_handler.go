@@ -241,7 +241,10 @@ func (h *iscsiSecurityHandler) handleTargetPreview(w http.ResponseWriter, r *htt
 
 func decodeISCSIBindingPut(r *http.Request) (iscsiBindingPutRequest, *domain.ISCSIAuthenticationPolicy, error) {
 	var req iscsiBindingPutRequest
-	if err := decodeRequiredJSONBody(r, &req); err != nil || req.Generation <= 0 || len(req.Auth) == 0 {
+	if err := decodeRequiredJSONBody(r, &req); err != nil {
+		return req, nil, err
+	}
+	if req.Generation <= 0 || len(req.Auth) == 0 {
 		return req, nil, domain.ErrInvalidInput
 	}
 	var authPolicy *domain.ISCSIAuthenticationPolicy
@@ -360,6 +363,8 @@ func respondSecurityError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	message := "security operation failed"
 	switch {
+	case errors.Is(err, errUnsupportedJSONMediaType):
+		status, message = http.StatusUnsupportedMediaType, "content type must be application/json"
 	case errors.Is(err, domain.ErrInvalidInput):
 		status, message = http.StatusBadRequest, "invalid iSCSI security request"
 	case errors.Is(err, domain.ErrNotFound):

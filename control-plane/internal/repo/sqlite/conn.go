@@ -34,6 +34,21 @@ func Open(ctx context.Context, dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
+// beginSerializedWriteTx takes SQLite's writer reservation before repository
+// projection checks. This keeps the read/check/write sequence atomic across
+// independent control-plane processes without adding a projection table.
+func beginSerializedWriteTx(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE schema_migrations SET applied_at=applied_at WHERE version=(SELECT MIN(version) FROM schema_migrations)`); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
 func configure(ctx context.Context, db *sql.DB) error {
 	pragmas := []string{
 		"PRAGMA busy_timeout = 5000",

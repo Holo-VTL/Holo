@@ -3,8 +3,11 @@ use std::path::Path;
 use super::blk_map::mark_blk_map_stale;
 use super::layout::SegmentKind;
 use super::map_lookup::load_lookup_records;
-use super::metadata::{checked_usize_from_u64, StorageError};
-use super::segment::{read_segment_file, write_segment_file};
+use super::metadata::{
+    checked_metadata_record_count, checked_usize_from_u64, StorageError,
+    MAX_MAINTENANCE_METADATA_BYTES,
+};
+use super::segment::{read_segment_file_bounded, write_segment_file};
 
 const RECLAIM_RECORD_SIZE: usize = 25;
 
@@ -129,7 +132,8 @@ impl ReclaimCandidate {
 }
 
 pub fn load_reclaim_candidates(path: &Path) -> Result<Vec<ReclaimCandidate>, StorageError> {
-    let (_header, payload) = read_segment_file(path, SegmentKind::Reclaim)?;
+    let (_header, payload) =
+        read_segment_file_bounded(path, SegmentKind::Reclaim, MAX_MAINTENANCE_METADATA_BYTES)?;
     if payload.is_empty() {
         return Ok(Vec::new());
     }
@@ -145,6 +149,7 @@ pub fn load_reclaim_candidates(path: &Path) -> Result<Vec<ReclaimCandidate>, Sto
             .map_err(|_| StorageError::Corrupt("reclaim count parse failed".to_string()))?,
     );
     let count = checked_usize_from_u64(raw_count, "reclaim count")?;
+    let count = checked_metadata_record_count(count)?;
     if payload.len().saturating_sub(8) / RECLAIM_RECORD_SIZE < count {
         return Err(StorageError::Corrupt(
             "reclaim payload truncated".to_string(),
@@ -282,8 +287,8 @@ fn persist_candidates(path: &Path, candidates: &[ReclaimCandidate]) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::map_lookup::MapLookupRecord;
+    use super::*;
 
     fn lookup(start: u64, end: u64) -> MapLookupRecord {
         MapLookupRecord {

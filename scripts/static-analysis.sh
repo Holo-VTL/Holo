@@ -38,7 +38,44 @@ run_govulncheck() {
     [[ "${allow_missing}" == "1" ]] && return 0
     return 2
   }
-  (cd "${repo_root}/control-plane" && govulncheck ./...)
+  local go_output go_version scanner_version
+  go_output="$(go version)"
+  [[ "${go_output}" == *"go1.26.8"* ]] || {
+    echo "[static-analysis] ERROR: Go 1.26.8 is required for the pinned vulnerability scan" >&2
+    return 2
+  }
+  scanner_version="$(govulncheck -version 2>&1)" || {
+    echo "[static-analysis] ERROR: govulncheck could not report its version" >&2
+    return 2
+  }
+  [[ "${scanner_version}" == *"v1.8.0"* ]] || {
+    echo "[static-analysis] ERROR: govulncheck v1.8.0 is required" >&2
+    return 2
+  }
+  go_version="${go_output#go version }"
+  go_version="${go_version%% *}"
+  HOLO_STATIC_SECURITY_TMP_DIR="$(mktemp -d)"
+  trap 'python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "${HOLO_STATIC_SECURITY_TMP_DIR}"' EXIT
+  if ! (
+    cd "${repo_root}/control-plane"
+    env GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 govulncheck -json ./...
+  ) >"${HOLO_STATIC_SECURITY_TMP_DIR}/source.json" 2>"${HOLO_STATIC_SECURITY_TMP_DIR}/source.stderr"; then
+    echo "[static-analysis] ERROR: source vulnerability scan failed" >&2
+    return 2
+  fi
+  if [[ -s "${HOLO_STATIC_SECURITY_TMP_DIR}/source.stderr" ]]; then
+    echo "[static-analysis] ERROR: source scan reported scanner/database diagnostics" >&2
+    return 2
+  fi
+  python3 "${repo_root}/scripts/verify-govulncheck-json.py" \
+    --input "${HOLO_STATIC_SECURITY_TMP_DIR}/source.json" \
+    --mode source \
+    --go-version "${go_version#go}" \
+    --scanner-version v1.8.0 \
+    --goos linux \
+    --goarch amd64 \
+    --output "${HOLO_STATIC_SECURITY_TMP_DIR}/summary.json"
+  cat "${HOLO_STATIC_SECURITY_TMP_DIR}/summary.json"
 }
 
 run_cargo_audit() {

@@ -169,8 +169,17 @@ func LegacyCartridgeLayoutDirs(storageRoot, cartridgeID string) ([]string, error
 			continue
 		}
 		candidate := filepath.Join(root, entry.Name(), needle)
-		stat, statErr := os.Stat(candidate)
-		if statErr != nil || !stat.IsDir() {
+		stat, statErr := os.Lstat(candidate)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil {
+			return nil, statErr
+		}
+		if stat.Mode()&os.ModeSymlink != 0 {
+			return nil, ErrStorageIdentityConflict
+		}
+		if !stat.IsDir() {
 			continue
 		}
 		out = append(out, candidate)

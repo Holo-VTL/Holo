@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::storage::layout_lease::LayoutLease;
 use crate::storage::LayoutPaths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +214,8 @@ pub struct TapeState {
     pub block_starts: Vec<u64>,
     pub block_lengths: BTreeMap<u64, u32>,
     pub active_layout: Option<LayoutPaths>,
+    pub layout_lease: Option<LayoutLease>,
+    pub requires_recovery: bool,
     pub early_warning_window: u64,
     pub block_mode: BlockModeProfile,
     pub buffered_mode: bool,
@@ -280,6 +283,8 @@ impl TapeState {
             block_starts: Vec::new(),
             block_lengths: BTreeMap::new(),
             active_layout: None,
+            layout_lease: None,
+            requires_recovery: false,
             early_warning_window: 8,
             block_mode: BlockModeProfile::default(),
             buffered_mode: true,
@@ -316,6 +321,7 @@ impl TapeState {
         self.block_starts.clear();
         self.block_lengths.clear();
         self.active_layout = Some(layout);
+        self.requires_recovery = false;
         self.early_warning_window = 8;
         self.block_mode = BlockModeProfile::default();
         self.buffered_mode = true;
@@ -358,6 +364,8 @@ impl TapeState {
         self.block_starts.clear();
         self.block_lengths.clear();
         self.active_layout = None;
+        self.layout_lease = None;
+        self.requires_recovery = false;
         self.early_warning_window = 8;
         self.block_mode = BlockModeProfile::default();
         self.buffered_mode = true;

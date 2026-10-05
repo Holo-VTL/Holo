@@ -59,11 +59,15 @@ if [[ -z "${VERSION}" ]]; then
   # Strip leading 'v' if present from git tag
   VERSION="${VERSION#v}"
 fi
+[[ "${VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9.+-]*$ ]] || {
+  echo "error: version contains unsupported characters" >&2
+  exit 1
+}
 
 # The remote build directory intentionally excludes .git; pass the local source
 # revision explicitly so the control-plane can report the commit used to build it.
 SOURCE_COMMIT="$(git -C "${PROJECT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if [[ -n "$(git -C "${PROJECT_DIR}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+if [[ -n "$(git -C "${PROJECT_DIR}" status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
   SOURCE_COMMIT="${SOURCE_COMMIT}-dirty"
 fi
 
@@ -133,9 +137,10 @@ export GOPROXY=https://goproxy.cn,direct
 export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
 export GOMODCACHE="\${CACHE_DIR}/gomod"
 
-GO_VERSION="1.24.3"
+GO_VERSION="1.26.8"
 GO_TARBALL="go\${GO_VERSION}.linux-amd64.tar.gz"
-GO_TARBALL_SHA256="3333f6ea53afa971e9078895eaa4ac7204a8c6b5c68c10e6bc9a33e8e391bdd8"
+GO_TARBALL_SHA256="d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b"
+GOVULNCHECK_VERSION="v1.8.0"
 RUSTUP_VERSION="1.27.1"
 RUSTUP_INIT_SHA256="6aeece6993e902708983b209d04c0d1dbb14ebb405ddb87def578d41f920f56d"
 NODE_VERSION="20.11.1"
@@ -153,9 +158,7 @@ download_verified() {
   # Check persistent cache first
   local cache_file="\${CACHE_DIR}/\$(basename "\${output}")"
   if [[ -f "\${cache_file}" ]]; then
-    local cached_sha
-    cached_sha="\$(sha256sum "\${cache_file}" | awk '{print \$1}')"
-    if [[ "\${cached_sha}" == "\${expected_sha}" ]]; then
+    if "\${BUILD_DIR}/scripts/verify-sha256.sh" "\${cache_file}" "\${expected_sha}" >/dev/null 2>&1; then
       cp "\${cache_file}" "\${output}"
       echo "  Cached \${name} sha256=\${expected_sha}"
       return 0
@@ -174,7 +177,7 @@ download_verified() {
       continue
     fi
     actual="\$(sha256sum "\${candidate}" | awk '{print \$1}')"
-    if [[ "\${actual}" != "\${expected_sha}" ]]; then
+    if ! "\${BUILD_DIR}/scripts/verify-sha256.sh" "\${candidate}" "\${expected_sha}" >/dev/null; then
       echo "  WARNING: checksum mismatch for \${name} from \${url}" >&2
       echo "           expected=\${expected_sha}" >&2
       echo "           actual=\${actual}" >&2
@@ -193,8 +196,13 @@ download_verified() {
 
 # ── Ensure build tools ──
 ensure_go() {
-  if command -v go >/dev/null 2>&1 && go version | grep -q 'go1.2'; then
-    return 0
+  if command -v go >/dev/null 2>&1; then
+    local actual_go_version
+    actual_go_version="\$(go version)"
+    if [[ "\${actual_go_version}" == *"go\${GO_VERSION}"* ]]; then
+      export GOTOOLCHAIN=local
+      return 0
+    fi
   fi
   echo "  Installing Go..."
   go_archive="\${BUILD_TMP}/\${GO_TARBALL}"
@@ -253,6 +261,8 @@ ensure_node() {
 }
 
 ensure_go
+export GOTOOLCHAIN=local
+[[ "\$(go env GOTOOLCHAIN)" == "local" ]] || { echo "error: Go toolchain auto-switching is enabled" >&2; exit 1; }
 ensure_rust
 ensure_docker
 ensure_node
@@ -281,6 +291,10 @@ CARGOEOF
 cargo build --release --bin tcmu_handler --target x86_64-unknown-linux-musl 2>&1 | tail -5
 cp target/x86_64-unknown-linux-musl/release/tcmu_handler "\${OUTPUT_DIR}/holo-tcmu-handler"
 strip "\${OUTPUT_DIR}/holo-tcmu-handler" 2>/dev/null || true
+echo "  Building holo-storage-maintenance (musl static)..."
+cargo build --release --bin holo_storage_maintenance --target x86_64-unknown-linux-musl 2>&1 | tail -5
+cp target/x86_64-unknown-linux-musl/release/holo_storage_maintenance "\${OUTPUT_DIR}/holo_storage_maintenance"
+strip "\${OUTPUT_DIR}/holo_storage_maintenance" 2>/dev/null || true
 
 # ── Build handler_holo.so (cached builder image) ──
 TCMU_RUNNER_IMAGE_TAG="\$(printf '%s' "\${TCMU_RUNNER_GIT_REF}" | tr -c 'A-Za-z0-9_.-' '_')"
@@ -387,6 +401,11 @@ if [ ! -f "\${BUILD_DIR}/infra/iscsi/holo-local-loopback-helper.py" ]; then
   exit 1
 fi
 cp "\${BUILD_DIR}/infra/iscsi/holo-local-loopback-helper.py" "\${OUTPUT_DIR}/holo-local-loopback-helper.py"
+if [ ! -f "\${BUILD_DIR}/infra/storage/holo-storage-helper.py" ]; then
+  echo "Missing infra/storage/holo-storage-helper.py" >&2
+  exit 1
+fi
+cp "\${BUILD_DIR}/infra/storage/holo-storage-helper.py" "\${OUTPUT_DIR}/holo-storage-helper.py"
 
 
 # Use scripts/install.sh if it exists
@@ -407,15 +426,32 @@ PACKAGE_ROOT="\${BUILD_DIR}/package-root"
 chmod -R u+rwX "\${PACKAGE_ROOT}" 2>/dev/null || true
 rm -rf "\${PACKAGE_ROOT}"
 mkdir -p "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}"
-cp -a control-plane holo-tcmu-handler handler_holo.so handler_holo.c \
+cp -a control-plane holo-tcmu-handler holo_storage_maintenance handler_holo.so handler_holo.c \
   holo-iscsi-security-helper.py \
   install-holo.sh install.sh web-console "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
 cp "\${OUTPUT_DIR}/holo-local-loopback-helper.py" "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/holo-local-loopback-helper.py"
+cp "\${OUTPUT_DIR}/holo-storage-helper.py" "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/holo-storage-helper.py"
 if [ -d packages ]; then
   cp -a packages "\${PACKAGE_ROOT}/${PACKAGE_DIR_NAME}/"
 fi
 tar czf "\${BUILD_DIR}/${TARBALL_NAME}" -C "\${PACKAGE_ROOT}" "${PACKAGE_DIR_NAME}"
 rm -rf "\${PACKAGE_ROOT}"
+
+# Scan the same source tree and the actual packaged Go binary with a pinned toolchain.
+mkdir -p "\${BUILD_TMP}/govulncheck-bin"
+GOBIN="\${BUILD_TMP}/govulncheck-bin" GOTOOLCHAIN=local go install "golang.org/x/vuln/cmd/govulncheck@\${GOVULNCHECK_VERSION}"
+GOVULNCHECK_BIN="\${BUILD_TMP}/govulncheck-bin/govulncheck"
+"\${GOVULNCHECK_BIN}" -version | tee "\${BUILD_TMP}/govulncheck-version.txt"
+grep -Fq "\${GOVULNCHECK_VERSION}" "\${BUILD_TMP}/govulncheck-version.txt" || {
+  echo "error: govulncheck version does not match \${GOVULNCHECK_VERSION}" >&2
+  exit 1
+}
+bash "\${BUILD_DIR}/scripts/release-security-scan.sh" \\
+  --repo-root "\${BUILD_DIR}" \\
+  --tarball "\${BUILD_DIR}/${TARBALL_NAME}" \\
+  --scanner "\${GOVULNCHECK_BIN}" \\
+  --evidence "\${BUILD_DIR}/${TARBALL_NAME}.security.json" \\
+  --source-revision "\${COMMIT}"
 
 echo ""
 echo "=== Build complete ==="
@@ -427,6 +463,9 @@ echo "[4/7] Downloading tarball..."
 rsync -azP -e "ssh ${SSH_OPTS}" \
   "${BUILD_HOST}:${BUILD_DIR}/${TARBALL_NAME}" \
   "${RELEASE_DIR}/" 2>&1 | tail -1
+rsync -az -e "ssh ${SSH_OPTS}" \
+  "${BUILD_HOST}:${BUILD_DIR}/${TARBALL_NAME}.security.json" \
+  "${RELEASE_DIR}/"
 
 # ── Verify ────────────────────────────────────────────────────────
 echo "[5/7] Verifying..."
@@ -435,7 +474,7 @@ tar xzf "${RELEASE_DIR}/${TARBALL_NAME}" -C "${VERIFY_DIR}"
 
 # Check all required files exist
 VERIFY_ROOT="${VERIFY_DIR}/${PACKAGE_DIR_NAME}"
-for f in control-plane holo-tcmu-handler handler_holo.so handler_holo.c holo-iscsi-security-helper.py holo-local-loopback-helper.py install-holo.sh web-console/dist/index.html; do
+for f in control-plane holo-tcmu-handler holo_storage_maintenance handler_holo.so handler_holo.c holo-iscsi-security-helper.py holo-local-loopback-helper.py holo-storage-helper.py install-holo.sh web-console/dist/index.html; do
   if [[ ! -f "${VERIFY_ROOT}/${f}" && ! -d "${VERIFY_ROOT}/${f}" ]]; then
     echo "error: missing ${f} in tarball" >&2
     rm -rf "${VERIFY_DIR}"
@@ -457,6 +496,7 @@ done
 
 echo "  control-plane:    $(du -h "${VERIFY_ROOT}/control-plane" | cut -f1) $(file "${VERIFY_ROOT}/control-plane" | grep -o 'statically linked')"
 echo "  holo-tcmu-handler: $(du -h "${VERIFY_ROOT}/holo-tcmu-handler" | cut -f1) $(file "${VERIFY_ROOT}/holo-tcmu-handler" | grep -o 'static')"
+echo "  storage-maintenance: $(du -h "${VERIFY_ROOT}/holo_storage_maintenance" | cut -f1) $(file "${VERIFY_ROOT}/holo_storage_maintenance" | grep -o 'static')"
 echo "  handler_holo.so:   $(du -h "${VERIFY_ROOT}/handler_holo.so" | cut -f1)"
 echo "  bundled RPMs:      $(find "${VERIFY_ROOT}/packages" -type f -name '*.rpm' | wc -l | tr -d ' ')"
 rm -rf "${VERIFY_DIR}"

@@ -1,7 +1,8 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::{env, ffi::OsStr};
 
+use super::layout_lease::LayoutLease;
 use super::metadata::{
     load_checkpoint_page, persist_checkpoint_page, storage_root_dir_for_cartridge, CheckpointFlags,
     MetadataCheckpoint, StorageError,
@@ -12,7 +13,6 @@ use super::segment_index::{data_segment_path, initialize_segment_index};
 pub const STORAGE_LAYOUT_MAGIC: u32 = 0x56544C58;
 pub const STORAGE_LAYOUT_VERSION_V1: u16 = 1;
 pub const STORAGE_LAYOUT_VERSION: u16 = 2;
-const MEDIA_STATE_KEY_SEPARATOR: &str = "__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -176,8 +176,8 @@ pub struct LayoutPaths {
 }
 
 impl LayoutPaths {
-    pub fn for_cartridge(root: &Path, drive_id: &str, cartridge_id: &str) -> Self {
-        let dir = resolve_layout_dir(root, drive_id, cartridge_id);
+    pub fn for_cartridge(root: &Path, library_id: &str, cartridge_id: &str) -> Self {
+        let dir = canonical_cartridge_dir(root, library_id, cartridge_id);
         Self {
             root: dir.clone(),
             data_file: dir.join("data.segment"),
@@ -195,36 +195,18 @@ impl LayoutPaths {
     }
 }
 
-fn layout_scope_from_media_state_key(media_state_key: &str, _drive_id: &str) -> String {
-    let trimmed = media_state_key.trim();
-    if !trimmed.is_empty() {
-        if let Some((library, _)) = trimmed.split_once(MEDIA_STATE_KEY_SEPARATOR) {
-            let library = sanitize_id(library);
-            if !library.is_empty() {
-                return library;
-            }
-        }
-        let fallback = sanitize_id(trimmed);
-        if !fallback.is_empty() {
-            return fallback;
-        }
-    }
-    let fallback = sanitize_id(_drive_id);
-    if fallback.is_empty() {
+fn layout_scope_key(library_id: &str) -> String {
+    let scope = sanitize_id(library_id);
+    if scope.is_empty() {
         "global".to_string()
     } else {
-        fallback
+        scope
     }
 }
 
-fn layout_scope_key(drive_id: &str) -> String {
-    let media_state_key = env::var("HOLO_MEDIA_STATE_KEY").unwrap_or_default();
-    layout_scope_from_media_state_key(&media_state_key, drive_id)
-}
-
-fn canonical_cartridge_dir(root: &Path, drive_id: &str, cartridge_id: &str) -> PathBuf {
+fn canonical_cartridge_dir(root: &Path, library_id: &str, cartridge_id: &str) -> PathBuf {
     root.join("cartridges")
-        .join(layout_scope_key(drive_id))
+        .join(layout_scope_key(library_id))
         .join(sanitize_id(cartridge_id))
 }
 
@@ -233,70 +215,71 @@ fn legacy_cartridge_dir(root: &Path, drive_id: &str, cartridge_id: &str) -> Path
         .join(sanitize_id(cartridge_id))
 }
 
-fn layout_dir_score(dir: &Path) -> u64 {
-    const SEGMENT_FILES: [&str; 6] = [
-        "data.segment",
-        "metadata.segment",
-        "blk_map.segment",
-        "lookup.segment",
-        "reclaim.segment",
-        "dedup.segment",
-    ];
-    SEGMENT_FILES
-        .iter()
-        .filter_map(|name| fs::metadata(dir.join(name)).ok().map(|m| m.len()))
-        .sum()
-}
-
-fn discover_legacy_dirs(root: &Path, cartridge_id: &str) -> Vec<PathBuf> {
+fn discover_legacy_dirs(root: &Path, cartridge_id: &str) -> Result<Vec<PathBuf>, StorageError> {
     let cartridge = sanitize_id(cartridge_id);
     let mut dirs = Vec::new();
     let entries = match fs::read_dir(root) {
-        Ok(v) => v,
-        Err(_) => return dirs,
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+        Err(err) => return Err(StorageError::Io(err)),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
         if entry.file_name() == OsStr::new("cartridges") {
             continue;
         }
+        let entry_type = entry.file_type()?;
+        if entry_type.is_symlink() {
+            return Err(StorageError::Conflict("identity_conflict".to_string()));
+        }
+        if !entry_type.is_dir() {
+            continue;
+        }
         let candidate = path.join(&cartridge);
-        if candidate.is_dir() {
+        if is_layout_directory(&candidate)? {
             dirs.push(candidate);
         }
     }
-    dirs
+    Ok(dirs)
 }
 
-fn resolve_layout_dir(root: &Path, drive_id: &str, cartridge_id: &str) -> PathBuf {
-    let canonical = canonical_cartridge_dir(root, drive_id, cartridge_id);
-    if canonical.is_dir() {
-        return canonical;
-    }
-
+fn resolve_layout_dir(
+    root: &Path,
+    library_id: &str,
+    drive_id: &str,
+    cartridge_id: &str,
+) -> Result<PathBuf, StorageError> {
+    let canonical = canonical_cartridge_dir(root, library_id, cartridge_id);
     let mut candidates = Vec::new();
+    if is_layout_directory(&canonical)? {
+        candidates.push(canonical.clone());
+    }
     let preferred = legacy_cartridge_dir(root, drive_id, cartridge_id);
-    if preferred.is_dir() {
+    if is_layout_directory(&preferred)? {
         candidates.push(preferred);
     }
-    for candidate in discover_legacy_dirs(root, cartridge_id) {
+    for candidate in discover_legacy_dirs(root, cartridge_id)? {
         if !candidates.iter().any(|existing| existing == &candidate) {
             candidates.push(candidate);
         }
     }
-    if candidates.is_empty() {
-        return canonical;
+    match candidates.len() {
+        0 => Ok(canonical),
+        1 => Ok(candidates.remove(0)),
+        _ => Err(StorageError::Conflict("ambiguous_layout".to_string())),
     }
+}
 
-    candidates.sort_by(|left, right| {
-        layout_dir_score(right)
-            .cmp(&layout_dir_score(left))
-            .then_with(|| left.cmp(right))
-    });
-    candidates.remove(0)
+fn is_layout_directory(path: &Path) -> Result<bool, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(StorageError::Conflict("identity_conflict".to_string()))
+        }
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(StorageError::Io(err)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -306,12 +289,60 @@ pub struct LayoutSnapshot {
 }
 
 pub fn bootstrap_for_mount(
+    library_id: &str,
     drive_id: &str,
     cartridge_id: &str,
 ) -> Result<LayoutSnapshot, StorageError> {
+    bootstrap_for_mount_inner(library_id, drive_id, cartridge_id, None)
+}
+
+pub fn bootstrap_for_mount_with_lease(
+    library_id: &str,
+    drive_id: &str,
+    cartridge_id: &str,
+    lease: &LayoutLease,
+) -> Result<LayoutSnapshot, StorageError> {
+    bootstrap_for_mount_inner(library_id, drive_id, cartridge_id, Some(lease))
+}
+
+fn bootstrap_for_mount_inner(
+    library_id: &str,
+    drive_id: &str,
+    cartridge_id: &str,
+    lease: Option<&LayoutLease>,
+) -> Result<LayoutSnapshot, StorageError> {
     let root = storage_root_dir_for_cartridge(cartridge_id);
-    let paths = LayoutPaths::for_cartridge(&root, drive_id, cartridge_id);
+    if let Some(lease) = lease {
+        lease
+            .verify_pool_root(&root)
+            .map_err(super::layout_lease::storage_error_from_lease)?;
+    }
+    let paths = resolve_layout_paths(&root, library_id, drive_id, cartridge_id)?;
+    if let Some(lease) = lease {
+        lease
+            .verify_pool_root(&root)
+            .map_err(super::layout_lease::storage_error_from_lease)?;
+    }
     initialize_layout(&paths)
+}
+
+pub fn resolve_layout_paths(
+    root: &Path,
+    library_id: &str,
+    drive_id: &str,
+    cartridge_id: &str,
+) -> Result<LayoutPaths, StorageError> {
+    let layout_root = resolve_layout_dir(root, library_id, drive_id, cartridge_id)?;
+    Ok(LayoutPaths {
+        root: layout_root.clone(),
+        data_file: layout_root.join("data.segment"),
+        metadata_file: layout_root.join("metadata.segment"),
+        blk_map_file: layout_root.join("blk_map.segment"),
+        lookup_file: layout_root.join("lookup.segment"),
+        reclaim_file: layout_root.join("reclaim.segment"),
+        dedup_file: layout_root.join("dedup.segment"),
+        segment_index_file: layout_root.join("segment_index.segment"),
+    })
 }
 
 pub fn initialize_layout(paths: &LayoutPaths) -> Result<LayoutSnapshot, StorageError> {
@@ -414,19 +445,24 @@ mod tests {
     }
 
     #[test]
-    fn for_cartridge_prefers_shared_canonical_layout() {
+    fn resolver_rejects_canonical_and_legacy_layout_ambiguity() {
         let root = unique_root("canonical");
-        let canonical = canonical_cartridge_dir(&root, "drive-a", "VTL000001");
+        let canonical = canonical_cartridge_dir(&root, "library-a", "VTL000001");
         let legacy = root.join("drive-a").join("vtl000001");
         fs::create_dir_all(&canonical).expect("create canonical");
         fs::create_dir_all(&legacy).expect("create legacy");
 
-        let paths = LayoutPaths::for_cartridge(&root, "drive-a", "VTL000001");
-        assert_eq!(paths.root, canonical);
+        let err = resolve_layout_dir(&root, "library-a", "drive-a", "VTL000001")
+            .expect_err("canonical and legacy layouts must not be guessed");
+        assert_eq!(err.to_string(), "conflict: ambiguous_layout");
+        assert!(
+            canonical.is_dir() && legacy.is_dir(),
+            "resolver must preserve both layouts"
+        );
     }
 
     #[test]
-    fn for_cartridge_reuses_richer_legacy_layout_across_drives() {
+    fn resolver_rejects_multiple_legacy_layouts_without_scoring() {
         let root = unique_root("legacy-share");
         let drive_a = root.join("drive-a").join("vtl000001");
         let drive_b = root.join("drive-b").join("vtl000001");
@@ -435,23 +471,37 @@ mod tests {
         fs::write(drive_a.join("data.segment"), vec![0u8; 1024]).expect("write drive-a data");
         fs::write(drive_b.join("data.segment"), vec![0u8; 64]).expect("write drive-b data");
 
-        let paths = LayoutPaths::for_cartridge(&root, "drive-b", "VTL000001");
-        assert_eq!(paths.root, drive_a);
+        let err = resolve_layout_dir(&root, "library-a", "drive-b", "VTL000001")
+            .expect_err("multiple legacy layouts must not be selected by size");
+        assert_eq!(err.to_string(), "conflict: ambiguous_layout");
+        assert_eq!(
+            fs::metadata(drive_a.join("data.segment"))
+                .expect("drive-a data")
+                .len(),
+            1024
+        );
+        assert_eq!(
+            fs::metadata(drive_b.join("data.segment"))
+                .expect("drive-b data")
+                .len(),
+            64
+        );
     }
 
     #[test]
-    fn scope_uses_library_prefix_from_media_state_key() {
-        assert_eq!(
-            layout_scope_from_media_state_key("library-a__drive-a", "drive-a"),
-            "library-a".to_string()
-        );
-        assert_eq!(
-            layout_scope_from_media_state_key("just-one-key", "drive-a"),
-            "just-one-key".to_string()
-        );
-        assert_eq!(
-            layout_scope_from_media_state_key("", "drive-a"),
-            "drive-a".to_string()
-        );
+    fn layout_scope_uses_explicit_library_identity() {
+        assert_eq!(layout_scope_key("library-a"), "library-a");
+        assert_eq!(layout_scope_key("library-a__drive-a"), "library-a__drive-a");
+    }
+
+    #[test]
+    fn resolver_reuses_one_legacy_layout_only_when_unique() {
+        let root = unique_root("legacy-unique");
+        let legacy = root.join("drive-a").join("vtl000001");
+        fs::create_dir_all(&legacy).expect("create legacy layout");
+
+        let resolved = resolve_layout_dir(&root, "library-a", "drive-a", "VTL000001")
+            .expect("single legacy layout should resolve");
+        assert_eq!(resolved, legacy);
     }
 }

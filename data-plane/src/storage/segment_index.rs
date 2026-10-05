@@ -7,9 +7,10 @@ use std::sync::{Mutex, OnceLock};
 use super::compression::CompressionCodec;
 use super::layout::{checksum32, LayoutPaths, SegmentKind};
 use super::metadata::{
-    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+    checked_metadata_record_count, checked_usize_from_u64, lock_storage_mutex,
+    modified_nanos_from_result, StorageError, MAX_MAINTENANCE_METADATA_BYTES,
 };
-use super::segment::{read_segment_file, validate_segment_shape, write_segment_file};
+use super::segment::{read_segment_file_bounded, validate_segment_shape, write_segment_file};
 
 pub const DEFAULT_MAX_DATA_SEGMENT_SIZE: u32 = 256 * 1024 * 1024;
 const SEGMENT_INDEX_PREFIX: &[u8; 4] = b"SDI1";
@@ -217,7 +218,11 @@ pub fn data_segment_path(layout: &LayoutPaths, seq: u32) -> PathBuf {
 }
 
 pub fn load_segment_index(path: &Path) -> Result<SegmentIndex, StorageError> {
-    let (_header, payload) = read_segment_file(path, SegmentKind::SegmentIndex)?;
+    let (_header, payload) = read_segment_file_bounded(
+        path,
+        SegmentKind::SegmentIndex,
+        MAX_MAINTENANCE_METADATA_BYTES,
+    )?;
     decode_segment_index(&payload)
 }
 
@@ -292,6 +297,11 @@ pub fn invalidate_segment_index_cache(path: &Path) {
         }
         Err(err) => eprintln!("[storage] failed to invalidate segment index cache: {err}"),
     }
+}
+
+pub fn invalidate_segment_index_cache_checked(path: &Path) -> Result<(), StorageError> {
+    lock_storage_mutex(cache(), "segment index")?.remove(path);
+    Ok(())
 }
 
 pub fn flush_segment_index_for_append(path: &Path) -> Result<(), StorageError> {
@@ -444,7 +454,10 @@ fn rotate_active_segment(
         compression: CompressionCodec::None,
         live_bytes: 0,
     });
-    index.next_segment_seq = index.next_segment_seq.saturating_add(1);
+    index.next_segment_seq = index
+        .next_segment_seq
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Conflict("segment sequence space is exhausted".to_string()))?;
     persist_segment_index(&layout.segment_index_file, index)
 }
 
@@ -471,6 +484,7 @@ fn decode_segment_index(payload: &[u8]) -> Result<SegmentIndex, StorageError> {
     );
     let total_segment_count =
         checked_usize_from_u64(u64::from(raw_total_segment_count), "segment index total")?;
+    let total_segment_count = checked_metadata_record_count(total_segment_count)?;
     let next_segment_seq = u64::from_le_bytes(
         payload[16..24]
             .try_into()
