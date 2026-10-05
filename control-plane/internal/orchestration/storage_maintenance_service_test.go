@@ -209,6 +209,85 @@ func TestStorageMaintenanceWatchdogStopsWorkerWithoutVerifiedProgress(t *testing
 	}
 }
 
+func TestStorageMaintenanceAllowsVerifiedProgressBeyondNinetySeconds(t *testing.T) {
+	if os.Getenv("HOLO_LONG_RECOVERY_ACCEPTANCE") != "1" {
+		t.Skip("set HOLO_LONG_RECOVERY_ACCEPTANCE=1 for the 95-second watchdog acceptance")
+	}
+	worker := filepath.Join(t.TempDir(), "worker.sh")
+	script := `#!/bin/sh
+i=0
+while [ "$i" -lt 19 ]; do
+  i=$((i + 1))
+  printf 'HOLO_PROGRESS {"schema_version":2,"phase":"verify","verified_bytes":%s,"verified_records":%s}\n' "$i" "$i" >&2
+  sleep 5
+done
+printf '%s\n' '{"schema_version":2,"pool_id":"pool-a","library_id":"library-a","cartridge_id":"cart-a","status":"completed","processed_segments":1,"has_more":false,"allocated_before_bytes":1,"allocated_after_bytes":0,"net_freed_bytes":1,"duration_ms":95000}'
+`
+	if err := os.WriteFile(worker, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service := NewStorageMaintenanceService(testMaintenanceCatalog{}, nil, nil, nil)
+	service.binPath = worker
+	candidate := storageMaintenanceCandidate{poolID: "pool-a", library: "library-a", cartridge: "cart-a"}
+	started := time.Now()
+	service.runCandidate(context.Background(), candidate)
+	if elapsed := time.Since(started); elapsed < 90*time.Second {
+		t.Fatalf("verified worker did not run through the long-recovery window: %s", elapsed)
+	}
+	if state := service.lastStates["pool-a/cart-a"]; state != "completed/" {
+		t.Fatalf("worker was not accepted after sustained verified progress: %q", state)
+	}
+}
+
+func TestStorageMaintenanceUsesIdleIOPriorityWhenIoniceIsAvailable(t *testing.T) {
+	binDir := t.TempDir()
+	worker := filepath.Join(binDir, "worker.sh")
+	if err := os.WriteFile(worker, []byte("#!/bin/sh\nprintf worker-ran\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(binDir, "ionice-args")
+	ionice := filepath.Join(binDir, "ionice")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\" > \"$IONICE_ARGS_PATH\"\nshift 2\nexec \"$@\"\n"
+	if err := os.WriteFile(ionice, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("IONICE_ARGS_PATH", argsPath)
+
+	cmd := storageMaintenanceCommand(worker, ionice, "--test-arg")
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run maintenance worker through ionice shim: %v", err)
+	}
+	if string(output) != "worker-ran" {
+		t.Fatalf("unexpected worker output: %q", output)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(args) != "-c3\n--\n" {
+		t.Fatalf("maintenance was not started with idle I/O class: %q", args)
+	}
+}
+
+func TestStorageMaintenanceFallsBackWhenIoniceIsUnavailable(t *testing.T) {
+	binDir := t.TempDir()
+	worker := filepath.Join(binDir, "worker.sh")
+	if err := os.WriteFile(worker, []byte("#!/bin/sh\nprintf fallback-ran\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	cmd := storageMaintenanceCommand(worker, filepath.Join(binDir, "missing-ionice"))
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run maintenance worker fallback: %v", err)
+	}
+	if string(output) != "fallback-ran" {
+		t.Fatalf("unexpected fallback output: %q", output)
+	}
+}
+
 func TestStorageMaintenanceShutdownCancelsWorkerWithinGrace(t *testing.T) {
 	worker := filepath.Join(t.TempDir(), "worker.sh")
 	if err := os.WriteFile(worker, []byte("#!/bin/sh\nexec sleep 5\n"), 0o700); err != nil {

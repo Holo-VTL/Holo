@@ -59,6 +59,10 @@ if [[ -z "${VERSION}" ]]; then
   # Strip leading 'v' if present from git tag
   VERSION="${VERSION#v}"
 fi
+[[ "${VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9.+-]*$ ]] || {
+  echo "error: version contains unsupported characters" >&2
+  exit 1
+}
 
 # The remote build directory intentionally excludes .git; pass the local source
 # revision explicitly so the control-plane can report the commit used to build it.
@@ -444,9 +448,9 @@ grep -Fq "\${GOVULNCHECK_VERSION}" "\${BUILD_TMP}/govulncheck-version.txt" || {
 }
 bash "\${BUILD_DIR}/scripts/release-security-scan.sh" \\
   --repo-root "\${BUILD_DIR}" \\
-  --tarball "\${BUILD_DIR}/\${TARBALL_NAME}" \\
+  --tarball "\${BUILD_DIR}/${TARBALL_NAME}" \\
   --scanner "\${GOVULNCHECK_BIN}" \\
-  --evidence "\${BUILD_DIR}/\${TARBALL_NAME}.security.json" \\
+  --evidence "\${BUILD_DIR}/${TARBALL_NAME}.security.json" \\
   --source-revision "\${COMMIT}"
 
 echo ""

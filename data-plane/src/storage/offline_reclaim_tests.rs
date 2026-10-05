@@ -2,6 +2,13 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
+
 use super::data_path::run_unmap;
 use super::layout::{initialize_layout, LayoutPaths, SegmentKind};
 use super::metadata::StorageError;
@@ -12,9 +19,13 @@ use super::segment_index::{
     data_segment_path, load_segment_index, persist_segment_index, SegmentDescriptor, SegmentState,
 };
 use super::space_guard::FilesystemLock;
+#[cfg(target_os = "linux")]
+use super::space_guard::FilesystemSnapshot;
 use super::{
     load_blk_map_records, read_logical_block, write_logical_block, BlkMapState, WriteOptions,
 };
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 
 static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -696,6 +707,418 @@ fn linux_small_filesystem_reclaim_smoke() {
             .payload,
         live_payload
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a dedicated Linux filesystem with space for the configured real payload"]
+fn linux_large_reclaim_acceptance() {
+    const BLOCK_BYTES: usize = 8 * 1024 * 1024;
+    const BLOCKS_PER_CHUNK: usize = 64;
+    const MAX_SEGMENT_BYTES: u32 = 1024 * 1024 * 1024;
+    const PUBLIC_LOCK_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+    const DEFAULT_TEST_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+    const PROBE_BLOCK_BYTES: usize = 256 * 1024;
+    const PROBE_BLOCKS_PER_ROUND: usize = 16;
+    const ACCEPTANCE_PROBE_ROUNDS: usize = 3;
+
+    let fixture_root = std::env::var_os("HOLO_TAPE_TEST_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("test harness must set HOLO_TAPE_TEST_ROOT");
+    fs::create_dir_all(&fixture_root).expect("create test fixture root");
+    let fixture_root = fs::canonicalize(fixture_root).expect("canonicalize test fixture root");
+    let total_write_bytes = std::env::var("HOLO_TAPE_RECLAIM_TEST_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TEST_BYTES);
+    assert_eq!(
+        total_write_bytes % (2 * BLOCK_BYTES as u64),
+        0,
+        "configured test bytes must contain whole stale/live block pairs"
+    );
+    let probe_rounds = if total_write_bytes < 2 * u64::from(MAX_SEGMENT_BYTES) {
+        1
+    } else {
+        ACCEPTANCE_PROBE_ROUNDS
+    };
+    let pair_count = (total_write_bytes / (2 * BLOCK_BYTES as u64)) as usize;
+    assert!(pair_count > 0, "configured payload must not be empty");
+    assert!(
+        pair_count.saturating_mul(2) <= super::metadata::MAX_MAINTENANCE_METADATA_RECORDS,
+        "payload record count exceeds the maintenance metadata budget"
+    );
+    let live_bytes = total_write_bytes / 2;
+
+    let pool_root = fixture_root.join("pool");
+    let runtime_dir = fixture_root.join("runtime");
+    let media_state_dir = fixture_root.join("media-state");
+    fs::create_dir_all(&pool_root).expect("create isolated pool root");
+    fs::create_dir_all(&runtime_dir).expect("create isolated runtime directory");
+    fs::create_dir_all(&media_state_dir).expect("create isolated media state directory");
+    std::env::set_var("HOLO_MEDIA_STATE_DIR", &media_state_dir);
+    std::env::set_var("HOLO_MEDIA_STATE_KEY", "large-reclaim__drive");
+
+    let filesystem = FilesystemSnapshot::probe(&pool_root).expect("probe scratch filesystem");
+    let conservative_peak = total_write_bytes
+        .checked_add(u64::from(MAX_SEGMENT_BYTES))
+        .and_then(|bytes| bytes.checked_add(super::space_guard::SPACE_RESERVE_BYTES))
+        .expect("compute scratch capacity requirement");
+    assert!(
+        filesystem.available_bytes >= conservative_peak,
+        "scratch filesystem needs {conservative_peak} bytes free, found {}",
+        filesystem.available_bytes
+    );
+
+    let paths = LayoutPaths::for_cartridge(&pool_root, "large-library", "large-cart");
+    initialize_layout(&paths).expect("initialize large reclaim layout");
+    let mut segment_index = load_segment_index(&paths.segment_index_file).expect("load index");
+    segment_index.max_segment_size = MAX_SEGMENT_BYTES;
+    persist_segment_index(&paths.segment_index_file, &segment_index).expect("set segment size");
+
+    let options = WriteOptions {
+        dedup_enabled: false,
+        preferred_codec: CompressionCodec::None,
+        force_sync: false,
+        payload_checksum_enabled: true,
+    };
+    let mut random = fs::File::open("/dev/urandom").expect("open kernel random source");
+    let mut live_hashes = Vec::<[u8; 32]>::with_capacity(pair_count);
+    let started_at = Instant::now();
+
+    for chunk_start in (0..pair_count).step_by(BLOCKS_PER_CHUNK) {
+        let chunk_blocks = (pair_count - chunk_start).min(BLOCKS_PER_CHUNK);
+        let logical_start = (chunk_start * BLOCK_BYTES) as u64;
+        for block in chunk_start..chunk_start + chunk_blocks {
+            let mut payload = vec![0u8; BLOCK_BYTES];
+            random
+                .read_exact(&mut payload)
+                .expect("generate stale payload");
+            write_logical_block(
+                &paths,
+                (block * BLOCK_BYTES) as u64,
+                &payload,
+                0,
+                options,
+                None,
+            )
+            .expect("write stale payload");
+        }
+        run_unmap(&paths, logical_start, (chunk_blocks * BLOCK_BYTES) as u32)
+            .expect("mark old payloads stale");
+        for block in chunk_start..chunk_start + chunk_blocks {
+            let mut payload = vec![0u8; BLOCK_BYTES];
+            random
+                .read_exact(&mut payload)
+                .expect("generate live payload");
+            live_hashes.push(Sha256::digest(&payload).into());
+            write_logical_block(
+                &paths,
+                (block * BLOCK_BYTES) as u64,
+                &payload,
+                0,
+                options,
+                None,
+            )
+            .expect("write replacement live payload");
+        }
+    }
+    super::data_path::flush_pending_writes(&paths).expect("flush all staged payloads");
+    let metadata_paths = [
+        paths.metadata_file.clone(),
+        paths.blk_map_file.clone(),
+        paths.lookup_file.clone(),
+        paths.reclaim_file.clone(),
+        paths.dedup_file.clone(),
+        paths.segment_index_file.clone(),
+        paths.root.join("filemarks.state"),
+        paths.root.join("usage.counters"),
+    ];
+    let mut metadata_bytes = 0u64;
+    for path in metadata_paths {
+        match fs::metadata(path) {
+            Ok(metadata) => metadata_bytes += metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect acceptance metadata file: {error}"),
+        }
+    }
+    assert!(
+        metadata_bytes <= super::metadata::MAX_MAINTENANCE_METADATA_BYTES,
+        "test fixture metadata exceeds the maintenance budget: {metadata_bytes} bytes"
+    );
+    let allocated_before = allocated_bytes_in_tree(&paths.root);
+    assert!(
+        allocated_before >= total_write_bytes * 95 / 100,
+        "payload was not physically allocated: wrote={total_write_bytes} allocated={allocated_before}"
+    );
+
+    let probe_paths = LayoutPaths::for_cartridge(&pool_root, "large-library", "probe-cart");
+    initialize_layout(&probe_paths).expect("initialize concurrent writer cartridge");
+    let probe_payload = vec![0x6d; PROBE_BLOCK_BYTES];
+    let probe_options = WriteOptions {
+        dedup_enabled: false,
+        preferred_codec: CompressionCodec::None,
+        force_sync: false,
+        payload_checksum_enabled: true,
+    };
+    let write_probe_round = |round: usize| {
+        let round_started = Instant::now();
+        for block in 0..PROBE_BLOCKS_PER_ROUND {
+            let logical_start =
+                ((round * PROBE_BLOCKS_PER_ROUND + block) * PROBE_BLOCK_BYTES) as u64;
+            write_logical_block(
+                &probe_paths,
+                logical_start,
+                &probe_payload,
+                0,
+                probe_options,
+                None,
+            )
+            .expect("write concurrent probe block");
+        }
+        super::data_path::flush_pending_writes(&probe_paths).expect("flush probe round");
+        round_started.elapsed().as_nanos()
+    };
+    for round in 0..probe_rounds {
+        write_probe_round(round);
+    }
+    let baseline_samples = (0..probe_rounds)
+        .map(|round| write_probe_round(probe_rounds + round))
+        .collect::<Vec<_>>();
+
+    let executable = std::env::current_exe().expect("locate test executable");
+    let worker_log = fixture_root.join("reclaim-worker.log");
+    let worker_output = fs::File::create(&worker_log).expect("create worker log");
+    let mut worker = std::process::Command::new("ionice")
+        .args(["-c3", "--"])
+        .arg(executable)
+        .args([
+            "--exact",
+            "storage::offline_reclaim_tests::linux_reclaim_worker_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("HOLO_TAPE_TEST_ROOT", &fixture_root)
+        .env("HOLO_MEDIA_STATE_DIR", &media_state_dir)
+        .env("HOLO_MEDIA_STATE_KEY", "large-reclaim__drive")
+        .stdout(worker_output)
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("start reclaim worker with idle I/O priority");
+
+    let mut concurrent_samples = Vec::<u128>::with_capacity(probe_rounds);
+    for round in 0..probe_rounds {
+        let phase_marker = fixture_root.join(format!("copy-phase-{}", round + 1));
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        while !phase_marker.exists() {
+            if let Some(status) = worker.try_wait().expect("check reclaim worker status") {
+                let log = fs::read_to_string(&worker_log).unwrap_or_default();
+                panic!("reclaim worker exited before probe phase {round}: {status}\n{log}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reclaim worker did not reach copy phase {} within 120 seconds",
+                round + 1
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        concurrent_samples.push(write_probe_round(probe_rounds * 2 + round));
+    }
+    let worker_status = worker.wait().expect("wait for reclaim worker");
+    let worker_log_contents = fs::read_to_string(&worker_log).unwrap_or_default();
+    assert!(
+        worker_status.success(),
+        "reclaim worker failed: {worker_status}\n{worker_log_contents}"
+    );
+    let report = fs::read_to_string(fixture_root.join("reclaim-worker-report"))
+        .expect("read reclaim worker report");
+    let worker_metrics = report
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<std::collections::HashMap<_, _>>();
+    let processed_segments = worker_metrics
+        .get("processed_segments")
+        .expect("worker segment count")
+        .parse::<u32>()
+        .expect("parse worker segment count");
+    let vm_hwm_kib = worker_metrics
+        .get("vm_hwm_kib")
+        .expect("worker RSS")
+        .parse::<u64>()
+        .expect("parse worker RSS");
+    let max_public_lock_wait_us = worker_metrics
+        .get("max_public_lock_wait_us")
+        .expect("worker lock wait")
+        .parse::<u64>()
+        .expect("parse worker lock wait");
+    assert_eq!(
+        concurrent_samples.len(),
+        probe_rounds,
+        "concurrent write probes did not overlap reclaim copy"
+    );
+    assert!(
+        std::time::Duration::from_micros(max_public_lock_wait_us) <= PUBLIC_LOCK_LIMIT,
+        "public filesystem lock waited {max_public_lock_wait_us}us, limit is {:?}",
+        PUBLIC_LOCK_LIMIT
+    );
+
+    let allocated_after = allocated_bytes_in_tree(&paths.root);
+    let bytes_freed = allocated_before.saturating_sub(allocated_after);
+    assert!(processed_segments > 0, "no segment was reclaimed");
+    assert!(
+        bytes_freed >= live_bytes * 70 / 100,
+        "reclaim freed too little storage: before={allocated_before} after={allocated_after} freed={bytes_freed} expected_at_least={}",
+        live_bytes * 70 / 100
+    );
+
+    for (block, expected_hash) in live_hashes.iter().enumerate() {
+        let readback = read_logical_block(&paths, (block * BLOCK_BYTES) as u64)
+            .expect("read reclaimed live block")
+            .expect("live block survives reclamation");
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(&readback.payload)),
+            *expected_hash,
+            "payload changed at logical block {block}"
+        );
+    }
+    assert!(
+        vm_hwm_kib <= 128 * 1024,
+        "large reclaim exceeded 128 MiB high-water RSS: {vm_hwm_kib} KiB"
+    );
+
+    let baseline_median = median_u128(&baseline_samples);
+    let concurrent_median = median_u128(&concurrent_samples);
+    let regression = concurrent_median as f64 / baseline_median as f64 - 1.0;
+    assert!(
+        regression <= 0.10,
+        "other-cartridge write median regressed {:.2}% during reclaim (baseline={}ns current={}ns)",
+        regression * 100.0,
+        baseline_median,
+        concurrent_median
+    );
+    println!(
+        "TAPE_RECLAIM_ACCEPTANCE payload_bytes={} live_bytes={} allocated_before_bytes={} allocated_after_bytes={} net_freed_bytes={} processed_segments={} vm_hwm_kib={} max_public_lock_wait_us={} probe_warmup_rounds={} baseline_probe_median_ns={} concurrent_probe_median_ns={} other_cart_write_regression_percent={:.2} elapsed_ms={}",
+        total_write_bytes,
+        live_bytes,
+        allocated_before,
+        allocated_after,
+        bytes_freed,
+        processed_segments,
+        vm_hwm_kib,
+        max_public_lock_wait_us,
+        probe_rounds,
+        baseline_median,
+        concurrent_median,
+        regression * 100.0,
+        started_at.elapsed().as_millis()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "invoked as a child by linux_large_reclaim_acceptance"]
+fn linux_reclaim_worker_child() {
+    const MAX_ROUNDS: usize = 4096;
+    let fixture_root = std::env::var_os("HOLO_TAPE_TEST_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("test harness must set HOLO_TAPE_TEST_ROOT");
+    let fixture_root = fs::canonicalize(fixture_root).expect("canonicalize fixture");
+    let pool_root = fixture_root.join("pool");
+    let runtime_dir = fixture_root.join("runtime");
+    let paths = LayoutPaths::for_cartridge(&pool_root, "large-library", "large-cart");
+    let mut cursor: Option<String> = None;
+    let mut processed_segments = 0u32;
+    let mut max_public_lock_wait = std::time::Duration::ZERO;
+    let mut copy_phase = 0u32;
+    let mut lock_probed = false;
+
+    for round in 0..MAX_ROUNDS {
+        let mut last_phase = None;
+        let mut progress = |phase, _verified_bytes, _verified_records| {
+            if phase == super::maintenance_progress::MaintenancePhase::Copy {
+                if last_phase != Some(phase) {
+                    copy_phase += 1;
+                    fs::write(
+                        fixture_root.join(format!("copy-phase-{copy_phase}")),
+                        b"copy started",
+                    )
+                    .expect("signal copy phase to parent");
+                }
+                if !lock_probed {
+                    let lock_started = Instant::now();
+                    let lock = FilesystemLock::acquire(&pool_root, &runtime_dir)
+                        .expect("public filesystem lock must be available during copy");
+                    max_public_lock_wait = max_public_lock_wait.max(lock_started.elapsed());
+                    drop(lock);
+                    lock_probed = true;
+                }
+            }
+            last_phase = Some(phase);
+            Ok(())
+        };
+        let report = super::offline_reclaim::reclaim_one_segment_with_cursor_and_progress(
+            &paths,
+            &pool_root,
+            "large-library",
+            "large-cart",
+            &runtime_dir,
+            cursor.as_deref(),
+            &mut progress,
+        )
+        .expect("reclaim next bounded segment");
+        processed_segments = processed_segments.saturating_add(report.processed_segments);
+        cursor = report.scan_cursor;
+        if !report.has_more {
+            break;
+        }
+        assert!(
+            round + 1 < MAX_ROUNDS,
+            "reclaimer did not drain the bounded fixture"
+        );
+    }
+    assert!(lock_probed, "no eligible segment reached copy phase");
+    let vm_hwm_kib = fs::read_to_string("/proc/self/status")
+        .expect("read worker high-water RSS")
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("parse worker VmHWM");
+    fs::write(
+        fixture_root.join("reclaim-worker-report"),
+        format!(
+            "processed_segments={processed_segments} vm_hwm_kib={vm_hwm_kib} max_public_lock_wait_us={} copy_phases={copy_phase}",
+            max_public_lock_wait.as_micros()
+        ),
+    )
+    .expect("write worker report");
+}
+
+#[cfg(target_os = "linux")]
+fn allocated_bytes_in_tree(root: &std::path::Path) -> u64 {
+    let metadata = fs::symlink_metadata(root).expect("inspect allocated test path");
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "test path must not be a link"
+    );
+    if metadata.is_dir() {
+        fs::read_dir(root)
+            .expect("read allocated test directory")
+            .map(|entry| allocated_bytes_in_tree(&entry.expect("directory entry").path()))
+            .sum()
+    } else {
+        metadata.blocks().saturating_mul(512)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn median_u128(samples: &[u128]) -> u128 {
+    assert!(
+        !samples.is_empty(),
+        "at least one timing sample is required"
+    );
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
 }
 
 #[cfg(target_os = "linux")]

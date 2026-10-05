@@ -690,6 +690,9 @@ fn rewrite_segment_in_place(
     index: &mut super::segment_index::SegmentIndex,
     progress: &mut MaintenanceProgress<'_>,
 ) -> Result<(), StorageError> {
+    const COPY_YIELD_BYTES: u64 = 1024 * 1024;
+    const COPY_YIELD_DURATION: std::time::Duration = std::time::Duration::from_millis(50);
+
     let source = reclaim_segment_path(paths, candidate.descriptor.segment_seq);
     let old_header = read_segment_header(&source, SegmentKind::Data)?;
     if old_header.sequence != candidate.source_sequence
@@ -747,6 +750,7 @@ fn rewrite_segment_in_place(
                 source_payload_offset + 8
             };
             let mut seen_headers = 0u64;
+            let mut copied_since_yield = 0u64;
             let mut prior_blob_id = 0u64;
             while input_offset < payload_end
                 && legacy_count.is_none_or(|count| seen_headers < count)
@@ -776,6 +780,11 @@ fn rewrite_segment_in_place(
                     ));
                 }
                 let keep = candidate.live_blob_ids.contains(&meta.blob_id);
+                let phase = if keep {
+                    MaintenancePhase::Copy
+                } else {
+                    MaintenancePhase::Verify
+                };
                 let output_header_offset = if keep {
                     let offset = output.seek(SeekFrom::End(0))?;
                     output.write_all(&[0u8; 24])?;
@@ -800,11 +809,17 @@ fn rewrite_segment_in_place(
                         blob_crc =
                             super::segment::integrity32_continue(blob_crc, &buffer[..requested]);
                         output.write_all(&buffer[..requested])?;
+                        copied_since_yield = copied_since_yield.saturating_add(requested as u64);
                     }
                     remaining = remaining.saturating_sub(requested as u64);
-                    progress(MaintenancePhase::Copy, requested as u64, 0)?;
+                    progress(phase, requested as u64, 0)?;
+                    if copied_since_yield >= COPY_YIELD_BYTES {
+                        // Leave the device a short window for foreground tape writes.
+                        std::thread::sleep(COPY_YIELD_DURATION);
+                        copied_since_yield = 0;
+                    }
                 }
-                progress(MaintenancePhase::Copy, 0, 1)?;
+                progress(phase, 0, 1)?;
                 if keep {
                     if meta.v2_integrity && blob_crc != meta.payload_checksum {
                         return Err(StorageError::Corrupt(

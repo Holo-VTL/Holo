@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -392,7 +393,7 @@ func (s *StorageMaintenanceService) runCandidate(parent context.Context, candida
 	if cursor != "" {
 		args = append(args, "--scan-cursor", cursor)
 	}
-	cmd := exec.Command(s.binPath, args...)
+	cmd := storageMaintenanceCommand(s.binPath, "/usr/bin/ionice", args...)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		s.recordWorkerFailure(candidate, "io_error")
@@ -484,6 +485,18 @@ func (s *StorageMaintenanceService) runCandidate(parent context.Context, candida
 	if s.updateWarningState(candidate, result) {
 		s.emitReclaimAudit(candidate, result)
 	}
+}
+
+func storageMaintenanceCommand(binaryPath, ionicePath string, args ...string) *exec.Cmd {
+	if filepath.IsAbs(ionicePath) {
+		if info, err := os.Stat(ionicePath); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			workerArgs := make([]string, 0, len(args)+3)
+			workerArgs = append(workerArgs, "-c3", "--", binaryPath)
+			workerArgs = append(workerArgs, args...)
+			return exec.Command(ionicePath, workerArgs...)
+		}
+	}
+	return exec.Command(binaryPath, args...)
 }
 
 func (s *StorageMaintenanceService) recordWorkerFailure(candidate storageMaintenanceCandidate, reason string) {
