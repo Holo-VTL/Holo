@@ -430,6 +430,29 @@ mod tests {
     }
 
     #[test]
+    fn read_and_write_cdbs_report_recovery_required_until_reload() {
+        let commands = [
+            (vec![0x08, 0x01, 0, 0, 1, 0], Vec::new()),
+            (vec![0x0A, 0x01, 0, 0, 1, 0], b"data".to_vec()),
+        ];
+        for (cdb, data_out) in commands {
+            let mut state = crate::scsi_tape::state::TapeState::new("drive-recovery-gate");
+            while state.take_unit_attention().is_some() {}
+            state.mount_state = crate::scsi_tape::state::MountState::Loaded;
+            state.requires_recovery = true;
+            state.block_mode.mode = crate::scsi_tape::state::BlockMode::Variable;
+
+            let response = dispatch_raw_cdb(&mut state, &cdb, &data_out);
+
+            assert_eq!(response.status, SCSI_STATUS_CHECK_CONDITION);
+            assert_eq!(response.sense[2] & 0x0F, 0x02, "cdb={cdb:?} sense={:?}", response.sense);
+            assert_eq!(response.sense[12], 0x04, "cdb={cdb:?} sense={:?}", response.sense);
+            assert_eq!(response.sense[13], 0x00);
+            assert_eq!(state.current_position, 0);
+        }
+    }
+
+    #[test]
     fn test_space_blocks_on_blank_media_reports_blank_check_eod() {
         let mut state = crate::scsi_tape::state::TapeState::new("drive-space-blank");
         let _ = state.take_unit_attention();
@@ -940,7 +963,7 @@ mod tests {
             None
         );
         assert_eq!(
-            read_shared_loaded_cartridge(&serial)
+            read_shared_loaded_cartridge_fresh(&serial)
                 .expect("read shared loaded cartridge")
                 .as_deref(),
             Some("VTA000L06")
@@ -1074,7 +1097,7 @@ mod tests {
         ];
         let response = dispatch_changer_cdb(&mut state, &load_to_drive, &[], profile.clone());
         assert_eq!(response.status, SCSI_STATUS_GOOD);
-        let shared = read_shared_loaded_cartridge(&serial).expect("read shared");
+        let shared = read_shared_loaded_cartridge_fresh(&serial).expect("read shared");
         assert_eq!(shared.as_deref(), Some("VTL000001"));
 
         let unload_to_empty_slot = vec![
@@ -1086,7 +1109,7 @@ mod tests {
         ];
         let response = dispatch_changer_cdb(&mut state, &unload_to_empty_slot, &[], profile);
         assert_eq!(response.status, SCSI_STATUS_GOOD);
-        let shared = read_shared_loaded_cartridge(&serial).expect("read shared");
+        let shared = read_shared_loaded_cartridge_fresh(&serial).expect("read shared");
         assert!(
             shared.is_none(),
             "shared state should clear after unload to slot"
@@ -1174,8 +1197,8 @@ mod tests {
         let load_response =
             dispatch_changer_cdb(&mut state, &load_second_drive, &[], profile.clone());
         assert_eq!(load_response.status, SCSI_STATUS_GOOD);
-        let shared_a = read_shared_loaded_cartridge(&key_a).expect("read shared a after load");
-        let shared_b = read_shared_loaded_cartridge(&key_b).expect("read shared b after load");
+        let shared_a = read_shared_loaded_cartridge_fresh(&key_a).expect("read shared a after load");
+        let shared_b = read_shared_loaded_cartridge_fresh(&key_b).expect("read shared b after load");
         assert_eq!(shared_a, None);
         assert_eq!(shared_b.as_deref(), Some("VTL000001"));
 
@@ -1188,8 +1211,8 @@ mod tests {
         ];
         let unload_response = dispatch_changer_cdb(&mut state, &unload_second_drive, &[], profile);
         assert_eq!(unload_response.status, SCSI_STATUS_GOOD);
-        let shared_a = read_shared_loaded_cartridge(&key_a).expect("read shared a after unload");
-        let shared_b = read_shared_loaded_cartridge(&key_b).expect("read shared b after unload");
+        let shared_a = read_shared_loaded_cartridge_fresh(&key_a).expect("read shared a after unload");
+        let shared_b = read_shared_loaded_cartridge_fresh(&key_b).expect("read shared b after unload");
         assert_eq!(shared_a, None);
         assert_eq!(shared_b, None);
 
@@ -1944,7 +1967,7 @@ mod tests {
         assert!(state.cartridge_id.is_none());
 
         write_shared_loaded_cartridge(&serial, Some("VTL000777")).expect("write shared");
-        sync_drive_mount_from_shared(&mut state);
+        sync_drive_mount_from_shared(&mut state).expect("shared media mount");
         assert_eq!(
             state.mount_state,
             crate::scsi_tape::state::MountState::Loaded
@@ -1954,7 +1977,7 @@ mod tests {
         assert_eq!(state.eod_position, 0);
 
         write_shared_loaded_cartridge(&serial, None).expect("write shared");
-        sync_drive_mount_from_shared(&mut state);
+        sync_drive_mount_from_shared(&mut state).expect("shared media unmount");
         assert_eq!(
             state.mount_state,
             crate::scsi_tape::state::MountState::Empty
@@ -1963,7 +1986,39 @@ mod tests {
     }
 
     #[test]
-    fn test_drive_sync_bypasses_stale_loaded_state_cache() {
+    fn test_tur_syncs_media_load_and_unload_from_shared_state() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let serial = format!("drive-tur-media-sync-{nanos}");
+        let cartridge_id = format!("VTL{nanos}");
+        let state_path = shared_media_state_path(&serial);
+        let _ = fs::remove_file(&state_path);
+
+        let mut state = crate::scsi_tape::state::TapeState::new(serial.clone());
+        drain_unit_attention(&mut state);
+        assert!(drive_opcode_requires_media_sync(0x00, &state));
+        assert!(!drive_opcode_requires_media_sync(0x01, &state));
+
+        write_shared_loaded_cartridge(&serial, Some(&cartridge_id)).expect("write shared load");
+        sync_drive_mount_from_shared(&mut state).expect("sync shared load");
+        assert_eq!(state.mount_state, crate::scsi_tape::state::MountState::Loaded);
+        assert_eq!(state.cartridge_id.as_deref(), Some(cartridge_id.as_str()));
+        assert_eq!(state.take_unit_attention(), Some((0x28, 0x00)));
+
+        write_shared_loaded_cartridge(&serial, None).expect("write shared unload");
+        sync_drive_mount_from_shared(&mut state).expect("sync shared unload");
+        assert_eq!(state.mount_state, crate::scsi_tape::state::MountState::Empty);
+        assert!(state.cartridge_id.is_none());
+        assert_eq!(state.take_unit_attention(), Some((0x28, 0x00)));
+        assert!(drive_opcode_requires_media_sync(0x00, &state));
+
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_drive_sync_reads_fresh_shared_state() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -1974,11 +2029,11 @@ mod tests {
 
         write_shared_loaded_cartridge(&serial, Some("VTL000001")).expect("write shared");
         let mut state = crate::scsi_tape::state::TapeState::new(serial.clone());
-        sync_drive_mount_from_shared(&mut state);
+        sync_drive_mount_from_shared(&mut state).expect("initial shared media mount");
         assert_eq!(state.cartridge_id.as_deref(), Some("VTL000001"));
 
         std::fs::write(&state_path, "cartridge=VTL000002\n").expect("external state update");
-        sync_drive_mount_from_shared(&mut state);
+        sync_drive_mount_from_shared(&mut state).expect("shared media switch");
         assert_eq!(state.cartridge_id.as_deref(), Some("VTL000002"));
 
         let _ = write_shared_loaded_cartridge(&serial, None);
@@ -3698,7 +3753,7 @@ mod tests {
         assert_eq!(miscompare.status, SCSI_STATUS_CHECK_CONDITION);
         assert_eq!(miscompare.sense[2] & 0x0F, 0x0E);
 
-        crate::media::mount_bridge::detach_cartridge(&mut state);
+        crate::media::mount_bridge::detach_cartridge(&mut state).expect("detach cartridge");
         let _ = write_shared_loaded_cartridge(&drive_id, None);
     }
 
@@ -3739,7 +3794,7 @@ mod tests {
         assert_eq!(attr_u64(&mut state, 0x0222), 1);
         assert_eq!(attr_u64(&mut state, 0x0223), 1);
 
-        crate::media::mount_bridge::detach_cartridge(&mut state);
+        crate::media::mount_bridge::detach_cartridge(&mut state).expect("detach cartridge");
         let after_unload = fs::read_to_string(&usage_path).expect("usage counters after unload");
         assert!(after_unload.contains("lifetime_write_ops=1"));
         assert!(after_unload.contains("lifetime_read_ops=1"));

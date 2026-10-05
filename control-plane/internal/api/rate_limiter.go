@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	rateLimitWindow     = time.Minute
-	maxRateLimitBuckets = 50000
+	rateLimitWindow      = time.Minute
+	maxRateLimitBuckets  = 4096
+	maxOverallRequests   = 300
+	maxSupportRequests   = 3
+	maxDiscoveryRequests = 30
 )
 
 type rateLimiter struct {
@@ -24,13 +27,15 @@ type rateLimiter struct {
 }
 
 type rateBucket struct {
-	windowStart time.Time
-	count       int
+	windowStart    time.Time
+	totalCount     uint16
+	supportCount   uint8
+	discoveryCount uint8
 }
 
 func newRateLimiter(trustedProxyCIDRs string) *rateLimiter {
 	return &rateLimiter{
-		buckets:          make(map[string]rateBucket),
+		buckets:          make(map[string]rateBucket, maxRateLimitBuckets),
 		trustedProxyCIDR: parseTrustedProxyCIDRs(trustedProxyCIDRs),
 	}
 }
@@ -39,83 +44,83 @@ func (l *rateLimiter) allow(clientID, path string, now time.Time) (bool, time.Du
 	if l == nil {
 		return true, 0
 	}
-	key := clientRateKey(clientID, path)
-	limit := limitForPath(path)
+	key := normalizeClientID(clientID)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.nextPrune.IsZero() || !now.Before(l.nextPrune) {
+		l.pruneLocked(now)
+		l.nextPrune = now.Add(rateLimitWindow)
+	}
+
 	bucket, exists := l.buckets[key]
-	if !exists && len(l.buckets) >= maxRateLimitBuckets {
-		if l.nextPrune.IsZero() || !now.Before(l.nextPrune) {
-			l.pruneLocked(now)
-			l.nextPrune = now.Add(rateLimitWindow)
-		}
+	if !exists {
 		if len(l.buckets) >= maxRateLimitBuckets {
-			l.evictOldestLocked()
+			return false, rateLimitWindow
 		}
+		bucket.windowStart = now
+	} else if !now.Before(bucket.windowStart) && now.Sub(bucket.windowStart) >= rateLimitWindow {
+		bucket = rateBucket{windowStart: now}
 	}
-	if bucket.windowStart.IsZero() || now.Sub(bucket.windowStart) >= rateLimitWindow {
-		l.buckets[key] = rateBucket{windowStart: now, count: 1}
-		if l.nextPrune.IsZero() || !now.Before(l.nextPrune) {
-			l.pruneLocked(now)
-			l.nextPrune = now.Add(rateLimitWindow)
+
+	if bucket.totalCount <= maxOverallRequests {
+		bucket.totalCount++
+	}
+	allowed := bucket.totalCount <= maxOverallRequests
+	switch requestClass(path) {
+	case requestClassSupport:
+		if bucket.supportCount <= maxSupportRequests {
+			bucket.supportCount++
 		}
-		return true, 0
+		allowed = allowed && bucket.supportCount <= maxSupportRequests
+	case requestClassDiscovery:
+		if bucket.discoveryCount <= maxDiscoveryRequests {
+			bucket.discoveryCount++
+		}
+		allowed = allowed && bucket.discoveryCount <= maxDiscoveryRequests
 	}
-	if bucket.count >= limit {
+	l.buckets[key] = bucket
+	if !allowed {
 		return false, rateLimitWindow - now.Sub(bucket.windowStart)
 	}
-	bucket.count++
-	l.buckets[key] = bucket
 	return true, 0
+}
+
+type rateRequestClass uint8
+
+const (
+	requestClassGeneral rateRequestClass = iota
+	requestClassSupport
+	requestClassDiscovery
+)
+
+func requestClass(path string) rateRequestClass {
+	switch path {
+	case "/v1/support/bundle":
+		return requestClassSupport
+	case "/v1/storage/disks/discovery":
+		return requestClassDiscovery
+	default:
+		return requestClassGeneral
+	}
 }
 
 func (l *rateLimiter) pruneLocked(now time.Time) {
 	for key, bucket := range l.buckets {
-		if now.Sub(bucket.windowStart) >= 2*rateLimitWindow {
+		if !now.Before(bucket.windowStart) && now.Sub(bucket.windowStart) >= 2*rateLimitWindow {
 			delete(l.buckets, key)
 		}
 	}
 }
 
-func (l *rateLimiter) evictOldestLocked() {
-	var oldestKey string
-	var oldestStart time.Time
-	for key, bucket := range l.buckets {
-		if oldestKey == "" || bucket.windowStart.Before(oldestStart) {
-			oldestKey = key
-			oldestStart = bucket.windowStart
-		}
-	}
-	if oldestKey != "" {
-		delete(l.buckets, oldestKey)
-	}
-}
-
-func clientRateKey(clientID, path string) string {
-	return normalizeClientID(clientID) + " " + path
-}
-
 func (l *rateLimiter) clientIDFromRequest(r *http.Request) string {
 	remote := normalizeClientID(r.RemoteAddr)
-	if !l.trusts(remote) {
+	client, _, err := forwardedClientIP(r, l)
+	if err != nil {
 		return remote
 	}
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			client := normalizeClientID(parts[i])
-			if client == "unknown" || l.trusts(client) {
-				continue
-			}
-			return client
-		}
-	}
-	if realIP := normalizeClientID(r.Header.Get("X-Real-IP")); realIP != "unknown" {
-		return realIP
-	}
-	return remote
+	return client
 }
 
 func (l *rateLimiter) trusts(clientID string) bool {
@@ -123,6 +128,7 @@ func (l *rateLimiter) trusts(clientID string) bool {
 	if err != nil {
 		return false
 	}
+	addr = addr.Unmap()
 	for _, prefix := range l.trustedProxyCIDR {
 		if prefix.Contains(addr) {
 			return true
@@ -140,7 +146,7 @@ func normalizeClientID(value string) string {
 		value = strings.TrimSpace(host)
 	}
 	if addr, err := netip.ParseAddr(value); err == nil {
-		return addr.String()
+		return addr.Unmap().String()
 	}
 	return "unknown"
 }
@@ -163,6 +169,7 @@ func parseTrustedProxyCIDRs(raw string) []netip.Prefix {
 			continue
 		}
 		if addr, err := netip.ParseAddr(token); err == nil {
+			addr = addr.Unmap()
 			bits := 128
 			if addr.Is4() {
 				bits = 32
@@ -179,15 +186,4 @@ func retryAfterSeconds(d time.Duration) string {
 		seconds = 1
 	}
 	return strconv.Itoa(seconds)
-}
-
-func limitForPath(path string) int {
-	switch path {
-	case "/v1/support/bundle":
-		return 3
-	case "/v1/storage/disks/discovery":
-		return 30
-	default:
-		return 300
-	}
 }

@@ -142,7 +142,10 @@ fn stable_identity_seed_separates_roles_and_preserves_verified_legacy_seed() {
         .expect("changer identity seed should be generated");
     let drive = stable_identity_seed(DeviceType::Drive, "library-a", None)
         .expect("drive identity seed should be generated");
-    assert_ne!(changer, drive, "changer and drive identity namespaces must differ");
+    assert_ne!(
+        changer, drive,
+        "changer and drive identity namespaces must differ"
+    );
 
     let legacy = stable_identity_seed(DeviceType::Drive, "drive-a", Some("legacy-serial-01"))
         .expect("verified legacy seed should be preserved");

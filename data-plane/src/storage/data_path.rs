@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,17 +19,22 @@ use super::dedup::{
     rebuild_ref_counts, sync_dedup, upsert_dedup_entry, DedupIndexEntry, DedupLookup,
     DedupUpsertResult, DEDUP_IDENTITY_BLAKE3_128,
 };
-use super::layout::{checksum32, integrity32, LayoutPaths, SegmentKind, STORAGE_LAYOUT_VERSION};
+use super::layout::{
+    checksum32, integrity32, LayoutPaths, SegmentHeader, SegmentKind, STORAGE_LAYOUT_VERSION,
+};
+use super::maintenance_progress::{no_maintenance_progress, MaintenancePhase, MaintenanceProgress};
 use super::map_lookup::{
-    append_lookup_record, locate_logical_block, persist_lookup_records,
+    append_lookup_record, load_lookup_records, locate_logical_block, persist_lookup_records,
     rebuild_lookup_from_blk_map, sync_lookup, MapLookupRecord,
 };
 use super::metadata::{
     checked_usize_from_u64, load_checkpoint_page, lock_storage_mutex, modified_nanos_from_result,
     persist_checkpoint_page, quarantine_invalid_metadata, CheckpointFlags, MetadataCheckpoint,
-    StorageError,
+    StorageError, MAX_MAINTENANCE_METADATA_RECORDS,
 };
-use super::reclaim::{refresh_reclaim_safety, upsert_reclaim_candidates, ReclaimReason};
+use super::reclaim::{
+    load_reclaim_candidates, refresh_reclaim_safety, upsert_reclaim_candidates, ReclaimReason,
+};
 use super::segment::{
     append_segment_payload_parts, read_segment_header, segment_payload_offset, sync_segment_file,
     write_segment_file,
@@ -43,7 +48,7 @@ use super::segment_index::{
 };
 
 const DATA_BLOB_HEADER_SIZE: usize = 24;
-const DATA_LOG_PREFIX: &[u8; 4] = b"DTV2";
+pub(crate) const DATA_LOG_PREFIX: &[u8; 4] = b"DTV2";
 const DEFAULT_SYNC_EVERY_WRITES: u32 = 64;
 const DEFAULT_SLOW_WRITE_STAGE_MS: u64 = 1000;
 const DEFAULT_DEDUP_COLD_LOAD_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -135,14 +140,22 @@ pub(crate) struct DataBlob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DataBlobMeta {
-    blob_id: u64,
-    codec: CompressionCodec,
-    logical_len: u32,
-    stored_len: u32,
-    payload_checksum: u32,
-    payload_offset: u64,
-    v2_integrity: bool,
+pub(crate) struct DataBlobMeta {
+    pub(crate) blob_id: u64,
+    pub(crate) codec: CompressionCodec,
+    pub(crate) logical_len: u32,
+    pub(crate) stored_len: u32,
+    pub(crate) payload_checksum: u32,
+    pub(crate) payload_offset: u64,
+    pub(crate) v2_integrity: bool,
+}
+
+pub(crate) struct SegmentBlobHeaderScan {
+    pub(crate) segment_header: SegmentHeader,
+    pub(crate) blobs: Vec<DataBlobMeta>,
+    pub(crate) next_offset: u64,
+    pub(crate) headers_scanned: u64,
+    pub(crate) complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -402,8 +415,20 @@ pub fn discard_layout_caches(paths: &LayoutPaths) {
     invalidate_segment_index_cache(&paths.segment_index_file);
 }
 
+pub fn discard_layout_caches_checked(paths: &LayoutPaths) -> Result<(), StorageError> {
+    super::segment::discard_layout_append_handles(&paths.root)?;
+    lock_storage_mutex(checkpoint_cache(), "checkpoint")?.remove(&paths.metadata_file);
+    lock_storage_mutex(pending_sync_writes(), "pending write")?.remove(&paths.metadata_file);
+    lock_storage_mutex(data_readers(), "data reader")?
+        .retain(|path, _| !path.starts_with(&paths.root));
+    lock_storage_mutex(data_cache(), "data")?.retain(|path, _| !path.starts_with(&paths.root));
+    super::dedup::discard_dedup_cache_checked(&paths.dedup_file)?;
+    super::segment_index::invalidate_segment_index_cache_checked(&paths.segment_index_file)?;
+    Ok(())
+}
+
 impl DataBlob {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         encode_data_blob_record(
             self.blob_id,
             self.codec,
@@ -413,6 +438,138 @@ impl DataBlob {
             &self.bytes,
         )
     }
+}
+
+pub(crate) fn scan_segment_blob_headers_with_progress(
+    path: &Path,
+    start_offset: Option<u64>,
+    start_headers_scanned: u64,
+    max_headers: usize,
+    progress: &mut MaintenanceProgress<'_>,
+) -> Result<SegmentBlobHeaderScan, StorageError> {
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(StorageError::Conflict(
+            "unsafe data segment file type".to_string(),
+        ));
+    }
+    let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    if opened.dev() != before.dev() || opened.ino() != before.ino() {
+        return Err(StorageError::Conflict(
+            "data segment identity changed while opening".to_string(),
+        ));
+    }
+    let file_len = opened.len();
+    let segment_header =
+        super::segment::read_segment_header_from_file(&mut file, SegmentKind::Data)?;
+    let payload_start = segment_payload_offset(&segment_header);
+    let payload_end = payload_start
+        .checked_add(segment_header.payload_len)
+        .ok_or_else(|| StorageError::Corrupt("data segment length overflow".to_string()))?;
+    if file_len != payload_end {
+        return Err(StorageError::Corrupt(
+            "data segment size mismatch".to_string(),
+        ));
+    }
+    if segment_header.payload_len == 0 {
+        return Ok(SegmentBlobHeaderScan {
+            segment_header,
+            blobs: Vec::new(),
+            next_offset: payload_end,
+            headers_scanned: 0,
+            complete: true,
+        });
+    }
+
+    let mut prefix = [0u8; 4];
+    read_exact_at(&file, &mut prefix, payload_start)?;
+    let is_log = prefix == *DATA_LOG_PREFIX;
+    let (mut offset, legacy_count) = if is_log {
+        (payload_start + DATA_LOG_PREFIX.len() as u64, None)
+    } else {
+        if segment_header.payload_len < 8 {
+            return Err(StorageError::Corrupt("data payload too short".to_string()));
+        }
+        let mut count_buf = [0u8; 8];
+        read_exact_at(&file, &mut count_buf, payload_start)?;
+        let count = u64::from_le_bytes(count_buf);
+        let max_possible_count = (segment_header.payload_len - 8) / DATA_BLOB_HEADER_SIZE as u64;
+        if count > max_possible_count {
+            return Err(StorageError::Corrupt(
+                "legacy data blob count exceeds segment payload".to_string(),
+            ));
+        }
+        (payload_start + 8, Some(count))
+    };
+    if let Some(cursor_offset) = start_offset {
+        if cursor_offset < offset || cursor_offset > payload_end {
+            return Err(StorageError::Conflict(
+                "reclaim scan cursor is outside the segment".to_string(),
+            ));
+        }
+        offset = cursor_offset;
+    } else if start_headers_scanned != 0 {
+        return Err(StorageError::Conflict(
+            "reclaim scan cursor header count is invalid".to_string(),
+        ));
+    }
+    if legacy_count.is_some_and(|count| start_headers_scanned > count) {
+        return Err(StorageError::Conflict(
+            "legacy scan cursor header count exceeds segment".to_string(),
+        ));
+    }
+    let initial_offset = offset;
+    let mut blobs = Vec::with_capacity(max_headers.min(4096));
+    let mut batch_scanned = 0u64;
+    while offset < payload_end && batch_scanned < max_headers as u64 {
+        if legacy_count.is_some_and(|count| start_headers_scanned + batch_scanned >= count) {
+            break;
+        }
+        let mut header_buf = [0u8; DATA_BLOB_HEADER_SIZE];
+        read_exact_at(&file, &mut header_buf, offset)?;
+        let mut meta = decode_blob_meta_from_header(&header_buf)?;
+        let next_offset = checked_blob_next_offset(offset, meta.stored_len, payload_end)?;
+        meta.payload_offset = offset + DATA_BLOB_HEADER_SIZE as u64;
+        meta.v2_integrity = segment_header.version == STORAGE_LAYOUT_VERSION;
+        blobs.push(meta);
+        progress(MaintenancePhase::Scan, DATA_BLOB_HEADER_SIZE as u64, 1)?;
+        offset = next_offset;
+        batch_scanned = batch_scanned.saturating_add(1);
+    }
+    let complete = match legacy_count {
+        Some(count) => start_headers_scanned.saturating_add(batch_scanned) >= count,
+        None => offset == payload_end,
+    };
+    if offset == initial_offset && !complete && max_headers > 0 {
+        return Err(StorageError::Corrupt(
+            "data blob scan made no progress".to_string(),
+        ));
+    }
+    Ok(SegmentBlobHeaderScan {
+        segment_header,
+        blobs,
+        next_offset: offset,
+        headers_scanned: batch_scanned,
+        complete,
+    })
+}
+
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> Result<(), StorageError> {
+    while !bytes.is_empty() {
+        let read = file.read_at(bytes, offset)?;
+        if read == 0 {
+            return Err(StorageError::Io(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "short read from data segment",
+            )));
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| StorageError::Corrupt("data read offset overflow".to_string()))?;
+        bytes = &mut bytes[read..];
+    }
+    Ok(())
 }
 
 fn encode_data_blob_record(
@@ -434,7 +591,7 @@ fn encode_data_blob_record(
     out
 }
 
-fn encode_data_blob_header(
+pub(crate) fn encode_data_blob_header(
     blob_id: u64,
     codec: CompressionCodec,
     logical_len: u32,
@@ -985,6 +1142,26 @@ pub fn run_unmap(
 }
 
 pub fn recover_dirty_state(paths: &LayoutPaths) -> Result<RecoveryReport, StorageError> {
+    let mut progress = no_maintenance_progress;
+    recover_dirty_state_with_progress(paths, &mut progress)
+}
+
+pub(crate) fn recover_dirty_state_with_progress(
+    paths: &LayoutPaths,
+    progress: &mut MaintenanceProgress<'_>,
+) -> Result<RecoveryReport, StorageError> {
+    let filemarks_path = paths.root.join("filemarks.state");
+    let usage_path = paths.root.join("usage.counters");
+    super::metadata::preflight_maintenance_metadata(&[
+        &paths.metadata_file,
+        &paths.blk_map_file,
+        &paths.lookup_file,
+        &paths.reclaim_file,
+        &paths.dedup_file,
+        &paths.segment_index_file,
+        &filemarks_path,
+        &usage_path,
+    ])?;
     let mut checkpoint = match load_checkpoint_cached(&paths.metadata_file) {
         Ok(checkpoint) => checkpoint,
         Err(StorageError::Corrupt(err)) => {
@@ -1004,6 +1181,11 @@ pub fn recover_dirty_state(paths: &LayoutPaths) -> Result<RecoveryReport, Storag
             checkpoint_epoch: checkpoint.epoch,
         });
     }
+
+    preflight_dirty_metadata_records(paths)?;
+    validate_active_blob_references_for_recovery(paths, progress)?;
+
+    cleanup_known_layout_temporary_files(paths)?;
 
     let rebuilt_lookup_entries =
         rebuild_lookup_from_blk_map(&paths.blk_map_file, &paths.lookup_file)?;
@@ -1025,6 +1207,299 @@ pub fn recover_dirty_state(paths: &LayoutPaths) -> Result<RecoveryReport, Storag
     })
 }
 
+fn preflight_dirty_metadata_records(paths: &LayoutPaths) -> Result<(), StorageError> {
+    let _ = load_segment_index(&paths.segment_index_file)?;
+    let _ = load_blk_map_records(&paths.blk_map_file)?;
+    let _ = load_lookup_records(&paths.lookup_file)?;
+    let _ = load_reclaim_candidates(&paths.reclaim_file)?;
+    let _ = load_dedup_index(&paths.dedup_file)?;
+    preflight_filemarks_record_limit(&paths.root)?;
+    Ok(())
+}
+
+fn preflight_filemarks_record_limit(root: &Path) -> Result<(), StorageError> {
+    let path = root.join("filemarks.state");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(StorageError::Io(err)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StorageError::Conflict(
+            "unsafe maintenance metadata file".to_string(),
+        ));
+    }
+    if metadata.len() < 8 {
+        return Err(StorageError::Corrupt(
+            "filemarks state too short".to_string(),
+        ));
+    }
+    let mut file = File::open(&path)?;
+    let opened = file.metadata()?;
+    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(StorageError::Conflict(
+            "filemarks state identity changed while opening".to_string(),
+        ));
+    }
+    let mut count_buf = [0u8; 8];
+    file.read_exact(&mut count_buf)?;
+    let count = checked_usize_from_u64(u64::from_le_bytes(count_buf), "filemarks count")?;
+    if count > MAX_MAINTENANCE_METADATA_RECORDS {
+        return Err(StorageError::MetadataBudgetExceeded);
+    }
+    let expected_len = 8u64
+        .checked_add((count as u64).saturating_mul(8))
+        .ok_or(StorageError::MetadataBudgetExceeded)?;
+    if metadata.len() != expected_len {
+        return Err(StorageError::Corrupt(
+            "filemarks state length mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_blob_references_for_recovery(
+    paths: &LayoutPaths,
+    progress: &mut MaintenanceProgress<'_>,
+) -> Result<(), StorageError> {
+    const MAX_HEADERS: usize = 65_536;
+    let (_, records) = load_blk_map_records(&paths.blk_map_file)?;
+    let mut active_by_segment = HashMap::<u32, HashMap<u64, Vec<BlkMapRecord>>>::new();
+    for record in records
+        .into_iter()
+        .filter(|record| record.state == BlkMapState::Active)
+    {
+        let raw_segment = u32::try_from(record.physical_segment_id).map_err(|_| {
+            StorageError::Corrupt("active physical segment ID exceeds u32".to_string())
+        })?;
+        let segment = resolve_active_segment_seq(paths, raw_segment)?;
+        active_by_segment
+            .entry(segment)
+            .or_default()
+            .entry(record.physical_offset)
+            .or_default()
+            .push(record);
+    }
+
+    let mut headers_scanned = 0usize;
+    for (segment_seq, active) in active_by_segment {
+        if headers_scanned >= MAX_HEADERS {
+            return Err(StorageError::MetadataBudgetExceeded);
+        }
+        let segment_path = active_segment_path(paths, segment_seq);
+        let scan = scan_segment_blob_headers_with_progress(
+            &segment_path,
+            None,
+            0,
+            MAX_HEADERS - headers_scanned,
+            progress,
+        )?;
+        headers_scanned = headers_scanned.saturating_add(scan.blobs.len());
+        if !scan.complete {
+            return Err(StorageError::MetadataBudgetExceeded);
+        }
+        let mut found = HashSet::new();
+        for meta in &scan.blobs {
+            let Some(records) = active.get(&meta.blob_id) else {
+                continue;
+            };
+            for record in records {
+                if record.logical_len != meta.logical_len
+                    || record.compression != meta.codec
+                    || record.compressed_len != meta.stored_len
+                {
+                    return Err(StorageError::Corrupt(
+                        "active map and data blob metadata disagree".to_string(),
+                    ));
+                }
+            }
+            validate_active_blob_payload(&segment_path, meta, records, progress)?;
+            found.insert(meta.blob_id);
+        }
+        if found.len() != active.len() {
+            return Err(StorageError::Corrupt(
+                "active block map references a missing data blob".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_active_segment_seq(paths: &LayoutPaths, segment_id: u32) -> Result<u32, StorageError> {
+    let exact = data_segment_path(paths, segment_id);
+    if exact.is_file() {
+        return Ok(segment_id);
+    }
+    if segment_id == 1 && data_segment_path(paths, 0).is_file() {
+        return Ok(0);
+    }
+    if segment_id == 0 && paths.data_file.is_file() {
+        return Ok(0);
+    }
+    Err(StorageError::Corrupt(
+        "active block map references a missing data segment".to_string(),
+    ))
+}
+
+fn active_segment_path(paths: &LayoutPaths, segment_seq: u32) -> PathBuf {
+    let path = data_segment_path(paths, segment_seq);
+    if segment_seq == 0 && !path.exists() && paths.data_file.exists() {
+        paths.data_file.clone()
+    } else {
+        path
+    }
+}
+
+fn validate_active_blob_payload(
+    path: &Path,
+    meta: &DataBlobMeta,
+    records: &[BlkMapRecord],
+    progress: &mut MaintenanceProgress<'_>,
+) -> Result<(), StorageError> {
+    if meta.codec != CompressionCodec::None {
+        if u64::from(meta.stored_len) > 16 * 1024 * 1024 {
+            return Err(StorageError::Corrupt(
+                "compressed active blob exceeds decode limit".to_string(),
+            ));
+        }
+        let blob = load_blob_by_id(path, meta.blob_id)?;
+        let logical_len =
+            checked_usize_from_u64(u64::from(meta.logical_len), "logical payload length")?;
+        let payload = decompress_payload(blob.codec, &blob.bytes, logical_len)?;
+        progress(
+            MaintenancePhase::Verify,
+            u64::from(meta.stored_len),
+            records.len() as u64,
+        )?;
+        for record in records {
+            verify_logical_payload_checksum(
+                record.payload_checksum_algorithm,
+                record.payload_checksum,
+                &payload,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if meta.stored_len != meta.logical_len {
+        return Err(StorageError::Corrupt(
+            "raw active blob length mismatch".to_string(),
+        ));
+    }
+    let file = File::open(path)?;
+    let mut remaining = u64::from(meta.stored_len);
+    let mut offset = meta.payload_offset;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut blob_crc = super::segment::integrity32_continue(0, &meta.blob_id.to_le_bytes());
+    blob_crc = super::segment::integrity32_continue(blob_crc, &meta.logical_len.to_le_bytes());
+    let mut fnv = 0x811C9DC5u32;
+    let mut crc = 0u32;
+    while remaining > 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| StorageError::Corrupt("raw payload length overflow".to_string()))?;
+        read_exact_at(&file, &mut buffer[..requested], offset)?;
+        let chunk = &buffer[..requested];
+        blob_crc = super::segment::integrity32_continue(blob_crc, chunk);
+        fnv = super::segment::checksum32_continue(fnv, chunk);
+        crc = super::segment::integrity32_continue(crc, chunk);
+        offset = offset
+            .checked_add(requested as u64)
+            .ok_or_else(|| StorageError::Corrupt("raw payload offset overflow".to_string()))?;
+        remaining = remaining.saturating_sub(requested as u64);
+        progress(MaintenancePhase::Verify, requested as u64, 0)?;
+    }
+    if meta.v2_integrity && blob_crc != meta.payload_checksum {
+        return Err(StorageError::Corrupt(
+            "data blob integrity checksum mismatch".to_string(),
+        ));
+    }
+    for record in records {
+        let matches = match record.payload_checksum_algorithm {
+            PayloadChecksumAlgorithm::None => true,
+            PayloadChecksumAlgorithm::Fnv1a32 => fnv == record.payload_checksum,
+            PayloadChecksumAlgorithm::Crc32c => crc == record.payload_checksum,
+        };
+        if !matches {
+            return Err(StorageError::Corrupt(
+                "payload checksum mismatch during recovery".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_known_layout_temporary_files(paths: &LayoutPaths) -> Result<(), StorageError> {
+    let fixed_temps = [
+        "metadata.tmp",
+        "blk_map.tmp",
+        "lookup.tmp",
+        "reclaim.tmp",
+        "dedup.tmp",
+        "segment_index.tmp",
+        "filemarks.tmp",
+        "usage.counters.tmp",
+    ];
+    let mut removed = false;
+    for name in fixed_temps {
+        let path = paths.root.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(path)?;
+                removed = true;
+            }
+            Ok(_) => {
+                return Err(StorageError::Conflict(
+                    "unsafe temporary artifact in cartridge layout".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(StorageError::Io(err)),
+        }
+    }
+    for entry in fs::read_dir(&paths.root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_stage = is_reclaim_stage_name(&name);
+        let is_data_tmp = is_data_segment_tmp_name(&name);
+        if !is_stage && !is_data_tmp {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StorageError::Conflict(
+                "unsafe temporary artifact in cartridge layout".to_string(),
+            ));
+        }
+        fs::remove_file(entry.path())?;
+        removed = true;
+    }
+    if removed {
+        File::open(&paths.root)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn is_reclaim_stage_name(name: &str) -> bool {
+    let Some(sequence) = name
+        .strip_prefix("data_")
+        .and_then(|value| value.strip_suffix(".reclaim-stage.seg"))
+    else {
+        return false;
+    };
+    sequence.len() == 6 && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_data_segment_tmp_name(name: &str) -> bool {
+    let Some(sequence) = name
+        .strip_prefix("data_")
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    sequence.len() == 6 && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn rebuild_segment_index_from_blk_map(paths: &LayoutPaths) -> Result<(), StorageError> {
     let max_segment_size = load_segment_index(&paths.segment_index_file)
         .map(|index| index.max_segment_size)
@@ -1040,7 +1515,7 @@ fn rebuild_segment_index_from_blk_map(paths: &LayoutPaths) -> Result<(), Storage
         .collect::<Result<_, _>>()?;
     let highest_existing_segment = highest_indexed_data_segment(paths)?;
 
-    let index = if referenced_segments.is_empty() {
+    let mut index = if referenced_segments.is_empty() {
         let active_path = data_segment_path(paths, 0);
         write_segment_file(&active_path, SegmentKind::Data, 1, 0, &[])?;
         invalidate_data_segment_cache(&active_path);
@@ -1088,6 +1563,19 @@ fn rebuild_segment_index_from_blk_map(paths: &LayoutPaths) -> Result<(), Storage
             next_segment_seq,
         }
     };
+
+    let blob_high_water = records
+        .iter()
+        .map(|record| record.physical_offset)
+        .max()
+        .unwrap_or(0);
+    if let Some(active) = index
+        .descriptors
+        .iter_mut()
+        .find(|descriptor| descriptor.state == SegmentState::Active)
+    {
+        active.last_blob_id = active.last_blob_id.max(blob_high_water);
+    }
 
     persist_segment_index(&paths.segment_index_file, &index)?;
     store_segment_index_clean(&paths.segment_index_file, index)?;
@@ -1177,7 +1665,7 @@ pub(crate) fn append_data_blob(
         prepare_active_segment_for_append(paths, &mut index, record_len, DATA_LOG_PREFIX.len())?;
     let path = data_segment_path(paths, segment_seq);
     ensure_data_cache_fresh(&path)?;
-    let blob_id = next_blob_id(&index);
+    let blob_id = next_blob_id(&index)?;
     let rewrite_legacy = {
         let guard = lock_storage_mutex(data_cache(), "data")?;
         let entry = guard
@@ -1334,14 +1822,16 @@ fn load_blob_by_id(path: &Path, blob_id: u64) -> Result<DataBlob, StorageError> 
     })
 }
 
-fn next_blob_id(index: &super::segment_index::SegmentIndex) -> u64 {
-    index
+fn next_blob_id(index: &super::segment_index::SegmentIndex) -> Result<u64, StorageError> {
+    let max_id = index
         .descriptors
         .iter()
         .map(|descriptor| descriptor.last_blob_id)
         .max()
-        .unwrap_or(0)
-        .saturating_add(1)
+        .unwrap_or(0);
+    max_id
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Conflict("data blob ID space is exhausted".to_string()))
 }
 
 pub(crate) fn load_blob_by_location(
@@ -1572,7 +2062,7 @@ fn checked_blob_next_offset(
     Ok(next_offset)
 }
 
-fn decode_blob_meta_from_header(
+pub(crate) fn decode_blob_meta_from_header(
     buf: &[u8; DATA_BLOB_HEADER_SIZE],
 ) -> Result<DataBlobMeta, StorageError> {
     let blob_id = u64::from_le_bytes(
@@ -1789,7 +2279,10 @@ mod tests {
         .expect("write fixture data");
 
         let (_, mut records) = load_blk_map_records(&paths.blk_map_file).expect("load new record");
-        assert_eq!(records[0].payload_checksum_algorithm, PayloadChecksumAlgorithm::Crc32c);
+        assert_eq!(
+            records[0].payload_checksum_algorithm,
+            PayloadChecksumAlgorithm::Crc32c
+        );
         assert_eq!(records[0].payload_checksum, integrity32(payload));
         let mut legacy = records.pop().expect("one block-map record");
         legacy.payload_checksum = checksum32(payload);

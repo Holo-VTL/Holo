@@ -44,8 +44,8 @@ func TestClientIDFromRequestUsesForwardedHeadersOnlyFromTrustedProxy(t *testing.
 
 	req.Header.Del("X-Forwarded-For")
 	req.Header.Set("X-Real-IP", "198.51.100.9")
-	if got := limiter.clientIDFromRequest(req); got != "198.51.100.9" {
-		t.Fatalf("expected X-Real-IP client IP, got %q", got)
+	if got := limiter.clientIDFromRequest(req); got != "192.0.2.10" {
+		t.Fatalf("X-Real-IP is not trusted; expected proxy RemoteAddr, got %q", got)
 	}
 
 	untrusted := newRateLimiter("")
@@ -180,24 +180,24 @@ func TestRateLimitMiddlewareIgnoresSpoofedForwardedForFromUntrustedClient(t *tes
 func TestRateLimiterPruneIsTimeGated(t *testing.T) {
 	limiter := newRateLimiter("")
 	now := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
-	limiter.buckets["stale /v1/a"] = rateBucket{windowStart: now.Add(-3 * rateLimitWindow), count: 1}
-	limiter.buckets["fresh /v1/a"] = rateBucket{windowStart: now, count: 1}
+	limiter.buckets["198.51.100.1"] = rateBucket{windowStart: now.Add(-3 * rateLimitWindow), totalCount: 1}
+	limiter.buckets["198.51.100.2"] = rateBucket{windowStart: now, totalCount: 1}
 
 	allowed, _ := limiter.allow("client-a", "/v1/a", now.Add(rateLimitWindow))
 	if !allowed {
 		t.Fatal("expected request to be allowed")
 	}
-	if _, ok := limiter.buckets["stale /v1/a"]; ok {
+	if _, ok := limiter.buckets["198.51.100.1"]; ok {
 		t.Fatal("expected stale bucket to be pruned")
 	}
 	firstNextPrune := limiter.nextPrune
 
-	limiter.buckets["stale2 /v1/a"] = rateBucket{windowStart: now.Add(-3 * rateLimitWindow), count: 1}
+	limiter.buckets["198.51.100.3"] = rateBucket{windowStart: now.Add(-3 * rateLimitWindow), totalCount: 1}
 	allowed, _ = limiter.allow("client-b", "/v1/a", now.Add(rateLimitWindow+time.Second))
 	if !allowed {
 		t.Fatal("expected second request to be allowed")
 	}
-	if _, ok := limiter.buckets["stale2 /v1/a"]; !ok {
+	if _, ok := limiter.buckets["198.51.100.3"]; !ok {
 		t.Fatal("expected second stale bucket to remain until next prune interval")
 	}
 	if !limiter.nextPrune.Equal(firstNextPrune) {
@@ -205,25 +205,67 @@ func TestRateLimiterPruneIsTimeGated(t *testing.T) {
 	}
 }
 
-func TestRateLimiterEvictsOldestBucketWhenFull(t *testing.T) {
+func TestRateLimiterRejectsNewClientWhenFullWithoutEviction(t *testing.T) {
 	limiter := newRateLimiter("")
 	now := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < maxRateLimitBuckets; i++ {
-		limiter.buckets["2001:db8::"+strconv.FormatInt(int64(i+1), 16)+" /v1/a"] = rateBucket{windowStart: now, count: 1}
+		limiter.buckets["2001:db8::"+strconv.FormatInt(int64(i+1), 16)] = rateBucket{windowStart: now, totalCount: 1}
 	}
-	limiter.buckets["2001:db8::1 /v1/a"] = rateBucket{windowStart: now.Add(-rateLimitWindow), count: 1}
+	limiter.nextPrune = now.Add(rateLimitWindow)
 
 	allowed, retryAfter := limiter.allow("2001:db8::ffff", "/v1/a", now)
-	if !allowed {
-		t.Fatalf("expected new bucket to be allowed after oldest eviction, retryAfter=%s", retryAfter)
+	if allowed {
+		t.Fatal("expected a new client to be rejected while all client slots are occupied")
 	}
 	if len(limiter.buckets) != maxRateLimitBuckets {
 		t.Fatalf("expected bucket map to remain capped at %d, got %d", maxRateLimitBuckets, len(limiter.buckets))
 	}
-	if _, ok := limiter.buckets["2001:db8::1 /v1/a"]; ok {
-		t.Fatal("expected oldest bucket to be evicted")
+	if _, ok := limiter.buckets["2001:db8::1"]; !ok {
+		t.Fatal("existing client bucket must not be evicted")
 	}
-	if _, ok := limiter.buckets["2001:db8::ffff /v1/a"]; !ok {
-		t.Fatal("expected new client bucket to be inserted")
+	if retryAfter <= 0 {
+		t.Fatal("full client table must include a positive retry interval")
+	}
+}
+
+func TestRateLimiterUsesOneEntryPerIPAndCapsAllRequestClasses(t *testing.T) {
+	limiter := newRateLimiter("")
+	now := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 10_000; i++ {
+		limiter.allow("203.0.113.8:1234", "/v1/variable/"+strconv.Itoa(i), now)
+	}
+	if len(limiter.buckets) != 1 {
+		t.Fatalf("10,000 path variants allocated %d limiter entries", len(limiter.buckets))
+	}
+	if maxRateLimitBuckets != 4096 {
+		t.Fatalf("expected a fixed client capacity of 4096, got %d", maxRateLimitBuckets)
+	}
+
+	support := newRateLimiter("")
+	for i := 0; i < 3; i++ {
+		if allowed, _ := support.allow("203.0.113.9", "/v1/support/bundle", now); !allowed {
+			t.Fatalf("support request %d should be allowed", i+1)
+		}
+	}
+	if allowed, _ := support.allow("203.0.113.9", "/v1/support/bundle", now); allowed {
+		t.Fatal("support bundle cap should be three per minute")
+	}
+	for i := 4; i < 300; i++ {
+		if allowed, _ := support.allow("203.0.113.9", "/v1/ordinary", now); !allowed {
+			t.Fatalf("overall request %d should remain allowed", i)
+		}
+	}
+	if allowed, _ := support.allow("203.0.113.9", "/v1/ordinary", now); allowed {
+		t.Fatal("overall cap should be 300 per minute")
+	}
+
+	discovery := newRateLimiter("")
+	for i := 0; i < 30; i++ {
+		if allowed, _ := discovery.allow("203.0.113.10", "/v1/storage/disks/discovery", now); !allowed {
+			t.Fatalf("discovery request %d should be allowed", i+1)
+		}
+	}
+	if allowed, _ := discovery.allow("203.0.113.10", "/v1/storage/disks/discovery", now); allowed {
+		t.Fatal("disk discovery cap should be thirty per minute")
 	}
 }

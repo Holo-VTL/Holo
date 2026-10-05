@@ -49,10 +49,23 @@ func (h *ResourcesHandler) deleteLibraryCascade(ctx context.Context, libraryID s
 		if cartridge == nil || cartridge.LibraryID != libraryID {
 			continue
 		}
+		if err := h.validateCartridgeIdentity(ctx, cartridge); err != nil {
+			return err
+		}
 		if poolID := strings.TrimSpace(cartridge.PoolID); poolID != "" {
 			deletedPoolIDs = append(deletedPoolIDs, poolID)
 		}
-		if err := removeCartridgeLayoutArtifacts(cartridge); err != nil {
+		if err := func() error {
+			storageLease, err := acquireCartridgeMutationLeases(cartridge)
+			if err != nil {
+				return err
+			}
+			defer storageLease.Release()
+			if err := storageLease.VerifyPoolRoot(); err != nil {
+				return err
+			}
+			return removeCartridgeLayoutArtifacts(cartridge)
+		}(); err != nil {
 			return err
 		}
 		if err := h.repo.DeleteCartridge(ctx, cartridge.CartridgeID); err != nil {

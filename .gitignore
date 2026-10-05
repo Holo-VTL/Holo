@@ -15,6 +15,12 @@ dist/
 web-console/vite.config.js
 web-console/vite.config.d.ts
 
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
 # go
 bin/
 !data-plane/src/bin/

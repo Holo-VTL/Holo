@@ -3,6 +3,7 @@ use crate::scsi_tape::error::TapeError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SenseContext {
     NotReady,
+    RecoveryRequired,
     IllegalRequest,
     BlankCheckEod,
     VolumeOverflow,
@@ -30,6 +31,15 @@ pub fn sense_for_context(context: SenseContext) -> SenseFrame {
             status: 0x02,
             sense_key: 0x02,
             asc: 0x3A,
+            ascq: 0x00,
+            end_of_medium: false,
+            information_valid: false,
+            information: 0,
+        },
+        SenseContext::RecoveryRequired => SenseFrame {
+            status: 0x02,
+            sense_key: 0x02,
+            asc: 0x04,
             ascq: 0x00,
             end_of_medium: false,
             information_valid: false,
@@ -123,7 +133,28 @@ pub fn resolve_sense_for_error(error: &TapeError) -> SenseFrame {
         }
         TapeError::InvalidReservationKey(_) => sense_for_context(SenseContext::IllegalRequest),
         TapeError::NotReady(_) => sense_for_context(SenseContext::NotReady),
+        TapeError::RecoveryRequired => sense_for_context(SenseContext::RecoveryRequired),
         TapeError::VolumeOverflow => sense_for_context(SenseContext::VolumeOverflow),
+        TapeError::PhysicalWriteAdmission {
+            requested_units, ..
+        } => SenseFrame {
+            status: 0x02,
+            sense_key: 0x03,
+            asc: 0x0C,
+            ascq: 0x00,
+            end_of_medium: false,
+            information_valid: true,
+            information: *requested_units,
+        },
+        TapeError::PhysicalFilemarkAdmission(_) => SenseFrame {
+            status: 0x02,
+            sense_key: 0x03,
+            asc: 0x0C,
+            ascq: 0x00,
+            end_of_medium: false,
+            information_valid: false,
+            information: 0,
+        },
         TapeError::UnsupportedVpdPage(_)
         | TapeError::UnsupportedModePage(_)
         | TapeError::UnsupportedLogPage(_)
@@ -134,6 +165,18 @@ pub fn resolve_sense_for_error(error: &TapeError) -> SenseFrame {
         | TapeError::InvalidTransition
         | TapeError::RetentionBlocked
         | TapeError::Unsupported(_) => sense_for_context(SenseContext::IllegalRequest),
+        TapeError::Storage(
+            crate::storage::StorageError::SpaceExhausted(_)
+            | crate::storage::StorageError::SpaceAdmission(_),
+        ) => SenseFrame {
+            status: 0x02,
+            sense_key: 0x03,
+            asc: 0x0C,
+            ascq: 0x00,
+            end_of_medium: false,
+            information_valid: false,
+            information: 0,
+        },
         TapeError::Storage(_) => sense_for_context(SenseContext::MediumError),
         TapeError::NotFound(_) => sense_for_context(SenseContext::BlankCheckEod),
     }

@@ -6,10 +6,11 @@ use std::sync::{Mutex, OnceLock};
 use super::blk_map::{load_blk_map_records, BlkMapState};
 use super::layout::SegmentKind;
 use super::metadata::{
-    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+    checked_metadata_record_count, checked_usize_from_u64, lock_storage_mutex,
+    modified_nanos_from_result, StorageError, MAX_MAINTENANCE_METADATA_BYTES,
 };
 use super::segment::{
-    append_segment_payload, read_segment_file, sync_segment_file, write_segment_file,
+    append_segment_payload, read_segment_file_bounded, sync_segment_file, write_segment_file,
 };
 
 const RECORD_SIZE: usize = 40;
@@ -142,7 +143,8 @@ fn ensure_cache_fresh(path: &Path) -> Result<(), StorageError> {
         }
     }
 
-    let (header, payload) = read_segment_file(path, SegmentKind::Lookup)?;
+    let (header, payload) =
+        read_segment_file_bounded(path, SegmentKind::Lookup, MAX_MAINTENANCE_METADATA_BYTES)?;
     let records = decode_payload(&payload)?;
     lock_storage_mutex(cache(), "lookup")?.insert(
         path.to_path_buf(),
@@ -169,6 +171,11 @@ pub fn append_lookup_record(
             .get(path)
             .ok_or_else(|| StorageError::NotFound("lookup cache not initialized".to_string()))?;
         if record.lookup_id == 0 {
+            if entry.next_lookup_id == u64::MAX {
+                return Err(StorageError::Conflict(
+                    "lookup ID space is exhausted".to_string(),
+                ));
+            }
             record.lookup_id = entry.next_lookup_id;
         }
     }
@@ -203,7 +210,12 @@ pub fn append_lookup_record(
         .get_mut(path)
         .ok_or_else(|| StorageError::NotFound("lookup cache not initialized".to_string()))?;
     entry.sequence = header.sequence;
-    entry.next_lookup_id = entry.next_lookup_id.max(record.lookup_id.saturating_add(1));
+    entry.next_lookup_id = entry.next_lookup_id.max(
+        record
+            .lookup_id
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Conflict("lookup ID space is exhausted".to_string()))?,
+    );
     if entry
         .records
         .last()
@@ -312,6 +324,7 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<MapLookupRecord>, Storage
             .map_err(|_| StorageError::Corrupt("lookup count parse failed".to_string()))?,
     );
     let count = checked_usize_from_u64(raw_count, "lookup count")?;
+    let count = checked_metadata_record_count(count)?;
     if payload.len().saturating_sub(8) / RECORD_SIZE < count {
         return Err(StorageError::Corrupt(
             "lookup payload truncated".to_string(),
@@ -340,6 +353,12 @@ fn decode_log_payload(payload: &[u8]) -> Result<Vec<MapLookupRecord>, StorageErr
         ));
     }
     let mut offset = LOG_PREFIX.len();
+    if !(payload.len() - LOG_PREFIX.len()).is_multiple_of(RECORD_SIZE) {
+        return Err(StorageError::Corrupt(
+            "lookup log payload length mismatch".to_string(),
+        ));
+    }
+    checked_metadata_record_count((payload.len() - LOG_PREFIX.len()) / RECORD_SIZE)?;
     let mut latest = HashMap::<u64, MapLookupRecord>::new();
     while offset < payload.len() {
         if payload.len() < offset + RECORD_SIZE {
@@ -390,7 +409,8 @@ fn next_lookup_id(records: &[MapLookupRecord]) -> u64 {
         .map(|record| record.lookup_id)
         .max()
         .unwrap_or(0)
-        .saturating_add(1)
+        .checked_add(1)
+        .unwrap_or(u64::MAX)
 }
 
 pub fn sync_lookup(path: &Path) -> Result<(), StorageError> {

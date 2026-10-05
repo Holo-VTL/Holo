@@ -24,7 +24,17 @@ func (r *CoreResourcesRepo) CreateLibrary(ctx context.Context, library *domain.V
 	if library == nil {
 		return domain.ErrInvalidInput
 	}
-	_, err := r.db.ExecContext(ctx, `
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if conflict, err := libraryProjectionConflict(ctx, tx, library, ""); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO virtual_libraries (
   library_id, name, status, vendor, library_type, drive_type, drive_count,
   drive_start_address, slot_count, slot_start_address, ie_port_count,
@@ -51,14 +61,27 @@ INSERT INTO virtual_libraries (
 	if isSQLiteConstraint(err) {
 		return domain.ErrConflict
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *CoreResourcesRepo) SaveLibrary(ctx context.Context, library *domain.VirtualLibrary) error {
 	if library == nil {
 		return domain.ErrInvalidInput
 	}
-	_, err := r.db.ExecContext(ctx, `
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if conflict, err := libraryProjectionConflict(ctx, tx, library, library.LibraryID); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO virtual_libraries (
   library_id, name, status, vendor, library_type, drive_type, drive_count,
   drive_start_address, slot_count, slot_start_address, ie_port_count,
@@ -99,14 +122,30 @@ ON CONFLICT(library_id) DO UPDATE SET
 		formatTime(library.CreatedAt),
 		formatTime(library.UpdatedAt),
 	)
-	return err
+	if isSQLiteConstraint(err) {
+		return domain.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *CoreResourcesRepo) CreateDrive(ctx context.Context, drive *domain.VirtualDrive) error {
 	if drive == nil {
 		return domain.ErrInvalidInput
 	}
-	_, err := r.db.ExecContext(ctx, `
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if conflict, err := driveProjectionConflict(ctx, tx, drive, ""); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO virtual_drives (
   drive_id, library_id, slot, iqn, mount_state, mounted_cartridge_id, created_at, updated_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -122,14 +161,27 @@ INSERT INTO virtual_drives (
 	if isSQLiteConstraint(err) {
 		return domain.ErrConflict
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *CoreResourcesRepo) SaveDrive(ctx context.Context, drive *domain.VirtualDrive) error {
 	if drive == nil {
 		return domain.ErrInvalidInput
 	}
-	_, err := r.db.ExecContext(ctx, `
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if conflict, err := driveProjectionConflict(ctx, tx, drive, drive.DriveID); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO virtual_drives (
   drive_id, library_id, slot, iqn, mount_state, mounted_cartridge_id, created_at, updated_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -150,22 +202,38 @@ ON CONFLICT(drive_id) DO UPDATE SET
 		formatTime(drive.CreatedAt),
 		formatTime(drive.UpdatedAt),
 	)
-	return err
+	if isSQLiteConstraint(err) {
+		return domain.ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *CoreResourcesRepo) CreateCartridge(ctx context.Context, cartridge *domain.VirtualCartridge) error {
 	if cartridge == nil {
 		return domain.ErrInvalidInput
 	}
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	barcodeKey := normalizeBarcodeKey(cartridge.Barcode)
-	destroyed, err := r.isBarcodeDestroyed(ctx, barcodeKey)
+	destroyed, err := barcodeDestroyed(ctx, tx, barcodeKey)
 	if err != nil {
 		return err
 	}
 	if destroyed {
 		return domain.ErrConflict
 	}
-	_, err = r.db.ExecContext(ctx, `
+	if conflict, err := cartridgeProjectionConflict(ctx, tx, cartridge, ""); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO virtual_cartridges (
   cartridge_id, pool_id, library_id, barcode, barcode_key, capacity_bytes, used_bytes,
   lifecycle_state, retention_state, assigned_slot_address, created_at, updated_at
@@ -186,32 +254,45 @@ INSERT INTO virtual_cartridges (
 	if isSQLiteConstraint(err) {
 		return domain.ErrConflict
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *CoreResourcesRepo) SaveCartridge(ctx context.Context, cartridge *domain.VirtualCartridge) error {
 	if cartridge == nil {
 		return domain.ErrInvalidInput
 	}
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	barcodeKey := normalizeBarcodeKey(cartridge.Barcode)
-	destroyed, err := r.isBarcodeDestroyed(ctx, barcodeKey)
+	destroyed, err := barcodeDestroyed(ctx, tx, barcodeKey)
 	if err != nil {
 		return err
 	}
 	if destroyed {
 		return domain.ErrConflict
 	}
+	if conflict, err := cartridgeProjectionConflict(ctx, tx, cartridge, cartridge.CartridgeID); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
 	// barcode_key is still protected by a UNIQUE constraint; this precheck only
 	// returns a predictable domain error before the DB constraint catches it.
 	var existingID string
-	err = r.db.QueryRowContext(ctx, `SELECT cartridge_id FROM virtual_cartridges WHERE barcode_key = ? AND cartridge_id <> ?`, barcodeKey, cartridge.CartridgeID).Scan(&existingID)
+	err = tx.QueryRowContext(ctx, `SELECT cartridge_id FROM virtual_cartridges WHERE barcode_key = ? AND cartridge_id <> ?`, barcodeKey, cartridge.CartridgeID).Scan(&existingID)
 	if err == nil {
 		return domain.ErrConflict
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	_, err = r.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO virtual_cartridges (
   cartridge_id, pool_id, library_id, barcode, barcode_key, capacity_bytes, used_bytes,
   lifecycle_state, retention_state, assigned_slot_address, created_at, updated_at
@@ -244,7 +325,10 @@ ON CONFLICT(cartridge_id) DO UPDATE SET
 	if isSQLiteConstraint(err) {
 		return domain.ErrConflict
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *CoreResourcesRepo) DeleteCartridge(ctx context.Context, cartridgeID string) error {

@@ -17,16 +17,7 @@ import (
 func TestServerPersistsRuntimePublicationsAcrossRestart(t *testing.T) {
 	metadataDSN := filepath.Join(t.TempDir(), "metadata.db")
 	srv := newTestServerWithMetadata(t, metadataDSN)
-	chainReq := newAuthedRequest(
-		http.MethodPost,
-		"/v1/resources/chain",
-		bytes.NewBufferString(`{"poolId":"pool-runtime","poolName":"Pool Runtime","libraryId":"lib-runtime","libraryName":"Library Runtime","driveId":"drive-runtime","driveSlot":1,"cartridgeId":"VTA901L06","barcode":"VTA901L06"}`),
-	)
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-runtime", "lib-runtime", "drive-runtime", "VTA901L06", "VTA901L06")
 	firstPublications := listPublications(t, srv)
 	if len(firstPublications) == 0 {
 		t.Fatalf("expected initial in-memory publications to be created")
@@ -39,15 +30,56 @@ func TestServerPersistsRuntimePublicationsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestManagementAuthenticationModesPreserveDefaultNoLogin(t *testing.T) {
+	noLogin := newTestServerWithAPIKey(t, "")
+	list := httptest.NewRequest(http.MethodGet, "/v1/libraries", nil)
+	listResp := httptest.NewRecorder()
+	noLogin.Router().ServeHTTP(listResp, list)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("default no-login mode should allow existing management use, got %d", listResp.Code)
+	}
+
+	create := httptest.NewRequest(http.MethodPost, "http://example.com/v1/libraries", bytes.NewBufferString(`{"libraryId":"lib-no-login","name":"No Login"}`))
+	create.Header.Set("Content-Type", "application/json")
+	createResp := httptest.NewRecorder()
+	noLogin.Router().ServeHTTP(createResp, create)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("default no-login resource creation should work without credential steps, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+
+	configured := newTestServerWithAPIKey(t, "configured-test-key")
+	unauthorized := httptest.NewRequest(http.MethodGet, "/v1/libraries", nil)
+	unauthorizedResp := httptest.NewRecorder()
+	configured.Router().ServeHTTP(unauthorizedResp, unauthorized)
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("configured key mode must still require the key, got %d", unauthorizedResp.Code)
+	}
+	valid := httptest.NewRequest(http.MethodGet, "/v1/libraries", nil)
+	valid.Header.Set("X-HOLO-API-Key", "configured-test-key")
+	validResp := httptest.NewRecorder()
+	configured.Router().ServeHTTP(validResp, valid)
+	if validResp.Code != http.StatusOK {
+		t.Fatalf("configured key mode should accept the configured key, got %d", validResp.Code)
+	}
+}
+
+func TestStandardResourceFixtureUsesNormalAPIs(t *testing.T) {
+	srv := newTestServer(t)
+	createStandardResourceFixture(t, srv, "normal-flow")
+
+	library, err := srv.resources.repo.FindLibrary(httptest.NewRequest(http.MethodGet, "/", nil).Context(), "lib-normal-flow")
+	if err != nil {
+		t.Fatalf("normal resource flow did not create its library: %v", err)
+	}
+	if library.LibraryID != "lib-normal-flow" {
+		t.Fatalf("unexpected library created: %+v", library)
+	}
+}
+
 func TestServerRestartCleanupFailureBlocksAutomaticPublication(t *testing.T) {
 	metadataDSN := filepath.Join(t.TempDir(), "metadata.db")
 	srv := newTestServerWithMetadata(t, metadataDSN)
-	request := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-restart","libraryId":"lib-restart","driveId":"drive-restart","driveSlot":1,"cartridgeId":"VTA903L06","barcode":"VTA903L06"}`))
-	response := httptest.NewRecorder()
-	srv.Router().ServeHTTP(response, request)
-	if response.Code != http.StatusCreated {
-		t.Fatalf("fixture creation failed: %d %s", response.Code, response.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-restart", "lib-restart", "drive-restart", "VTA903L06", "VTA903L06")
 	if _, err := srv.metadataDB.Exec(`DELETE FROM target_publications`); err != nil {
 		t.Fatal(err)
 	}
@@ -83,16 +115,7 @@ func TestServerRestartCleanupFailureBlocksAutomaticPublication(t *testing.T) {
 func TestUpgradeRuntimePublicationRecoveryPreservesResourceIQNs(t *testing.T) {
 	metadataDSN := filepath.Join(t.TempDir(), "metadata.db")
 	srv := newTestServerWithMetadata(t, metadataDSN)
-	chainReq := newAuthedRequest(
-		http.MethodPost,
-		"/v1/resources/chain",
-		bytes.NewBufferString(`{"poolId":"pool-upgrade","poolName":"Pool Upgrade","libraryId":"lib-upgrade","libraryName":"Library Upgrade","driveId":"drive-upgrade","driveSlot":1,"cartridgeId":"VTA902L06","barcode":"VTA902L06"}`),
-	)
-	chainResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(chainResp, chainReq)
-	if chainResp.Code != http.StatusCreated {
-		t.Fatalf("expected chain create 201, got %d body=%s", chainResp.Code, chainResp.Body.String())
-	}
+	createResourceFlowFixture(t, srv, "pool-upgrade", "lib-upgrade", "drive-upgrade", "VTA902L06", "VTA902L06")
 	initial := listPublications(t, srv)
 	if len(initial) == 0 {
 		t.Fatalf("expected initial publications")
@@ -135,6 +158,7 @@ func TestNewServerWithConfigEUsesConfiguredLogDirForAudit(t *testing.T) {
 	cfg := config.Load()
 	cfg.APIKey = testAPIKey
 	cfg.LogDir = t.TempDir()
+	cfg.ISCSISecretKeyPath = filepath.Join(t.TempDir(), "vault.key")
 	cfg.MetadataDSN = filepath.Join(t.TempDir(), "metadata.db")
 	cfg.TargetRuntimeMode = "in-memory"
 	cfg.TargetRuntimeUseSudo = false
@@ -147,6 +171,9 @@ func TestNewServerWithConfigEUsesConfiguredLogDirForAudit(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(cfg.LogDir, "audit.jsonl")); err != nil {
 		t.Fatalf("expected audit journal under configured log dir: %v", err)
+	}
+	if got := srv.ops.support.ISCSISecretKeyPath; got != cfg.ISCSISecretKeyPath {
+		t.Fatalf("support bundle must use the configured secret-key path, got %q want %q", got, cfg.ISCSISecretKeyPath)
 	}
 }
 

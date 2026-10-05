@@ -39,33 +39,65 @@ func (r *StoragePoolRepo) CreatePool(ctx context.Context, pool *domain.StoragePo
 		return domain.ErrInvalidInput
 	}
 	var count int
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM storage_pools`).Scan(&count); err != nil {
+	tx, err := beginSerializedWriteTx(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM storage_pools`).Scan(&count); err != nil {
 		return err
 	}
 	if count >= maxStoragePools {
 		return domain.ErrInvalidState
 	}
-	if _, err := r.FindPool(ctx, pool.PoolID); err == nil {
+	if conflict, err := poolProjectionConflict(ctx, tx, pool.PoolID, ""); err != nil {
+		return err
+	} else if conflict {
 		return domain.ErrConflict
-	} else if err != domain.ErrNotFound {
+	}
+	if err := savePoolTx(ctx, tx, pool); err != nil {
 		return err
 	}
-	return r.SavePool(ctx, pool)
+	return tx.Commit()
 }
 
 func (r *StoragePoolRepo) SavePool(ctx context.Context, pool *domain.StoragePoolRuntime) error {
 	if pool == nil {
 		return domain.ErrInvalidInput
 	}
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := beginSerializedWriteTx(ctx, r.db)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	if conflict, err := poolProjectionConflict(ctx, tx, pool.PoolID, pool.PoolID); err != nil {
+		return err
+	} else if conflict {
+		return domain.ErrConflict
+	}
 	if err := savePoolTx(ctx, tx, pool); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()
+}
+
+func poolProjectionConflict(ctx context.Context, q poolLoader, poolID, excludeID string) (bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT pool_id FROM storage_pools`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	want := storageutil.PoolRootProjection(poolID)
+	for rows.Next() {
+		var existingID string
+		if err := rows.Scan(&existingID); err != nil {
+			return false, err
+		}
+		if existingID != excludeID && storageutil.PoolRootProjection(existingID) == want {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (r *StoragePoolRepo) FindPool(ctx context.Context, poolID string) (*domain.StoragePoolRuntime, error) {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -701,29 +702,18 @@ func exportedVaultLabels(cartridges []*domain.VirtualCartridge) []string {
 }
 
 func readDriveMediaState(libraryID, driveID string) (string, error) {
-	stateKey := storageutil.MediaStateKey(libraryID, driveID)
-	path := filepath.Join(mediaStateDir(), sanitizeStateID(stateKey)+".state")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	trimmed := strings.TrimSpace(string(raw))
-	if strings.HasPrefix(trimmed, "cartridge=") {
-		return strings.TrimSpace(strings.TrimPrefix(trimmed, "cartridge=")), nil
-	}
-	return trimmed, nil
+	return storageutil.ReadDriveMediaState(libraryID, driveID)
 }
 
 func writeDriveMediaState(libraryID, driveID, cartridgeID string) error {
-	stateKey := storageutil.MediaStateKey(libraryID, driveID)
-	dir := mediaStateDir()
+	targetPath, err := storageutil.MediaStatePath(libraryID, driveID)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	targetPath := filepath.Join(dir, sanitizeStateID(stateKey)+".state")
 	tmpPath := targetPath + ".tmp"
 	payload := "cartridge=" + strings.TrimSpace(cartridgeID) + "\n"
 	if err := os.WriteFile(tmpPath, []byte(payload), 0o644); err != nil {
@@ -879,10 +869,7 @@ func syncParentDir(path string) error {
 }
 
 func mediaStateDir() string {
-	if raw := strings.TrimSpace(os.Getenv("HOLO_MEDIA_STATE_DIR")); raw != "" {
-		return raw
-	}
-	return "/run/holo/media-state"
+	return storageutil.MediaStateDir()
 }
 
 func sanitizeStateID(raw string) string {
@@ -959,24 +946,65 @@ func resetCartridgeLayoutArtifacts(cartridge *domain.VirtualCartridge) error {
 }
 
 func cartridgeLayoutArtifactDirs(cartridge *domain.VirtualCartridge) (map[string]struct{}, error) {
-	candidateRoots := approvedCartridgeLayoutRoots(cartridge.PoolID)
+	return resolveCartridgeLayoutArtifactDirs(cartridge, approvedCartridgeLayoutRoots(cartridge.PoolID))
+}
 
-	targets := make(map[string]struct{})
+func resolveCartridgeLayoutArtifactDirs(cartridge *domain.VirtualCartridge, candidateRoots []string) (map[string]struct{}, error) {
+	if cartridge == nil {
+		return nil, domain.ErrInvalidInput
+	}
+
+	existingTargets := make(map[string]struct{})
 	for _, root := range candidateRoots {
 		root = strings.TrimSpace(root)
 		if root == "" {
 			continue
 		}
-		targets[storageutil.CanonicalCartridgeLayoutDir(root, cartridge.LibraryID, cartridge.CartridgeID)] = struct{}{}
+		canonical := storageutil.CanonicalCartridgeLayoutDir(root, cartridge.LibraryID, cartridge.CartridgeID)
+		exists, err := existingCartridgeLayoutDir(canonical)
+		if err != nil {
+			if errors.Is(err, storageutil.ErrStorageIdentityConflict) {
+				return nil, domain.ErrIdentityConflict
+			}
+			return nil, err
+		}
+		if exists {
+			existingTargets[canonical] = struct{}{}
+		}
 		legacyDirs, err := storageutil.LegacyCartridgeLayoutDirs(root, cartridge.CartridgeID)
 		if err != nil {
+			if errors.Is(err, storageutil.ErrStorageIdentityConflict) {
+				return nil, domain.ErrIdentityConflict
+			}
 			return nil, err
 		}
 		for _, dir := range legacyDirs {
-			targets[dir] = struct{}{}
+			existingTargets[dir] = struct{}{}
 		}
 	}
-	return targets, nil
+	if len(existingTargets) > 1 {
+		return nil, domain.ErrAmbiguousLayout
+	}
+	if len(existingTargets) == 1 {
+		return existingTargets, nil
+	}
+	return map[string]struct{}{
+		storageutil.CanonicalCartridgeLayoutDir(storageutil.PoolStorageRoot(cartridge.PoolID), cartridge.LibraryID, cartridge.CartridgeID): {},
+	}, nil
+}
+
+func existingCartridgeLayoutDir(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, domain.ErrIdentityConflict
+	}
+	return info.IsDir(), nil
 }
 
 func approvedCartridgeLayoutRoots(poolID string) []string {

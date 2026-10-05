@@ -128,6 +128,10 @@ func (h *TargetHandler) handlePublications(w http.ResponseWriter, r *http.Reques
 				status = http.StatusNotFound
 				message = "resource not found"
 			}
+			if errors.Is(err, domain.ErrIdentityConflict) || errors.Is(err, domain.ErrAmbiguousLayout) {
+				status = http.StatusConflict
+				message = "resource identity conflict"
+			}
 			if errors.Is(err, domain.ErrCapacityExceeded) {
 				status = http.StatusInsufficientStorage
 				message = "insufficient storage capacity"

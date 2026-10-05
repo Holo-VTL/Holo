@@ -36,6 +36,9 @@ class FakeLoopbackBackend:
             return "absent"
         return "owned"
 
+    def inspect_for_remove(self, mapping):
+        return self.inspect(mapping)
+
     def probe(self):
         return {"available": True}
 
@@ -133,6 +136,117 @@ class LocalLoopbackHelperTests(unittest.TestCase):
 
         self.assertIsInstance(result, FakeLUN)
         self.assertEqual(calls, [("tpg", 4, None, None)])
+
+    def test_probe_initializes_lazy_configfs_fabric_before_checking_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = helper_module.RTSlibLoopbackBackend.__new__(helper_module.RTSlibLoopbackBackend)
+            backend.configfs_root = Path(directory) / "target" / "loopback"
+            calls = []
+
+            class FakeFabricModule:
+                def __init__(self, name):
+                    calls.append(("init", name))
+
+                def _check_self(self):
+                    calls.append(("check",))
+                    backend.configfs_root.mkdir(parents=True)
+
+            backend.FabricModule = FakeFabricModule
+            with patch.object(helper_module.os, "geteuid", return_value=0), patch.object(
+                helper_module.shutil, "which", return_value="/usr/bin/sg_inq"
+            ):
+                result = backend.probe()
+
+            self.assertEqual(result, {"available": True})
+            self.assertTrue(backend.configfs_root.is_dir())
+            self.assertEqual(calls, [("init", "loopback"), ("check",)])
+
+    def test_remove_inspection_accepts_only_owned_empty_orphan_luns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = helper_module.RTSlibLoopbackBackend.__new__(helper_module.RTSlibLoopbackBackend)
+            backend.configfs_root = Path(directory) / "target" / "loopback"
+            backend.owner_dir = Path(directory) / "owners"
+            mapping = helper_module.validate_mapping(valid_request("remove")["mapping"], "remove")
+            target = backend.configfs_root / mapping["targetNaa"]
+            tpg = target / "tpgt_1"
+            lun_root = tpg / "lun"
+            core = backend.configfs_root.parent / "core"
+            lun_root.mkdir(parents=True)
+            (tpg / "nexus").write_text(mapping["nexusNaa"], encoding="ascii")
+            (lun_root / "lun_5").mkdir()
+            for name in helper_module.CONFIGFS_LUN_ATTRIBUTES:
+                (lun_root / "lun_5" / name).mkdir()
+            storage = core / "user_1" / mapping["devices"][0]["backendRef"]
+            storage.parent.mkdir(parents=True)
+            (lun_root / "lun_0").mkdir()
+            (lun_root / "lun_0" / "holo-backstore").symlink_to(storage)
+            for name in helper_module.CONFIGFS_LUN_ATTRIBUTES:
+                (lun_root / "lun_0" / name).mkdir()
+            backend.owner_dir.mkdir()
+            owner = backend._owner_record(mapping)
+            with patch.object(backend, "_read_owner_file", return_value=owner):
+                self.assertEqual(backend.inspect_for_remove(mapping), "owned")
+
+                unexpected_lun = lun_root / "lun_99"
+                unexpected_lun.mkdir()
+                self.assertEqual(backend.inspect_for_remove(mapping), "conflict")
+
+    def test_remove_component_deletes_only_an_empty_owned_lun_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = helper_module.RTSlibLoopbackBackend.__new__(helper_module.RTSlibLoopbackBackend)
+            backend.configfs_root = Path(directory) / "target" / "loopback"
+            mapping = helper_module.validate_mapping(valid_request("remove")["mapping"], "remove")
+            target = backend.configfs_root / mapping["targetNaa"]
+            empty_lun = target / "tpgt_1" / "lun" / "lun_5"
+            empty_lun.mkdir(parents=True)
+
+            with patch.object(backend, "_target", return_value=type("Target", (), {"path": str(target)})()):
+                backend.remove_component(mapping, "lun:5")
+            self.assertFalse(empty_lun.exists())
+
+            nonempty_lun = target / "tpgt_1" / "lun" / "lun_5"
+            nonempty_lun.mkdir()
+            (nonempty_lun / "unexpected").touch()
+            with patch.object(backend, "_target", return_value=type("Target", (), {"path": str(target)})()):
+                with self.assertRaises(helper_module.HelperFailure) as raised:
+                    backend.remove_component(mapping, "lun:5")
+            self.assertEqual(raised.exception.reason, "mapping_conflict")
+            self.assertTrue(nonempty_lun.exists())
+
+    def test_remove_component_accepts_owned_lun_with_configfs_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = helper_module.RTSlibLoopbackBackend.__new__(helper_module.RTSlibLoopbackBackend)
+            backend.configfs_root = Path(directory) / "target" / "loopback"
+            mapping = helper_module.validate_mapping(valid_request("remove")["mapping"], "remove")
+            target = backend.configfs_root / mapping["targetNaa"]
+            tpg_path = target / "tpgt_1"
+            lun_path = tpg_path / "lun" / "lun_0"
+            lun_path.mkdir(parents=True)
+            (tpg_path / "nexus").write_text(mapping["nexusNaa"], encoding="ascii")
+            storage = Path(directory) / "core" / "user_1" / mapping["devices"][0]["backendRef"]
+            storage.parent.mkdir(parents=True)
+            (lun_path / "holo-backstore").symlink_to(storage)
+            for name in helper_module.CONFIGFS_LUN_ATTRIBUTES:
+                (lun_path / name).mkdir()
+
+            class FakeStorage:
+                plugin = "user"
+                name = mapping["devices"][0]["backendRef"]
+
+            class FakeLUN:
+                storage_object = FakeStorage()
+
+                def delete(self):
+                    self.deleted = True
+
+            fake_lun = FakeLUN()
+            fake_target = type("Target", (), {"path": str(target)})()
+            with patch.object(backend, "_target", return_value=fake_target), patch.object(
+                backend, "TPG", create=True, return_value=object()
+            ), patch.object(backend, "_lookup_lun", return_value=fake_lun):
+                backend.remove_component(mapping, "lun:0")
+
+            self.assertTrue(fake_lun.deleted)
 
     def test_json_version_operation_and_fields_are_allowlisted(self):
         with tempfile.TemporaryDirectory() as directory:

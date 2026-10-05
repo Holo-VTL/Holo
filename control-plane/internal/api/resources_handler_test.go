@@ -214,6 +214,60 @@ func TestCoreResourceCreateAndQueryEndpoints(t *testing.T) {
 	}
 }
 
+func TestDemoResourceChainRouteCannotOverwriteProtectedResources(t *testing.T) {
+	srv := newTestServer(t)
+	createStandardResourceFixture(t, srv, "protected")
+	ctx := context.Background()
+
+	drive, err := srv.resources.repo.FindDrive(ctx, "drive-protected")
+	if err != nil {
+		t.Fatalf("find protected drive: %v", err)
+	}
+	drive.MountState = domain.MountBusy
+	drive.MountedCartridgeID = "VTA900L06"
+	if err := srv.resources.repo.SaveDrive(ctx, drive); err != nil {
+		t.Fatalf("save protected drive: %v", err)
+	}
+	cartridge, err := srv.resources.repo.FindCartridge(ctx, "VTA900L06")
+	if err != nil {
+		t.Fatalf("find protected cartridge: %v", err)
+	}
+	cartridge.UsedBytes = 128
+	cartridge.RetentionState = domain.RetentionLocked
+	if err := srv.resources.repo.SaveCartridge(ctx, cartridge); err != nil {
+		t.Fatalf("save protected cartridge: %v", err)
+	}
+
+	request := newAuthedRequest(http.MethodPost, "/v1/resources/chain", strings.NewReader(`{"poolId":"pool-protected","poolName":"Replace Pool","libraryId":"lib-protected","libraryName":"Replace Library","driveId":"drive-protected","driveSlot":1,"cartridgeId":"VTA900L06","barcode":"REPLACED"}`))
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("expected removed demo route to return 404, got %d body=%s", response.Code, response.Body.String())
+	}
+
+	library, err := srv.resources.repo.FindLibrary(ctx, "lib-protected")
+	if err != nil {
+		t.Fatalf("reload protected library: %v", err)
+	}
+	if library.Name != "Library lib-protected" {
+		t.Fatalf("demo route changed protected library: %+v", library)
+	}
+	drive, err = srv.resources.repo.FindDrive(ctx, "drive-protected")
+	if err != nil {
+		t.Fatalf("reload protected drive: %v", err)
+	}
+	if drive.MountState != domain.MountBusy || drive.MountedCartridgeID != "VTA900L06" {
+		t.Fatalf("demo route changed mounted drive state: %+v", drive)
+	}
+	cartridge, err = srv.resources.repo.FindCartridge(ctx, "VTA900L06")
+	if err != nil {
+		t.Fatalf("reload protected cartridge: %v", err)
+	}
+	if cartridge.Barcode != "VTA900L06" || cartridge.UsedBytes != 128 || cartridge.RetentionState != domain.RetentionLocked {
+		t.Fatalf("demo route changed protected cartridge: %+v", cartridge)
+	}
+}
+
 func TestCoreResourceValidationAndConflicts(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -597,16 +651,10 @@ func TestCartridgeCreateRequiresCanonicalIdentity(t *testing.T) {
 	}
 }
 
-func TestResourceChainRejectsDuplicateBarcode(t *testing.T) {
+func TestCartridgeEndpointRejectsDuplicateBarcode(t *testing.T) {
 	srv := newTestServer(t)
-	first := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-chain","poolName":"Pool Chain","capacityBytes":1073741824,"libraryId":"lib-chain","libraryName":"Library Chain","driveId":"drive-chain-1","driveSlot":1,"cartridgeId":"VTA100L06","barcode":"VTA100L06"}`))
-	firstResp := httptest.NewRecorder()
-	srv.Router().ServeHTTP(firstResp, first)
-	if firstResp.Code != http.StatusCreated {
-		t.Fatalf("expected first chain create 201, got %d body=%s", firstResp.Code, firstResp.Body.String())
-	}
-
-	second := newAuthedRequest(http.MethodPost, "/v1/resources/chain", bytes.NewBufferString(`{"poolId":"pool-chain","poolName":"Pool Chain","capacityBytes":1073741824,"libraryId":"lib-chain","libraryName":"Library Chain","driveId":"drive-chain-2","driveSlot":2,"cartridgeId":"VTA101L06","barcode":"VTA100L06"}`))
+	createResourceFlowFixture(t, srv, "pool-chain", "lib-chain", "drive-chain-1", "VTA100L06", "VTA100L06")
+	second := newAuthedRequest(http.MethodPost, "/v1/cartridges", bytes.NewBufferString(`{"poolId":"pool-chain","libraryId":"lib-chain","cartridgeId":"VTA100L06","barcode":"VTA100L06","capacityBytes":1073741824}`))
 	secondResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(secondResp, second)
 	if secondResp.Code != http.StatusConflict {
@@ -614,7 +662,7 @@ func TestResourceChainRejectsDuplicateBarcode(t *testing.T) {
 	}
 }
 
-func TestCartridgeDeleteAndSlotsSync(t *testing.T) {
+func TestCartridgeDeleteRejectsAmbiguousLayoutsAndPreservesSlots(t *testing.T) {
 	mediaStateDir := t.TempDir()
 	storageRoot := t.TempDir()
 	t.Setenv("HOLO_MEDIA_STATE_DIR", mediaStateDir)
@@ -670,22 +718,25 @@ func TestCartridgeDeleteAndSlotsSync(t *testing.T) {
 	deleteReq := newAuthedRequest(http.MethodDelete, "/v1/cartridges/VTA000L06", nil)
 	deleteResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(deleteResp, deleteReq)
-	if deleteResp.Code != http.StatusNoContent {
-		t.Fatalf("expected cartridge delete 204, got %d, body=%s", deleteResp.Code, deleteResp.Body.String())
+	if deleteResp.Code != http.StatusConflict {
+		t.Fatalf("expected ambiguous layout conflict 409, got %d, body=%s", deleteResp.Code, deleteResp.Body.String())
 	}
 
-	if _, err := os.Stat(canonicalLayoutDir); !os.IsNotExist(err) {
-		t.Fatalf("expected canonical layout cleanup, err=%v", err)
-	}
-	if _, err := os.Stat(legacyLayoutDir); !os.IsNotExist(err) {
-		t.Fatalf("expected legacy layout cleanup, err=%v", err)
+	for _, path := range []string{canonicalLayoutDir, legacyLayoutDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("ambiguous delete removed layout %s: %v", path, err)
+		}
+		data, err := os.ReadFile(filepath.Join(path, "data.segment"))
+		if err != nil || string(data) != "legacy" {
+			t.Fatalf("ambiguous delete changed layout %s: data=%q err=%v", path, data, err)
+		}
 	}
 
 	getDeletedReq := newAuthedRequest(http.MethodGet, "/v1/cartridges/VTA000L06", nil)
 	getDeletedResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(getDeletedResp, getDeletedReq)
-	if getDeletedResp.Code != http.StatusNotFound {
-		t.Fatalf("expected deleted cartridge 404, got %d", getDeletedResp.Code)
+	if getDeletedResp.Code != http.StatusOK {
+		t.Fatalf("ambiguous delete must preserve cartridge metadata, got %d", getDeletedResp.Code)
 	}
 
 	raw, err = os.ReadFile(slotsPath)
@@ -693,8 +744,8 @@ func TestCartridgeDeleteAndSlotsSync(t *testing.T) {
 		t.Fatalf("expected slots file after delete: %v", err)
 	}
 	lines = strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) < 2 || lines[0] != "-" || lines[1] != "VTA001L06" {
-		t.Fatalf("unexpected slots file content after delete: %q", string(raw))
+	if len(lines) < 2 || lines[0] != "VTA000L06" || lines[1] != "VTA001L06" {
+		t.Fatalf("ambiguous delete changed slots state: %q", string(raw))
 	}
 }
 

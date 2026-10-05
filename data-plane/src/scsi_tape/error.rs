@@ -15,6 +15,8 @@ pub enum TapeError {
     UnsupportedLogPage(u8),
     #[error("device not ready: {0}")]
     NotReady(String),
+    #[error("cartridge requires unload and recovery before data access")]
+    RecoveryRequired,
     #[error("access denied: {0}")]
     AccessDenied(String),
     #[error("unsupported operation: {0}")]
@@ -43,4 +45,12 @@ pub enum TapeError {
     Unauthorized,
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("physical storage admission rejected write: {source}")]
+    PhysicalWriteAdmission {
+        requested_units: u32,
+        #[source]
+        source: StorageError,
+    },
+    #[error("physical storage admission rejected filemarks: {0}")]
+    PhysicalFilemarkAdmission(#[source] StorageError),
 }

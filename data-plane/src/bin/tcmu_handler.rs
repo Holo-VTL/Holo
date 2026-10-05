@@ -9,7 +9,9 @@
 ///
 /// Wire protocol: see `data-plane/src/iscsi/cdb_server.rs`
 use data_plane::iscsi::cdb_server::{
-    dispatch_raw_cdb_with_context, CdbDispatchContext, CdbPacket, CdbResponse, MAX_DATA_LEN,
+    dispatch_raw_cdb_with_context, media_state_key_for_state, read_shared_loaded_cartridge_fresh,
+    sync_loaded_cartridge_usage_to_shared, CdbDispatchContext, CdbPacket, CdbResponse,
+    MAX_DATA_LEN,
 };
 use data_plane::scsi_tape::identity::DeviceIdentityProfile;
 use data_plane::scsi_tape::profiles::resolve_active_profile_from_env;
@@ -24,11 +26,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TCMU_IO_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_SLOW_CDB_LOG_MS: u64 = 1_000;
+const IDLE_MEDIA_DETACH_AFTER: Duration = Duration::from_secs(2);
+const IDLE_MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SLOW_CDB_WARN_US: u64 = 5_000_000;
 const SLOW_CDB_CRITICAL_US: u64 = 30_000_000;
 
@@ -96,7 +100,13 @@ fn main() {
     // The TCMU bridge may reconnect after transient socket failures/timeouts;
     // recreating TapeState on every reconnect loses in-memory session state and
     // can surface initiator-visible tape errors mid-job.
-    let mut tape_state = TapeState::new(&serial_seed);
+    let tape_state = Arc::new(Mutex::new(TapeState::new(&serial_seed)));
+    let last_cdb_at = Arc::new(Mutex::new(Instant::now()));
+    let idle_monitor = start_idle_media_monitor(
+        Arc::clone(&tape_state),
+        Arc::clone(&last_cdb_at),
+        Arc::clone(&shutdown),
+    );
     let mut data_buffer = Vec::new();
     let mut timing_probe = TimingProbe::from_env(&socket_path);
     let io_timeout = tcmu_io_timeout();
@@ -154,12 +164,25 @@ fn main() {
                             let context = CdbDispatchContext {
                                 initiator: header.initiator.clone(),
                             };
+                            let mut state = match tape_state.lock() {
+                                Ok(state) => state,
+                                Err(_) => {
+                                    eprintln!("[tcmu_handler] tape state lock poisoned");
+                                    let busy = CdbResponse::busy();
+                                    let _ = busy.encode(&mut writer);
+                                    let _ = writer.flush();
+                                    continue;
+                                }
+                            };
                             let response = dispatch_raw_cdb_with_context(
-                                &mut tape_state,
+                                &mut state,
                                 &header.cdb,
                                 &data_buffer,
                                 context,
                             );
+                            if let Ok(mut last) = last_cdb_at.lock() {
+                                *last = Instant::now();
+                            }
                             let timing_after_dispatch = timing_probe.mark();
                             let reply_len = response.reply.len();
                             let sense_len = response.sense.len();
@@ -177,7 +200,7 @@ fn main() {
                                 opcode,
                                 &header.cdb,
                                 header.initiator.as_deref(),
-                                &tape_state,
+                                &state,
                                 status,
                                 header.data_len,
                                 reply_len,
@@ -209,8 +232,72 @@ fn main() {
     }
 
     // Cleanup.
+    if let Some(monitor) = idle_monitor {
+        if monitor.join().is_err() {
+            eprintln!("[tcmu_handler] idle media monitor panicked");
+        }
+    }
+    if let Ok(mut state) = tape_state.lock() {
+        if state.mount_state == data_plane::scsi_tape::state::MountState::Loaded {
+            if let Err(err) = data_plane::media::mount_bridge::detach_cartridge(&mut state) {
+                eprintln!("[tcmu_handler] final media detach failed: {err}");
+            }
+        }
+    }
     let _ = std::fs::remove_file(&socket_path);
     eprintln!("[tcmu_handler] exiting cleanly");
+}
+
+fn start_idle_media_monitor(
+    state: Arc<Mutex<TapeState>>,
+    last_cdb_at: Arc<Mutex<Instant>>,
+    shutdown: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("holo-media-idle-detach".to_string())
+        .spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                std::thread::sleep(IDLE_MEDIA_POLL_INTERVAL);
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let Ok(mut tape) = state.lock() else {
+                    eprintln!("[tcmu_handler] tape state lock poisoned in idle monitor");
+                    continue;
+                };
+                if tape.mount_state != data_plane::scsi_tape::state::MountState::Loaded {
+                    continue;
+                }
+                let idle = last_cdb_at
+                    .lock()
+                    .map(|last| last.elapsed() >= IDLE_MEDIA_DETACH_AFTER)
+                    .unwrap_or(false);
+                if !idle {
+                    continue;
+                }
+                let media_state_key = media_state_key_for_state(&tape);
+                let desired = match read_shared_loaded_cartridge_fresh(&media_state_key) {
+                    Ok(desired) => desired,
+                    Err(err) => {
+                        eprintln!("[tcmu_handler] idle media state read failed: {err}");
+                        continue;
+                    }
+                };
+                if desired.as_deref() == tape.cartridge_id.as_deref() {
+                    continue;
+                }
+                sync_loaded_cartridge_usage_to_shared(&tape);
+                match data_plane::media::mount_bridge::detach_cartridge(&mut tape) {
+                    Ok(()) => tape.push_unit_attention(0x28, 0x00),
+                    Err(err) => eprintln!("[tcmu_handler] idle media detach failed: {err}"),
+                }
+            }
+        })
+        .map(Some)
+        .unwrap_or_else(|err| {
+            eprintln!("[tcmu_handler] failed to start idle media monitor: {err}");
+            None
+        })
 }
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
@@ -684,6 +771,17 @@ mod tests {
         std::env::set_var("HOLO_SCSI_SERIAL_SEED", "drive-01");
         assert_eq!(resolve_serial_seed("pub-123"), "drive-01");
         std::env::remove_var("HOLO_SCSI_SERIAL_SEED");
+    }
+
+    #[test]
+    fn idle_media_monitor_uses_the_configured_library_drive_media_key() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        std::env::set_var("HOLO_MEDIA_STATE_KEY", "library-01__drive-01");
+        let state = TapeState::new("drive-01");
+
+        assert_eq!(media_state_key_for_state(&state), "library-01__drive-01");
+
+        std::env::remove_var("HOLO_MEDIA_STATE_KEY");
     }
 
     #[test]

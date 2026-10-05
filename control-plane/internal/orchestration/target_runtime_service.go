@@ -49,6 +49,16 @@ type CoreResourceReader interface {
 	FindCartridge(ctx context.Context, cartridgeID string) (*domain.VirtualCartridge, error)
 }
 
+type coreResourceIdentityReader interface {
+	ListLibraries(context.Context) []*domain.VirtualLibrary
+	ListDrives(context.Context) []*domain.VirtualDrive
+	ListCartridges(context.Context) []*domain.VirtualCartridge
+}
+
+type storagePoolIdentityReader interface {
+	ListPools(context.Context) []*domain.StoragePoolRuntime
+}
+
 type TargetRuntimeRepository interface {
 	SavePublication(ctx context.Context, p *domain.TargetPublication) error
 	SavePublicationIfIQNAvailable(ctx context.Context, p *domain.TargetPublication) error
@@ -368,6 +378,18 @@ func (s *TargetRuntimeService) Publish(ctx context.Context, req PublishRequest) 
 	}
 	if strings.TrimSpace(cartridge.LibraryID) != strings.TrimSpace(req.LibraryID) {
 		return nil, domain.ErrInvalidInput
+	}
+	if identityReader, ok := s.coreRepo.(coreResourceIdentityReader); ok {
+		var pools []*domain.StoragePoolRuntime
+		if poolReader, ok := s.poolReader.(storagePoolIdentityReader); ok {
+			pools = poolReader.ListPools(ctx)
+		}
+		if err := ValidateResourceIdentity(
+			identityReader.ListLibraries(ctx), identityReader.ListDrives(ctx), identityReader.ListCartridges(ctx), pools,
+			req.LibraryID, req.DriveID, req.CartridgeID,
+		); err != nil {
+			return nil, err
+		}
 	}
 	poolID := strings.TrimSpace(cartridge.PoolID)
 	if poolID == "" {

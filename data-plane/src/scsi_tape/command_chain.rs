@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use crate::media::mount_bridge;
@@ -13,8 +13,12 @@ use crate::scsi_tape::reservation::{
     register_ignore_existing, register_key, release_key, reserve_key, snapshot,
 };
 use crate::scsi_tape::state::{BlockMode, MountState, TapeState};
+use crate::storage::space_guard::{
+    ensure_capacity, estimate_write_peak_bytes, FilesystemLock, FilesystemReservation,
+    SPACE_RESERVE_BYTES,
+};
 use crate::storage::{
-    discard_layout_caches, flush_pending_writes, initialize_layout, persist_filemarks,
+    discard_layout_caches_checked, flush_pending_writes, initialize_layout, persist_filemarks,
     persist_retention_state, read_logical_block, reset_layout_for_overwrite, run_unmap,
     write_logical_block, CompressionCodec, StorageError, WriteOptions,
 };
@@ -242,7 +246,7 @@ fn invalidate_read_prefetch(layout_root: &Path) {
     }
 }
 
-fn invalidate_state_read_prefetch(state: &TapeState) {
+pub(crate) fn invalidate_state_read_prefetch(state: &TapeState) {
     if let Some(layout) = state.active_layout.as_ref() {
         invalidate_read_prefetch(&layout.root);
     }
@@ -440,14 +444,9 @@ pub fn load_media(state: &mut TapeState, cartridge_id: &str) -> Result<(), TapeE
 }
 
 pub fn unload_media(state: &mut TapeState) -> Result<(), TapeError> {
-    invalidate_state_read_prefetch(state);
     let active_layout = state.active_layout.clone();
+    mount_bridge::detach_cartridge(state)?;
     if let Some(layout) = active_layout.as_ref() {
-        flush_pending_writes(layout)?;
-    }
-    state.unmount();
-    if let Some(layout) = active_layout.as_ref() {
-        discard_layout_caches(layout);
         clear_read_prefetch_degradation(&layout.root);
     }
     Ok(())
@@ -598,36 +597,39 @@ pub fn erase_media(
         .as_ref()
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?
         .clone();
+    ensure_write_ready(state)?;
+    let _filesystem_reservation = acquire_space_admission(&layout, 0, 0, 0, 16 * 1024)?;
     let preserved_partition_runtime = state.partition_runtime.clone();
     let preserved_capacity_bytes = state.cartridge_capacity_bytes;
     let preserved_retention_policy = state.retention_policy.clone();
 
-    match mode {
-        EraseMode::Short => reset_layout_for_overwrite(&layout)?,
-        EraseMode::Long => {
-            discard_layout_caches(&layout);
-            if let Err(err) = fs::remove_dir_all(&layout.root) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(StorageError::Io(err).into());
+    let erase_result = (|| {
+        match mode {
+            EraseMode::Short => reset_layout_for_overwrite(&layout)?,
+            EraseMode::Long => {
+                discard_layout_caches_checked(&layout)?;
+                if let Err(err) = fs::remove_dir_all(&layout.root) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(StorageError::Io(err).into());
+                    }
                 }
+                initialize_layout(&layout)?;
+                reset_layout_for_overwrite(&layout)?;
             }
-            initialize_layout(&layout)?;
-            reset_layout_for_overwrite(&layout)?;
         }
-    }
-    state.mount(cartridge_id, layout);
-    state.partition_runtime = preserved_partition_runtime;
-    state.cartridge_capacity_bytes = preserved_capacity_bytes;
-    state.retention_policy = preserved_retention_policy;
-    if let Some(layout) = state.active_layout.as_ref() {
+        state.mount(cartridge_id, layout.clone());
+        state.partition_runtime = preserved_partition_runtime;
+        state.cartridge_capacity_bytes = preserved_capacity_bytes;
+        state.retention_policy = preserved_retention_policy;
         persist_filemarks(&layout.root, &state.filemarks)?;
         persist_retention_state(
             &layout.root,
             state.retention_policy.is_worm_media,
             state.retention_policy.retention_locked,
         )?;
-    }
-    Ok(())
+        Ok(())
+    })();
+    finish_write_command(state, &layout, erase_result)
 }
 
 pub fn set_block_mode_fixed(state: &mut TapeState, block_size: u32) -> Result<(), TapeError> {
@@ -656,6 +658,7 @@ pub fn write_data(
     initiator: Option<&str>,
 ) -> Result<(), TapeError> {
     ensure_loaded(state)?;
+    ensure_write_ready(state)?;
     invalidate_state_read_prefetch(state);
     let payload_len = validate_payload_len(payload.len())?;
     if payload.is_empty() {
@@ -682,28 +685,39 @@ pub fn write_data(
         .as_ref()
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?
         .clone();
-    truncate_tail_before_write(state, &layout)?;
     ensure_capacity_available(state, payload.len() as u64)?;
+    let requested_units = if state.block_mode.mode == BlockMode::Fixed {
+        1
+    } else {
+        payload_len
+    };
+    let _filesystem_reservation =
+        acquire_write_admission(&layout, payload.len() as u64, 1, 1, 8192, requested_units)?;
+    let write_result = (|| {
+        crate::storage::data_path::mark_checkpoint_dirty(&layout)?;
+        truncate_tail_before_write(state, &layout)?;
+        write_logical_block(
+            &layout,
+            state.current_position,
+            payload,
+            validate_payload_len(state.filemarks.len())?,
+            tape_write_options(state),
+            None,
+        )?;
 
-    write_logical_block(
-        &layout,
-        state.current_position,
-        payload,
-        validate_payload_len(state.filemarks.len())?,
-        tape_write_options(state),
-        None,
-    )?;
-
-    record_block(state, state.current_position, payload_len);
-    state.current_position += payload.len() as u64;
-    if state.current_position > state.eod_position {
-        state.eod_position = state.current_position;
-    }
-    state.command_counters.write_ops = state.command_counters.write_ops.saturating_add(1);
-    state
-        .record_write_usage(payload.len() as u64)
-        .map_err(StorageError::from)?;
-    Ok(())
+        record_block(state, state.current_position, payload_len);
+        state.current_position = state
+            .current_position
+            .checked_add(payload.len() as u64)
+            .ok_or(StorageError::Internal("tape position overflow".to_string()))?;
+        state.eod_position = state.eod_position.max(state.current_position);
+        state.command_counters.write_ops = state.command_counters.write_ops.saturating_add(1);
+        state
+            .record_write_usage(payload.len() as u64)
+            .map_err(StorageError::from)?;
+        Ok(())
+    })();
+    finish_write_command(state, &layout, write_result)
 }
 
 fn truncate_tail_before_write(
@@ -752,6 +766,7 @@ fn truncate_tail_before_write(
 
 pub fn read_data(state: &mut TapeState) -> Result<Vec<u8>, TapeError> {
     ensure_loaded(state)?;
+    ensure_recovery_complete(state)?;
 
     let layout = state
         .active_layout
@@ -788,6 +803,7 @@ pub fn write_fixed_blocks(
     initiator: Option<&str>,
 ) -> Result<(), TapeError> {
     ensure_loaded(state)?;
+    ensure_write_ready(state)?;
     invalidate_state_read_prefetch(state);
     if payload.is_empty() || block_size == 0 || !payload.len().is_multiple_of(block_size) {
         return Err(TapeError::InvalidArgument(
@@ -811,30 +827,46 @@ pub fn write_fixed_blocks(
         .as_ref()
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?
         .clone();
-    truncate_tail_before_write(state, &layout)?;
     ensure_capacity_available(state, payload.len() as u64)?;
-
-    let filemark_count = validate_payload_len(state.filemarks.len())?;
-    for chunk in payload.chunks(block_size) {
-        write_logical_block(
-            &layout,
-            state.current_position,
-            chunk,
-            filemark_count,
-            tape_write_options(state),
-            None,
-        )?;
-        record_block(state, state.current_position, fixed_block_size);
-        state.current_position = state.current_position.saturating_add(chunk.len() as u64);
-        if state.current_position > state.eod_position {
-            state.eod_position = state.current_position;
+    let block_count = payload.len() / block_size;
+    let _filesystem_reservation = acquire_write_admission(
+        &layout,
+        payload.len() as u64,
+        u64::try_from(block_count)
+            .map_err(|_| TapeError::InvalidArgument("write too large".into()))?,
+        u64::try_from(block_count)
+            .map_err(|_| TapeError::InvalidArgument("write too large".into()))?,
+        8192,
+        u32::try_from(block_count)
+            .map_err(|_| TapeError::InvalidArgument("write too large".into()))?,
+    )?;
+    let write_result = (|| {
+        crate::storage::data_path::mark_checkpoint_dirty(&layout)?;
+        truncate_tail_before_write(state, &layout)?;
+        let filemark_count = validate_payload_len(state.filemarks.len())?;
+        for chunk in payload.chunks(block_size) {
+            write_logical_block(
+                &layout,
+                state.current_position,
+                chunk,
+                filemark_count,
+                tape_write_options(state),
+                None,
+            )?;
+            record_block(state, state.current_position, fixed_block_size);
+            state.current_position = state
+                .current_position
+                .checked_add(chunk.len() as u64)
+                .ok_or(StorageError::Internal("tape position overflow".to_string()))?;
+            state.eod_position = state.eod_position.max(state.current_position);
+            state.command_counters.write_ops = state.command_counters.write_ops.saturating_add(1);
+            state
+                .record_write_usage(chunk.len() as u64)
+                .map_err(StorageError::from)?;
         }
-        state.command_counters.write_ops = state.command_counters.write_ops.saturating_add(1);
-        state
-            .record_write_usage(chunk.len() as u64)
-            .map_err(StorageError::from)?;
-    }
-    Ok(())
+        Ok(())
+    })();
+    finish_write_command(state, &layout, write_result)
 }
 
 pub fn read_fixed_blocks(
@@ -843,6 +875,7 @@ pub fn read_fixed_blocks(
     transfer_blocks: usize,
 ) -> Result<Vec<u8>, TapeError> {
     ensure_loaded(state)?;
+    ensure_recovery_complete(state)?;
     let fixed_block_size = validate_payload_len(block_size)?;
     if transfer_blocks == 0 || block_size == 0 {
         return Err(TapeError::InvalidArgument(
@@ -946,6 +979,7 @@ pub fn write_filemarks(
     initiator: Option<&str>,
 ) -> Result<(), TapeError> {
     ensure_loaded(state)?;
+    ensure_write_ready(state)?;
     invalidate_state_read_prefetch(state);
     if count == 0 {
         state.command_counters.filemark_ops = state.command_counters.filemark_ops.saturating_add(1);
@@ -956,23 +990,50 @@ pub fn write_filemarks(
     enforce_worm_append_only(state)?;
 
     let step = logical_position_step(state);
-    ensure_capacity_available(state, step.saturating_mul(count as u64))?;
-    for _ in 0..count {
-        state.filemarks.push(state.current_position);
-        state.current_position = state.current_position.saturating_add(step);
-    }
-    if state.current_position > state.eod_position {
-        state.eod_position = state.current_position;
-    }
-    if let Some(layout) = state.active_layout.as_ref() {
-        flush_pending_writes(layout)?;
+    let advance = step
+        .checked_mul(count as u64)
+        .ok_or(StorageError::Internal(
+            "filemark position overflow".to_string(),
+        ))?;
+    ensure_capacity_available(state, advance)?;
+    let layout = state
+        .active_layout
+        .as_ref()
+        .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?
+        .clone();
+    let filemark_bytes = (state.filemarks.len() as u64)
+        .checked_mul(8)
+        .and_then(|old| old.checked_add((count as u64).checked_mul(8)?))
+        .ok_or(StorageError::Internal(
+            "filemark estimate overflow".to_string(),
+        ))?;
+    let _filesystem_reservation = acquire_space_admission(&layout, 0, 0, 0, filemark_bytes)
+        .map_err(|err| match err {
+            TapeError::Storage(source) => TapeError::PhysicalFilemarkAdmission(source),
+            other => other,
+        })?;
+    let write_result = (|| {
+        flush_pending_writes(&layout)?;
+        crate::storage::data_path::mark_checkpoint_dirty(&layout)?;
+        for _ in 0..count {
+            state.filemarks.push(state.current_position);
+            state.current_position =
+                state
+                    .current_position
+                    .checked_add(step)
+                    .ok_or(StorageError::Internal(
+                        "filemark position overflow".to_string(),
+                    ))?;
+        }
+        state.eod_position = state.eod_position.max(state.current_position);
         persist_filemarks(&layout.root, &state.filemarks)?;
-    }
-    state.command_counters.filemark_ops = state.command_counters.filemark_ops.saturating_add(1);
-    state
-        .record_filemark_usage(count as u64)
-        .map_err(StorageError::from)?;
-    Ok(())
+        state.command_counters.filemark_ops = state.command_counters.filemark_ops.saturating_add(1);
+        state
+            .record_filemark_usage(count as u64)
+            .map_err(StorageError::from)?;
+        Ok(())
+    })();
+    finish_write_command(state, &layout, write_result)
 }
 
 pub fn space(state: &mut TapeState, branch: SpaceBranch, count: i64) -> Result<(), TapeError> {
@@ -1293,6 +1354,116 @@ fn ensure_capacity_available(state: &TapeState, bytes_to_advance: u64) -> Result
         return Err(TapeError::VolumeOverflow);
     }
     Ok(())
+}
+
+fn ensure_write_ready(state: &TapeState) -> Result<(), TapeError> {
+    ensure_recovery_complete(state)
+}
+
+fn ensure_recovery_complete(state: &TapeState) -> Result<(), TapeError> {
+    if state.requires_recovery {
+        return Err(TapeError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+fn acquire_space_admission(
+    layout: &crate::storage::LayoutPaths,
+    payload_bytes: u64,
+    blob_count: u64,
+    touched_segments: u64,
+    metadata_temporary_bytes: u64,
+) -> Result<FilesystemReservation, TapeError> {
+    let runtime_dir = crate::storage::layout_lease::storage_runtime_dir();
+    let lock = FilesystemLock::acquire_wait(
+        &layout.root,
+        &runtime_dir,
+        std::time::Duration::from_secs(30),
+    )
+    .map_err(|err| {
+        eprintln!("[space_guard] filesystem lock failed reason={err}");
+        TapeError::Storage(StorageError::SpaceAdmission(err))
+    })?;
+    let snapshot = lock.probe().map_err(|err| {
+        eprintln!("[space_guard] filesystem probe failed reason={err}");
+        TapeError::Storage(StorageError::SpaceAdmission(err))
+    })?;
+    if lock.filesystem_id != snapshot.filesystem_id {
+        let err = crate::storage::space_guard::SpaceGuardError::UnknownCapacity;
+        eprintln!("[space_guard] filesystem changed during admission");
+        return Err(TapeError::Storage(StorageError::SpaceAdmission(err)));
+    }
+    let peak = estimate_write_peak_bytes(
+        payload_bytes,
+        blob_count,
+        touched_segments,
+        metadata_temporary_bytes,
+        snapshot.allocation_unit,
+    )
+    .map_err(|err| {
+        eprintln!("[space_guard] write estimate failed reason={err}");
+        TapeError::Storage(StorageError::SpaceAdmission(err))
+    })?;
+    let in_flight = lock.active_reservation_bytes().map_err(|err| {
+        eprintln!("[space_guard] active reservations could not be read reason={err}");
+        TapeError::Storage(StorageError::SpaceAdmission(err))
+    })?;
+    let peak_with_in_flight = in_flight.checked_add(peak).ok_or_else(|| {
+        TapeError::Storage(StorageError::SpaceAdmission(
+            crate::storage::space_guard::SpaceGuardError::ArithmeticOverflow,
+        ))
+    })?;
+    ensure_capacity(snapshot.available_bytes, peak_with_in_flight, SPACE_RESERVE_BYTES).map_err(|err| {
+        eprintln!(
+            "[space_guard] write rejected filesystem_id={} available_bytes={} peak_extra_bytes={} in_flight_reserved_bytes={} reason={err}",
+            snapshot.filesystem_id, snapshot.available_bytes, peak, in_flight
+        );
+        TapeError::Storage(StorageError::SpaceAdmission(err))
+    })?;
+    let reservation = lock.reserve(peak).map_err(|err| {
+        eprintln!("[space_guard] write reservation failed reason={err}");
+        TapeError::Storage(StorageError::SpaceAdmission(err))
+    })?;
+    drop(lock);
+    Ok(reservation)
+}
+
+fn acquire_write_admission(
+    layout: &crate::storage::LayoutPaths,
+    payload_bytes: u64,
+    blob_count: u64,
+    touched_segments: u64,
+    metadata_temporary_bytes: u64,
+    requested_units: u32,
+) -> Result<FilesystemReservation, TapeError> {
+    acquire_space_admission(
+        layout,
+        payload_bytes,
+        blob_count,
+        touched_segments,
+        metadata_temporary_bytes,
+    )
+    .map_err(|err| match err {
+        TapeError::Storage(source) => TapeError::PhysicalWriteAdmission {
+            requested_units,
+            source,
+        },
+        other => other,
+    })
+}
+
+fn finish_write_command(
+    state: &mut TapeState,
+    layout: &crate::storage::LayoutPaths,
+    result: Result<(), TapeError>,
+) -> Result<(), TapeError> {
+    if result.is_err() {
+        state.requires_recovery = true;
+        if let Err(err) = discard_layout_caches_checked(layout) {
+            eprintln!("[space_guard] cache invalidation failed after write error: {err}");
+        }
+    }
+    result
 }
 
 fn early_warning_active(state: &TapeState) -> bool {

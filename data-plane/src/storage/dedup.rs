@@ -6,10 +6,11 @@ use std::sync::{Mutex, OnceLock};
 use super::compression::CompressionCodec;
 use super::layout::SegmentKind;
 use super::metadata::{
-    checked_usize_from_u64, lock_storage_mutex, modified_nanos_from_result, StorageError,
+    checked_metadata_record_count, checked_usize_from_u64, lock_storage_mutex,
+    modified_nanos_from_result, StorageError, MAX_MAINTENANCE_METADATA_BYTES,
 };
 use super::segment::{
-    append_segment_payload, read_segment_file, sync_segment_file, write_segment_file,
+    append_segment_payload, read_segment_file_bounded, sync_segment_file, write_segment_file,
 };
 
 const DEDUP_RECORD_SIZE: usize = 52;
@@ -254,7 +255,8 @@ fn ensure_cache_fresh(path: &Path) -> Result<(), StorageError> {
         }
     }
 
-    let (header, payload) = read_segment_file(path, SegmentKind::Dedup)?;
+    let (header, payload) =
+        read_segment_file_bounded(path, SegmentKind::Dedup, MAX_MAINTENANCE_METADATA_BYTES)?;
     let log_format = payload.starts_with(LOG_PREFIX);
     let entries = decode_payload(&payload)?;
     lock_storage_mutex(cache(), "dedup")?.insert(
@@ -291,6 +293,11 @@ pub fn discard_dedup_cache(path: &Path) {
     if let Ok(mut guard) = lock_storage_mutex(cache(), "dedup") {
         guard.remove(path);
     }
+}
+
+pub fn discard_dedup_cache_checked(path: &Path) -> Result<(), StorageError> {
+    lock_storage_mutex(cache(), "dedup")?.remove(path);
+    Ok(())
 }
 
 pub fn lookup_entry_by_id(path: &Path, entry_id: u64) -> Result<DedupIndexEntry, StorageError> {
@@ -379,6 +386,11 @@ pub fn upsert_dedup_entry(
     let fp_key = fingerprint_key_for(&entry);
     let saw_collision = cached.fingerprint_index.contains_key(&fp_key);
 
+    if cached.next_entry_id == u64::MAX {
+        return Err(StorageError::Conflict(
+            "dedup entry ID space is exhausted".to_string(),
+        ));
+    }
     entry.entry_id = cached.next_entry_id;
     let header = append_segment_payload(
         path,
@@ -393,7 +405,10 @@ pub fn upsert_dedup_entry(
     cached.identity_index.insert(key, inserted_index);
     cached.fingerprint_index.insert(fp_key, ());
     cached.id_index.insert(entry.entry_id, inserted_index);
-    cached.next_entry_id = cached.next_entry_id.saturating_add(1);
+    cached.next_entry_id = cached
+        .next_entry_id
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Conflict("dedup entry ID space is exhausted".to_string()))?;
     cached.sequence = header.sequence;
     if !trust_hot_cache() {
         cached.stamp = file_stamp(path)?;
@@ -420,6 +435,11 @@ pub fn insert_dedup_collision_entry(
         .ok_or_else(|| StorageError::NotFound("dedup cache not initialized".to_string()))?;
     let key = identity_key_for(&entry);
     let fp_key = fingerprint_key_for(&entry);
+    if cached.next_entry_id == u64::MAX {
+        return Err(StorageError::Conflict(
+            "dedup entry ID space is exhausted".to_string(),
+        ));
+    }
     entry.entry_id = cached.next_entry_id;
     let header = append_segment_payload(
         path,
@@ -434,7 +454,10 @@ pub fn insert_dedup_collision_entry(
     cached.identity_index.insert(key, inserted_index);
     cached.fingerprint_index.insert(fp_key, ());
     cached.id_index.insert(entry.entry_id, inserted_index);
-    cached.next_entry_id = cached.next_entry_id.saturating_add(1);
+    cached.next_entry_id = cached
+        .next_entry_id
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Conflict("dedup entry ID space is exhausted".to_string()))?;
     cached.sequence = header.sequence;
     if !trust_hot_cache() {
         cached.stamp = file_stamp(path)?;
@@ -543,6 +566,7 @@ fn decode_legacy_payload(payload: &[u8]) -> Result<Vec<DedupIndexEntry>, Storage
             .map_err(|_| StorageError::Corrupt("dedup count parse failed".to_string()))?,
     );
     let count = checked_usize_from_u64(raw_count, "dedup count")?;
+    let count = checked_metadata_record_count(count)?;
     if payload.len().saturating_sub(8) / DEDUP_RECORD_SIZE < count {
         return Err(StorageError::Corrupt("dedup payload truncated".to_string()));
     }
@@ -567,6 +591,12 @@ fn decode_log_payload(payload: &[u8]) -> Result<Vec<DedupIndexEntry>, StorageErr
         ));
     }
     let mut offset = LOG_PREFIX.len();
+    if !(payload.len() - LOG_PREFIX.len()).is_multiple_of(DEDUP_RECORD_SIZE) {
+        return Err(StorageError::Corrupt(
+            "dedup log payload length mismatch".to_string(),
+        ));
+    }
+    checked_metadata_record_count((payload.len() - LOG_PREFIX.len()) / DEDUP_RECORD_SIZE)?;
     let mut latest = HashMap::<u64, DedupIndexEntry>::new();
     while offset < payload.len() {
         if payload.len() < offset + DEDUP_RECORD_SIZE {
@@ -584,7 +614,8 @@ fn decode_log_payload(payload: &[u8]) -> Result<Vec<DedupIndexEntry>, StorageErr
 }
 
 fn ensure_log_format(path: &Path, entries: &[DedupIndexEntry]) -> Result<(), StorageError> {
-    let (_, payload) = read_segment_file(path, SegmentKind::Dedup)?;
+    let (_, payload) =
+        read_segment_file_bounded(path, SegmentKind::Dedup, MAX_MAINTENANCE_METADATA_BYTES)?;
     if payload.starts_with(LOG_PREFIX) {
         return Ok(());
     }

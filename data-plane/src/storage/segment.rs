@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -87,6 +87,99 @@ pub fn write_segment_file(
     Ok(())
 }
 
+pub(crate) fn write_segment_file_streaming<F>(
+    path: &Path,
+    kind: SegmentKind,
+    segment_id: u64,
+    sequence: u64,
+    write_payload: F,
+) -> Result<SegmentHeader, StorageError>
+where
+    F: FnOnce(&mut File) -> Result<(), StorageError>,
+{
+    ensure_parent_dir(path)?;
+    invalidate_append_file(path)?;
+    let tmp_path = path.with_extension("tmp");
+    match fs::symlink_metadata(&tmp_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(&tmp_path)?;
+        }
+        Ok(_) => {
+            return Err(StorageError::Conflict(
+                "unsafe segment temporary file".to_string(),
+            ));
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(StorageError::Io(err)),
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StorageError::Conflict(
+                "unsafe segment output file".to_string(),
+            ));
+        }
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(&[0u8; SEGMENT_HEADER_V2_TOTAL_SIZE])?;
+        write_payload(&mut file)?;
+
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let payload_offset = SEGMENT_HEADER_V2_TOTAL_SIZE as u64;
+        let payload_len = file_end
+            .checked_sub(payload_offset)
+            .ok_or_else(|| StorageError::Corrupt("streamed segment is truncated".to_string()))?;
+        file.seek(SeekFrom::Start(payload_offset))?;
+        let mut checksum = 0u32;
+        let mut remaining = payload_len;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        while remaining > 0 {
+            let requested = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| StorageError::Corrupt("segment length overflow".to_string()))?;
+            let read = file.read(&mut buffer[..requested])?;
+            if read == 0 {
+                return Err(StorageError::Io(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "short read verifying streamed segment",
+                )));
+            }
+            checksum = integrity32_continue(checksum, &buffer[..read]);
+            remaining = remaining.saturating_sub(read as u64);
+        }
+        let header = SegmentHeader {
+            magic: STORAGE_LAYOUT_MAGIC,
+            version: STORAGE_LAYOUT_VERSION,
+            kind,
+            segment_id,
+            sequence,
+            payload_len,
+            checksum,
+        };
+        file.seek(SeekFrom::Start(0))?;
+        write_segment_headers(&mut file, &header)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        invalidate_append_file(path)?;
+        Ok(header)
+    })();
+    if result.is_err() {
+        match fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+    result
+}
+
 pub fn read_segment_file(
     path: &Path,
     expected_kind: SegmentKind,
@@ -108,7 +201,57 @@ pub fn read_segment_file(
         )));
     }
 
-    let (header, payload_offset) = decode_segment_header_set(&bytes)?;
+    decode_segment_file_bytes(path, expected_kind, &bytes)
+}
+
+pub(crate) fn read_segment_file_bounded(
+    path: &Path,
+    expected_kind: SegmentKind,
+    max_bytes: u64,
+) -> Result<(SegmentHeader, Vec<u8>), StorageError> {
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(StorageError::Conflict(
+            "unsafe metadata file type".to_string(),
+        ));
+    }
+    if before.len() > max_bytes {
+        return Err(StorageError::MetadataBudgetExceeded);
+    }
+    let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.dev() != before.dev() || opened.ino() != before.ino() {
+        return Err(StorageError::Conflict(
+            "metadata file identity changed while opening".to_string(),
+        ));
+    }
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or(StorageError::MetadataBudgetExceeded)?;
+    let capacity =
+        usize::try_from(before.len()).map_err(|_| StorageError::MetadataBudgetExceeded)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes || file.metadata()?.len() > max_bytes {
+        return Err(StorageError::MetadataBudgetExceeded);
+    }
+    decode_segment_file_bytes(path, expected_kind, &bytes)
+}
+
+fn decode_segment_file_bytes(
+    path: &Path,
+    expected_kind: SegmentKind,
+    bytes: &[u8],
+) -> Result<(SegmentHeader, Vec<u8>), StorageError> {
+    if bytes.len() < SEGMENT_HEADER_SIZE {
+        return Err(StorageError::Corrupt(format!(
+            "segment too short: {}",
+            path.display()
+        )));
+    }
+    let (header, payload_offset) = decode_segment_header_set(bytes)?;
     if header.kind != expected_kind {
         return Err(StorageError::Corrupt("segment kind mismatch".to_string()));
     }
@@ -129,15 +272,34 @@ pub fn read_segment_header(
     path: &Path,
     expected_kind: SegmentKind,
 ) -> Result<SegmentHeader, StorageError> {
-    if !path.exists() {
-        return Err(StorageError::NotFound(format!(
-            "segment not found: {}",
-            path.display()
-        )));
+    let before = fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            StorageError::NotFound(format!("segment not found: {}", path.display()))
+        } else {
+            StorageError::Io(err)
+        }
+    })?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(StorageError::Conflict(
+            "unsafe segment file type".to_string(),
+        ));
     }
-
     let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    if opened.dev() != before.dev() || opened.ino() != before.ino() {
+        return Err(StorageError::Conflict(
+            "segment identity changed while opening".to_string(),
+        ));
+    }
+    read_segment_header_from_file(&mut file, expected_kind)
+}
+
+pub(crate) fn read_segment_header_from_file(
+    file: &mut File,
+    expected_kind: SegmentKind,
+) -> Result<SegmentHeader, StorageError> {
     let mut probe = vec![0u8; SEGMENT_HEADER_V2_TOTAL_SIZE];
+    file.seek(SeekFrom::Start(0))?;
     let read_len = file.read(&mut probe)?;
     let (header, _) = decode_segment_header_set(&probe[..read_len])?;
     if header.kind != expected_kind {
@@ -489,6 +651,12 @@ pub fn sync_segment_file(path: &Path) -> Result<(), StorageError> {
     }
     let file = OpenOptions::new().read(true).write(true).open(path)?;
     file.sync_all()?;
+    Ok(())
+}
+
+pub fn discard_layout_append_handles(root: &Path) -> Result<(), StorageError> {
+    let mut cache = lock_storage_mutex(append_file_cache(), "segment append")?;
+    cache.retain(|path, _| !path.starts_with(root));
     Ok(())
 }
 

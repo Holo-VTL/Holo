@@ -9,17 +9,63 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::blk_map::BlkMapRecord;
 use super::layout::{checksum32, sanitize_id, SegmentKind};
 use super::map_lookup::MapLookupRecord;
-use super::segment::{read_segment_file, write_segment_file};
+use super::segment::{read_segment_file_bounded, write_segment_file};
+
+pub const MAX_MAINTENANCE_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_MAINTENANCE_METADATA_RECORDS: usize = 65_536;
+const MAX_LIVE_METADATA_ESTIMATE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub(crate) fn preflight_maintenance_metadata(paths: &[&Path]) -> Result<(), StorageError> {
+    let mut total_bytes = 0u64;
+    for path in paths {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(StorageError::Io(err)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StorageError::Conflict(
+                "unsafe maintenance metadata file".to_string(),
+            ));
+        }
+        if metadata.len() > MAX_MAINTENANCE_METADATA_BYTES {
+            return Err(StorageError::MetadataBudgetExceeded);
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or(StorageError::MetadataBudgetExceeded)?;
+    }
+    let estimated_live_bytes = total_bytes
+        .checked_mul(6)
+        .ok_or(StorageError::MetadataBudgetExceeded)?;
+    if total_bytes > MAX_MAINTENANCE_METADATA_BYTES
+        || estimated_live_bytes > MAX_LIVE_METADATA_ESTIMATE_BYTES
+    {
+        return Err(StorageError::MetadataBudgetExceeded);
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_metadata_record_count(count: usize) -> Result<usize, StorageError> {
+    if count > MAX_MAINTENANCE_METADATA_RECORDS {
+        return Err(StorageError::MetadataBudgetExceeded);
+    }
+    Ok(count)
+}
 
 const DEFAULT_SLOW_LOCK_WAIT_MS: u64 = 1000;
 
 #[derive(Debug)]
 pub enum StorageError {
     Io(io::Error),
+    SpaceExhausted(String),
+    SpaceAdmission(super::space_guard::SpaceGuardError),
     Corrupt(String),
     VersionMismatch { expected: u16, got: u16 },
     NotFound(String),
     Conflict(String),
+    MetadataBudgetExceeded,
+    Cancelled,
     Internal(String),
 }
 
@@ -27,12 +73,16 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "io error: {err}"),
+            Self::SpaceExhausted(msg) => write!(f, "filesystem is out of space: {msg}"),
+            Self::SpaceAdmission(err) => write!(f, "filesystem space admission failed: {err}"),
             Self::Corrupt(msg) => write!(f, "corrupt state: {msg}"),
             Self::VersionMismatch { expected, got } => {
                 write!(f, "version mismatch expected={expected} got={got}")
             }
             Self::NotFound(msg) => write!(f, "not found: {msg}"),
             Self::Conflict(msg) => write!(f, "conflict: {msg}"),
+            Self::MetadataBudgetExceeded => write!(f, "maintenance metadata budget exceeded"),
+            Self::Cancelled => write!(f, "maintenance operation cancelled"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -42,7 +92,20 @@ impl std::error::Error for StorageError {}
 
 impl From<io::Error> for StorageError {
     fn from(value: io::Error) -> Self {
+        let raw = value.raw_os_error();
+        if value.kind() == io::ErrorKind::StorageFull
+            || raw == Some(rustix::io::Errno::NOSPC.raw_os_error())
+            || raw == Some(rustix::io::Errno::DQUOT.raw_os_error())
+        {
+            return Self::SpaceExhausted(value.to_string());
+        }
         Self::Io(value)
+    }
+}
+
+impl From<super::space_guard::SpaceGuardError> for StorageError {
+    fn from(value: super::space_guard::SpaceGuardError) -> Self {
+        Self::SpaceAdmission(value)
     }
 }
 
@@ -205,33 +268,39 @@ pub fn storage_root_dir() -> PathBuf {
 }
 
 pub fn storage_root_dir_for_cartridge(cartridge_id: &str) -> PathBuf {
-	let media_state_dir = env::var("HOLO_MEDIA_STATE_DIR")
-		.map(PathBuf::from)
-		.unwrap_or_else(|_| PathBuf::from("/run/holo/media-state"));
-	let pool_root_base = env::var("HOLO_STORAGE_POOL_ROOT_BASE")
-		.ok()
-		.map(PathBuf::from);
-	resolve_cartridge_storage_root(cartridge_id, &media_state_dir, &storage_root_dir(), pool_root_base.as_deref())
+    let media_state_dir = env::var("HOLO_MEDIA_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/run/holo/media-state"));
+    let pool_root_base = env::var("HOLO_STORAGE_POOL_ROOT_BASE")
+        .ok()
+        .map(PathBuf::from);
+    resolve_cartridge_storage_root(
+        cartridge_id,
+        &media_state_dir,
+        &storage_root_dir(),
+        pool_root_base.as_deref(),
+    )
 }
 
 fn resolve_cartridge_storage_root(
-	cartridge_id: &str,
-	media_state_dir: &Path,
-	fallback_root: &Path,
-	pool_root_base: Option<&Path>,
+    cartridge_id: &str,
+    media_state_dir: &Path,
+    fallback_root: &Path,
+    pool_root_base: Option<&Path>,
 ) -> PathBuf {
-	let metadata_path = media_state_dir.join(format!("cartridge_{}.meta", sanitize_id(cartridge_id)));
-	let Ok(raw) = fs::read_to_string(metadata_path) else {
-		return fallback_root.to_path_buf();
-	};
-	let pool_id = raw.lines().find_map(|line| {
-		let (key, value) = line.trim().split_once('=')?;
-		(key.trim() == "pool_id" && !value.trim().is_empty()).then(|| value.trim())
-	});
-	let (Some(pool_id), Some(base)) = (pool_id, pool_root_base) else {
-		return fallback_root.to_path_buf();
-	};
-	base.join(sanitize_id(pool_id))
+    let metadata_path =
+        media_state_dir.join(format!("cartridge_{}.meta", sanitize_id(cartridge_id)));
+    let Ok(raw) = fs::read_to_string(metadata_path) else {
+        return fallback_root.to_path_buf();
+    };
+    let pool_id = raw.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == "pool_id" && !value.trim().is_empty()).then(|| value.trim())
+    });
+    let (Some(pool_id), Some(base)) = (pool_id, pool_root_base) else {
+        return fallback_root.to_path_buf();
+    };
+    base.join(sanitize_id(pool_id))
 }
 
 pub fn persist_checkpoint_page(
@@ -249,41 +318,53 @@ pub fn persist_checkpoint_page(
 }
 
 pub fn load_checkpoint_page(path: &Path) -> Result<MetadataCheckpoint, StorageError> {
-    let (_, payload) = read_segment_file(path, SegmentKind::Metadata)?;
+    let (_, payload) =
+        read_segment_file_bounded(path, SegmentKind::Metadata, MAX_MAINTENANCE_METADATA_BYTES)?;
     MetadataCheckpoint::decode(&payload)
 }
 
 #[cfg(test)]
 mod local_mount_pool_tests {
-	use super::resolve_cartridge_storage_root;
-	use std::fs;
+    use super::resolve_cartridge_storage_root;
+    use std::fs;
 
-	#[test]
-	fn resolves_loaded_cartridge_to_its_pool_root() {
-		let root = std::env::temp_dir().join(format!("holo-pool-route-{}", std::process::id()));
-		let state_dir = root.join("media-state");
-		let pool_base = root.join("pools");
-		let fallback = root.join("fallback");
-		fs::create_dir_all(&state_dir).expect("create state dir");
-		fs::write(state_dir.join("cartridge_tape001.meta"), "pool_id=pool-a\n").expect("write media map");
+    #[test]
+    fn resolves_loaded_cartridge_to_its_pool_root() {
+        let root = std::env::temp_dir().join(format!("holo-pool-route-{}", std::process::id()));
+        let state_dir = root.join("media-state");
+        let pool_base = root.join("pools");
+        let fallback = root.join("fallback");
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        fs::write(state_dir.join("cartridge_tape001.meta"), "pool_id=pool-a\n")
+            .expect("write media map");
 
-		let resolved = resolve_cartridge_storage_root("TAPE001", &state_dir, &fallback, Some(&pool_base));
-		assert_eq!(resolved, pool_base.join("pool-a"));
-		let _ = fs::remove_dir_all(root);
-	}
+        let resolved =
+            resolve_cartridge_storage_root("TAPE001", &state_dir, &fallback, Some(&pool_base));
+        assert_eq!(resolved, pool_base.join("pool-a"));
+        let _ = fs::remove_dir_all(root);
+    }
 
-	#[test]
-	fn missing_pool_metadata_keeps_existing_storage_root_behavior() {
-		let root = std::env::temp_dir().join(format!("holo-pool-fallback-{}", std::process::id()));
-		let state_dir = root.join("media-state");
-		let fallback = root.join("fallback");
-		fs::create_dir_all(&state_dir).expect("create state dir");
-		fs::write(state_dir.join("cartridge_tape002.meta"), "capacity_bytes=1024\n").expect("write legacy metadata");
+    #[test]
+    fn missing_pool_metadata_keeps_existing_storage_root_behavior() {
+        let root = std::env::temp_dir().join(format!("holo-pool-fallback-{}", std::process::id()));
+        let state_dir = root.join("media-state");
+        let fallback = root.join("fallback");
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        fs::write(
+            state_dir.join("cartridge_tape002.meta"),
+            "capacity_bytes=1024\n",
+        )
+        .expect("write legacy metadata");
 
-		let resolved = resolve_cartridge_storage_root("TAPE002", &state_dir, &fallback, Some(&root.join("pools")));
-		assert_eq!(resolved, fallback);
-		let _ = fs::remove_dir_all(root);
-	}
+        let resolved = resolve_cartridge_storage_root(
+            "TAPE002",
+            &state_dir,
+            &fallback,
+            Some(&root.join("pools")),
+        );
+        assert_eq!(resolved, fallback);
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

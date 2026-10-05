@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/Holo-VTL/Holo/control-plane/internal/domain"
@@ -17,6 +18,161 @@ func openTestDB(t *testing.T, path string) *CoreResourcesRepo {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return NewCoreResourcesRepo(db)
+}
+
+func TestSQLiteCoreResourcesRepoRejectsProjectedIdentityAliases(t *testing.T) {
+	ctx := context.Background()
+	repo := openTestDB(t, filepath.Join(t.TempDir(), "metadata.db"))
+
+	firstLibrary, _ := domain.NewVirtualLibrary("lib.a", "Library A")
+	secondLibrary, _ := domain.NewVirtualLibrary("lib_a", "Library B")
+	if err := repo.CreateLibrary(ctx, firstLibrary); err != nil {
+		t.Fatalf("create first projected library: %v", err)
+	}
+	if err := repo.CreateLibrary(ctx, secondLibrary); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected aliased library directory conflict, got %v", err)
+	}
+
+	library, _ := domain.NewVirtualLibrary("lib-drive", "Drive Library")
+	if err := repo.CreateLibrary(ctx, library); err != nil {
+		t.Fatal(err)
+	}
+	firstDrive, _ := domain.NewVirtualDrive("drive name", library.LibraryID, 1)
+	secondDrive, _ := domain.NewVirtualDrive("drive-name", library.LibraryID, 2)
+	if firstDrive.IQN != secondDrive.IQN {
+		t.Fatalf("test requires generated IQN alias, got %q and %q", firstDrive.IQN, secondDrive.IQN)
+	}
+	if err := repo.CreateDrive(ctx, firstDrive); err != nil {
+		t.Fatalf("create first drive: %v", err)
+	}
+	if err := repo.CreateDrive(ctx, secondDrive); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected generated IQN conflict, got %v", err)
+	}
+
+	driveAliasLibrary, _ := domain.NewVirtualLibrary("lib-drive-alias", "Drive Alias Library")
+	if err := repo.CreateLibrary(ctx, driveAliasLibrary); err != nil {
+		t.Fatal(err)
+	}
+	firstAliasDrive, _ := domain.NewVirtualDrive("drive.a", driveAliasLibrary.LibraryID, 1)
+	secondAliasDrive, _ := domain.NewVirtualDrive("drive_a", driveAliasLibrary.LibraryID, 2)
+	if firstAliasDrive.IQN == secondAliasDrive.IQN {
+		t.Fatal("test identities unexpectedly share a target IQN")
+	}
+	if err := repo.CreateDrive(ctx, firstAliasDrive); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateDrive(ctx, secondAliasDrive); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected aliased legacy drive directory conflict, got %v", err)
+	}
+
+	firstStateLibrary, _ := domain.NewVirtualLibrary("a", "State A")
+	secondStateLibrary, _ := domain.NewVirtualLibrary("a__b", "State B")
+	if err := repo.CreateLibrary(ctx, firstStateLibrary); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateLibrary(ctx, secondStateLibrary); err != nil {
+		t.Fatal(err)
+	}
+	firstStateDrive, _ := domain.NewVirtualDrive("b__x", "a", 1)
+	secondStateDrive, _ := domain.NewVirtualDrive("x", "a__b", 2)
+	if firstStateDrive.IQN == secondStateDrive.IQN {
+		t.Fatal("test identities unexpectedly share a target IQN")
+	}
+	if err := repo.CreateDrive(ctx, firstStateDrive); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateDrive(ctx, secondStateDrive); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected shared media-state path conflict, got %v", err)
+	}
+
+	if err := NewStoragePoolRepo(repo.db).SavePool(ctx, mustSQLiteStoragePool(t, "pool-a")); err != nil {
+		t.Fatalf("save pool: %v", err)
+	}
+	firstCartridge := domain.NewVirtualCartridge("cart.a", "pool-a", library.LibraryID, "VTA001L06", 1024)
+	secondCartridge := domain.NewVirtualCartridge("cart_a", "pool-a", library.LibraryID, "VTA002L06", 1024)
+	if err := repo.CreateCartridge(ctx, firstCartridge); err != nil {
+		t.Fatalf("create first projected cartridge: %v", err)
+	}
+	if err := repo.CreateCartridge(ctx, secondCartridge); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected aliased cartridge metadata conflict, got %v", err)
+	}
+
+	firstDrive.Slot = 3
+	if err := repo.SaveDrive(ctx, firstDrive); err != nil {
+		t.Fatalf("save same drive after non-identity update: %v", err)
+	}
+}
+
+func TestSQLiteCoreResourcesRepoPreservesHistoricalProjectionConflicts(t *testing.T) {
+	ctx := context.Background()
+	repo := openTestDB(t, filepath.Join(t.TempDir(), "metadata.db"))
+	first, _ := domain.NewVirtualLibrary("lib.a", "Original A")
+	if err := repo.CreateLibrary(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.Exec(`INSERT INTO virtual_libraries (library_id, name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, "lib_a", "Historical B", "ready", "created", "updated"); err != nil {
+		t.Fatalf("insert historical alias fixture: %v", err)
+	}
+	first.Name = "Attempted Update"
+	if err := repo.SaveLibrary(ctx, first); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected conflict to block update to a historically aliased library, got %v", err)
+	}
+	var firstName, secondName string
+	if err := repo.db.QueryRow(`SELECT name FROM virtual_libraries WHERE library_id='lib.a'`).Scan(&firstName); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.db.QueryRow(`SELECT name FROM virtual_libraries WHERE library_id='lib_a'`).Scan(&secondName); err != nil {
+		t.Fatal(err)
+	}
+	if firstName != "Original A" || secondName != "Historical B" {
+		t.Fatalf("historical rows changed: first=%q second=%q", firstName, secondName)
+	}
+}
+
+func TestSQLiteCoreResourcesRepoSerializesProjectedLibraryCollisionsAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "metadata.db")
+	repos := []*CoreResourcesRepo{openTestDB(t, path), openTestDB(t, path)}
+	ids := []string{"concurrent.lib", "concurrent_lib"}
+	start := make(chan struct{})
+	results := make(chan error, len(repos))
+	var workers sync.WaitGroup
+	for index, repo := range repos {
+		id := ids[index]
+		workers.Add(1)
+		go func(repo *CoreResourcesRepo, id string) {
+			defer workers.Done()
+			library, _ := domain.NewVirtualLibrary(id, id)
+			<-start
+			results <- repo.CreateLibrary(ctx, library)
+		}(repo, id)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	created, conflicts := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			created++
+		case errors.Is(err, domain.ErrConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent create error: %v", err)
+		}
+	}
+	if created != 1 || conflicts != 1 {
+		t.Fatalf("expected one library and one conflict, created=%d conflicts=%d", created, conflicts)
+	}
+}
+
+func mustSQLiteStoragePool(t *testing.T, id string) *domain.StoragePoolRuntime {
+	t.Helper()
+	pool, err := domain.NewStoragePoolRuntime(id, id, 90)
+	if err != nil {
+		t.Fatalf("create test storage pool: %v", err)
+	}
+	return pool
 }
 
 func saveCoreRepoTestPool(t *testing.T, ctx context.Context, repo *CoreResourcesRepo, poolID string) {

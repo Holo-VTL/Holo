@@ -17,6 +17,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 PROTOCOL_VERSION = 1
+CONFIGFS_LUN_ATTRIBUTES = frozenset({
+    "statistics",
+    "alua_tg_pt_write_md",
+    "alua_tg_pt_status",
+    "alua_tg_pt_offline",
+    "alua_tg_pt_gp",
+})
 MAX_INPUT = 64 * 1024
 LOCK_PATH = "/run/holo/local-loopback-helper/lock"
 OWNER_DIR = "/var/lib/holo/local-loopback"
@@ -180,7 +187,10 @@ class LocalLoopbackHelper:
         return _ExclusiveLock(self.lock_path, self.lock_timeout)
 
     def _mutate(self, operation: str, mapping: Dict[str, Any]) -> Dict[str, Any]:
-        ownership = self.backend.inspect(mapping)
+        if operation == "remove":
+            ownership = self.backend.inspect_for_remove(mapping)
+        else:
+            ownership = self.backend.inspect(mapping)
         if ownership == "conflict":
             raise HelperFailure("mapping_conflict")
         if ownership not in ("absent", "owned"):
@@ -334,11 +344,13 @@ class RTSlibLoopbackBackend:
         self._storage_objects = None
 
     def probe(self) -> Dict[str, Any]:
-        if os.geteuid() != 0 or not self.configfs_root.is_dir() or shutil.which("sg_inq") is None:
+        if os.geteuid() != 0 or shutil.which("sg_inq") is None:
             return {"available": False, "reasonCode": "loopback_unavailable"}
         try:
             self.FabricModule("loopback")._check_self()
         except Exception:
+            return {"available": False, "reasonCode": "loopback_unavailable"}
+        if not self.configfs_root.is_dir():
             return {"available": False, "reasonCode": "loopback_unavailable"}
         return {"available": True}
 
@@ -455,6 +467,60 @@ class RTSlibLoopbackBackend:
             self._storage_object(backend.split(":", 1)[1])
         return "owned"
 
+    def inspect_for_remove(self, mapping: Dict[str, Any]) -> str:
+        target_path = self.configfs_root / mapping["targetNaa"]
+        owner = self._read_owner_file(self._owner_path(mapping["libraryId"]))
+        if owner is None:
+            return "conflict" if target_path.exists() else "absent"
+        if owner != self._owner_record(mapping):
+            return "conflict"
+        if not target_path.exists():
+            return "owned"
+
+        tpg_paths = sorted(path for path in target_path.glob("tpgt_*") if path.is_dir())
+        if any(path.name != "tpgt_1" for path in tpg_paths) or len(tpg_paths) > 1:
+            return "conflict"
+        if not tpg_paths:
+            return "owned"
+
+        tpg_path = tpg_paths[0]
+        try:
+            nexus = (tpg_path / "nexus").read_text(encoding="ascii").strip()
+        except OSError:
+            nexus = ""
+        if nexus and nexus != mapping["nexusNaa"]:
+            return "conflict"
+
+        expected = {device["lun"]: device["backendRef"] for device in mapping["devices"]}
+        core_root = (self.configfs_root.parent / "core").resolve()
+        for lun_path in (tpg_path / "lun").glob("lun_*"):
+            try:
+                lun_id = int(lun_path.name.split("_", 1)[1])
+                children = list(lun_path.iterdir())
+            except (OSError, ValueError):
+                return "conflict"
+            backend_ref = expected.get(lun_id)
+            if backend_ref is None:
+                return "conflict"
+            links = [path for path in children if path.is_symlink()]
+            if any(
+                not path.is_symlink() and path.name not in CONFIGFS_LUN_ATTRIBUTES
+                for path in children
+            ):
+                return "conflict"
+            if not links:
+                continue
+            if len(links) != 1:
+                return "conflict"
+            storage_path = Path(os.path.realpath(links[0]))
+            if (
+                storage_path.name != backend_ref
+                or not re.fullmatch(r"user_[0-9]+", storage_path.parent.name)
+                or storage_path.parent.parent != core_root
+            ):
+                return "conflict"
+        return "owned"
+
     def ensure_component(self, mapping: Dict[str, Any], component: str) -> bool:
         if component == "target":
             path = self.configfs_root / mapping["targetNaa"]
@@ -552,7 +618,18 @@ class RTSlibLoopbackBackend:
                 raise HelperFailure("mapping_conflict")
             lun_path = tpg_path / "lun" / ("lun_" + str(lun_id))
             if lun_path.exists():
-                links = [path for path in lun_path.iterdir() if path.is_symlink()]
+                children = list(lun_path.iterdir())
+                links = [path for path in children if path.is_symlink()]
+                if any(
+                    not path.is_symlink() and path.name not in CONFIGFS_LUN_ATTRIBUTES
+                    for path in children
+                ):
+                    raise HelperFailure("mapping_conflict")
+                if not links:
+                    os.rmdir(lun_path)
+                    if lun_path.exists():
+                        raise HelperFailure("cleanup_failed")
+                    return
                 if len(links) != 1:
                     raise HelperFailure("mapping_conflict")
                 storage_path = Path(os.path.realpath(links[0]))

@@ -34,7 +34,8 @@ make_bundle() {
   mkdir -p "${dir}/web-console/dist"
   printf '#!/bin/sh\n' >"${dir}/control-plane"
   printf '#!/bin/sh\n' >"${dir}/holo-tcmu-handler"
-  chmod +x "${dir}/control-plane" "${dir}/holo-tcmu-handler"
+  printf '#!/bin/sh\n' >"${dir}/holo_storage_maintenance"
+  chmod +x "${dir}/control-plane" "${dir}/holo-tcmu-handler" "${dir}/holo_storage_maintenance"
   printf '<!doctype html>\n' >"${dir}/web-console/dist/index.html"
   printf 'fake-so\n' >"${dir}/handler_holo.so"
   printf '#!/usr/bin/env python3\n' >"${dir}/holo-local-loopback-helper.py"
@@ -100,6 +101,7 @@ test_ubuntu_plan() {
   assert_contains "${out}" "Action: install"
   assert_contains "${out}" "Detected platform: ubuntu 22.04 x86_64 (apt)"
   assert_contains "${out}" "Runtime packages: kmod sudo targetcli-fb tcmu-runner xfsprogs open-iscsi sg3-utils"
+  assert_contains "${out}" "Ubuntu/Debian tape character-device module check deferred in dry-run"
   assert_contains "${out}" "Runtime invariant: HOLO_STRICT_STORAGE_FLOW=1"
   assert_contains "${out}" "[dry-run][env] HOLO_HTTP_ADDR=0.0.0.0:80"
   assert_contains "${out}" "[dry-run][env] HOLO_API_KEY="
@@ -131,7 +133,14 @@ test_ubuntu_plan() {
   assert_not_contains "${out}" "[dry-run][unit] RestrictNamespaces=yes"
   assert_not_contains "${out}" "[dry-run][unit] MemoryDenyWriteExecute=yes"
   assert_not_contains "${out}" "[dry-run][unit] LockPersonality=yes"
-  assert_contains "${out}" "[dry-run][helper] STORAGE_POOL_ROOT_BASE=\"/var/lib/holo/storage-pools\""
+  assert_contains "${out}" "[dry-run][storage-config] {\"data_dir\":\"/var/lib/holo\",\"storage_pool_root_base\":\"/var/lib/holo/storage-pools\",\"runtime_dir\":\"/run/holo-privileged\""
+  assert_contains "${out}" "[dry-run][storage-helper] exec /usr/bin/python3 -I \"/opt/holo/libexec/holo-storage-helper.py\" --config \"/etc/holo/storage-helper.json\" \"\$@\""
+  assert_contains "${out}" "[dry-run] /opt/holo/bin/holo-storage-helper prepare-directories"
+  assert_contains "${out}" "[dry-run] chown root:holo /var/lib/holo"
+  assert_contains "${out}" "[dry-run] chmod 1770 /var/lib/holo"
+  assert_contains "${out}" "[dry-run] chown root:root /opt/holo /opt/holo/bin /opt/holo/libexec /opt/holo/web-console"
+  assert_contains "${out}" "[dry-run] chmod 0750 /opt/holo/libexec"
+  assert_not_contains "${out}" "chown -R holo:holo /var/lib/holo"
   assert_contains "${out}" "[dry-run][targetcli-helper] valid_iqn()"
   assert_contains "${out}" "targetcli_home=\"/run/holo-targetcli\""
   assert_contains "${out}" "set global auto_save_on_exit=false"
@@ -267,7 +276,18 @@ test_upgrade_plan() {
   assert_contains "${out}" "Action: upgrade"
   assert_contains "${out}" "Stopping control-plane before upgrade"
   assert_contains "${out}" "systemctl\\ stop\\ holo-control-plane"
+  assert_contains "${out}" "Verifying Holo iSCSI targets, backstores, local mappings, and TCMU handlers are drained"
+  assert_contains "${out}" "verify no Holo IQNs remain"
+  assert_contains "${out}" "verify none remain"
   assert_contains "${out}" "[dry-run][summary] action=upgrade"
+  local stop_line local_cleanup_line targets_line drain_line perms_line
+  stop_line="$(grep -n "Stopping control-plane before upgrade" <<<"${out}" | head -n 1 | cut -d: -f1)"
+  local_cleanup_line="$(grep -n "Cleaning Holo-owned local loopback mappings before shared backstores" <<<"${out}" | head -n 1 | cut -d: -f1)"
+  targets_line="$(grep -n "Cleaning Holo-VTL runtime targets" <<<"${out}" | head -n 1 | cut -d: -f1)"
+  drain_line="$(grep -n "Verifying Holo iSCSI targets, backstores, local mappings, and TCMU handlers are drained" <<<"${out}" | head -n 1 | cut -d: -f1)"
+  perms_line="$(grep -n "chown root:holo /var/lib/holo" <<<"${out}" | head -n 1 | cut -d: -f1)"
+  [[ -n "${stop_line}" && -n "${local_cleanup_line}" && -n "${targets_line}" && -n "${drain_line}" && -n "${perms_line}" ]] || fail "upgrade drain checkpoints must be present"
+  [[ "${stop_line}" -lt "${local_cleanup_line}" && "${local_cleanup_line}" -lt "${targets_line}" && "${targets_line}" -lt "${drain_line}" && "${drain_line}" -lt "${perms_line}" ]] || fail "all control-plane, local, iSCSI, backstore, and handler cleanup must finish before data directory permissions change"
 }
 
 test_uninstall_plan_preserves_data_without_artifacts() {
@@ -300,8 +320,35 @@ test_uninstall_purge_plan() {
   out="$(run_dry_action uninstall "${osr}" "${bundle}" --purge-data)"
   assert_contains "${out}" "Data policy: purge config, data, and logs"
   assert_contains "${out}" "Unmounting Holo-VTL storage pools"
+  assert_contains "${out}" "findmnt -R -l -n -o TARGET"
   assert_contains "${out}" "Purging Holo-VTL config, data, and logs"
   assert_contains "${out}" "rm -rf /etc/holo /var/lib/holo /var/log/holo"
+}
+
+test_missing_holo_backstore_handler_is_empty() {
+  local fakebin="${TMP_ROOT}/missing-backstore-bin"
+  mkdir -p "${fakebin}"
+  cat >"${fakebin}/targetcli" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${FAKE_TARGETCLI_MODE:-missing}" == "missing" ]]; then
+  echo "No such path /backstores/user:holo" >&2
+else
+  echo "targetcli inspection failed" >&2
+fi
+exit 1
+EOF
+  chmod +x "${fakebin}/targetcli"
+
+  local out code
+  out="$(PATH="${fakebin}:${PATH}" bash -c 'source "$1"; list_holo_backstores' _ "${INSTALLER}" 2>&1)"
+  [[ -z "${out}" ]] || fail "a missing Holo handler must be treated as an empty backstore list"
+
+  set +e
+  out="$(PATH="${fakebin}:${PATH}" FAKE_TARGETCLI_MODE=unexpected bash -c 'source "$1"; list_holo_backstores' _ "${INSTALLER}" 2>&1)"
+  code=$?
+  set -e
+  [[ "${code}" -eq 1 ]] || fail "unexpected targetcli errors should remain fatal, got ${code}"
+  assert_contains "${out}" "targetcli inspection failed"
 }
 
 test_purge_data_rejected_for_install() {
@@ -419,6 +466,7 @@ test_optional_package_sets() {
   out="$(run_dry "${osr}" "${bundle}" --with-validation-tools --build-tcmu-plugin --plugin-source-dir "${bundle}/tcmu-src")"
   assert_contains "${out}" "Validation packages: curl jq lsscsi open-iscsi"
   assert_contains "${out}" "Build packages: gcc make pkg-config dpkg-dev"
+  assert_not_contains "${out}" "libtcmu-dev"
 }
 
 test_strict_storage_rejection() {
@@ -557,6 +605,8 @@ echo "[test] uninstall dry-run preserves data"
 test_uninstall_plan_preserves_data_without_artifacts
 echo "[test] uninstall purge dry-run"
 test_uninstall_purge_plan
+echo "[test] absent Holo backstore handler"
+test_missing_holo_backstore_handler_is_empty
 echo "[test] purge-data rejected for install"
 test_purge_data_rejected_for_install
 echo "[test] strict storage rejection"
