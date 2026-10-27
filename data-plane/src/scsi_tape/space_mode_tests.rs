@@ -68,7 +68,7 @@ fn space_branches_and_early_warning_are_deterministic() {
     assert_eq!(state.current_position, 8);
     execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 })
         .expect("space filemarks -1 should pass");
-    assert_eq!(state.current_position, 0);
+    assert_eq!(state.current_position, 4);
 
     execute(&mut state, CoreCommand::SpaceEndOfData { count: 1 }).expect("space eod should pass");
     assert_eq!(state.current_position, 16);
@@ -117,7 +117,10 @@ fn reverse_space_filemarks_positions_at_previous_files_last_record() {
     .expect("write next file record");
 
     execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 }).expect("backspace one filemark");
-    assert_eq!(state.current_position, 4);
+    // SSC-3: positioned on the BOT side of the filemark.
+    assert_eq!(state.current_position, 8);
+    // Reaching the last record of the previous file takes an extra SPACE -1 block.
+    execute(&mut state, CoreCommand::SpaceBlocks { count: -1 }).expect("backspace one block");
     let previous_file_last_record =
         execute(&mut state, CoreCommand::ReadData).expect("read previous file's last record");
     assert_eq!(
@@ -266,4 +269,53 @@ fn locate_rejects_non_addressable_positions() {
     let err = execute_with_sense(&mut state, CoreCommand::Locate { logical_block: 2 })
         .expect_err("locate into the middle of a logical block should fail");
     assert_eq!(err.sense_key, 0x05);
+}
+
+/// Veeam append probe: EOD, SPACE -1 FM twice, READ one fixed block.
+/// Layout: D D FM C FM FM (data set, filemark, catalog, two trailing filemarks).
+#[test]
+fn veeam_append_probe_reads_filemark_after_reverse_space() {
+    use super::command_chain::read_fixed_blocks;
+    use super::error::TapeError;
+    let mut state = new_state("veeam-append-probe");
+    execute(&mut state, CoreCommand::Load { cartridge_id: "cart-veeam-append".to_string() })
+        .expect("load");
+    let bs = 262_144usize;
+    execute(&mut state, CoreCommand::SetBlockModeFixed { block_size: bs as u32 }).expect("fixed");
+    for b in [0x11u8, 0x22] {
+        execute(&mut state, CoreCommand::WriteData { payload: vec![b; bs] }).expect("data");
+    }
+    execute(&mut state, CoreCommand::WriteFilemarks { count: 1 }).expect("fm1");
+    execute(&mut state, CoreCommand::WriteData { payload: vec![0xCC; bs] }).expect("catalog");
+    execute(&mut state, CoreCommand::WriteFilemarks { count: 2 }).expect("fm2+fm3");
+    let bsu = bs as u64;
+    assert_eq!(state.filemarks, vec![2 * bsu, 4 * bsu, 5 * bsu]);
+
+    execute(&mut state, CoreCommand::SpaceEndOfData { count: 1 }).expect("eod");
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 }).expect("bsf 1");
+    assert_eq!(state.current_position, 5 * bsu);
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 }).expect("bsf 2");
+    assert_eq!(state.current_position, 4 * bsu, "BOT side of second-to-last filemark");
+
+    // First READ must report FILEMARK (not blank check / medium error) and step past it.
+    match read_fixed_blocks(&mut state, bs, 1) {
+        Err(TapeError::FilemarkDetected { residue }) => assert_eq!(residue, 1),
+        other => panic!("expected FilemarkDetected, got {other:?}"),
+    }
+    assert_eq!(state.current_position, 5 * bsu);
+    // And the sense must be NO SENSE + FILEMARK bit, 00/01.
+    let frame = super::commands_core::tape_error_to_sense(&TapeError::FilemarkDetected { residue: 1 });
+    let bytes = crate::iscsi::cdb_server::sense_frame_to_bytes(&frame);
+    assert_eq!(bytes[2], 0x80);
+    assert_eq!((bytes[12], bytes[13]), (0x00, 0x01));
+
+    // Spacing back over the catalog file reaches its data: SPACE -2 FM then +1 FM.
+    execute(&mut state, CoreCommand::SpaceEndOfData { count: 1 }).expect("eod");
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: -2 }).expect("bsf 2");
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: -1 }).expect("bsf 1");
+    assert_eq!(state.current_position, 2 * bsu);
+    execute(&mut state, CoreCommand::SpaceFilemarks { count: 1 }).expect("fsf 1");
+    let catalog = read_fixed_blocks(&mut state, bs, 1).expect("read catalog block");
+    assert_eq!(catalog, vec![0xCC; bs]);
+    cleanup(&state);
 }

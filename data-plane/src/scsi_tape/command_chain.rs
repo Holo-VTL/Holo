@@ -773,6 +773,13 @@ pub fn read_data(state: &mut TapeState) -> Result<Vec<u8>, TapeError> {
         .as_ref()
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?;
 
+    if state.filemarks.contains(&state.current_position) {
+        state.current_position = state
+            .current_position
+            .saturating_add(logical_position_step(state));
+        return Err(TapeError::FilemarkDetected { residue: 0 });
+    }
+
     let read = read_logical_block(layout, state.current_position)?.ok_or_else(|| {
         TapeError::NotFound(format!(
             "no block mapped at logical position {}",
@@ -896,8 +903,13 @@ pub fn read_fixed_blocks(
         .as_ref()
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?
         .clone();
+    let filemark_step = logical_position_step(state);
     if transfer_blocks == 1 {
         let position = state.current_position;
+        if state.filemarks.contains(&position) {
+            state.current_position = position.saturating_add(filemark_step);
+            return Err(TapeError::FilemarkDetected { residue: 1 });
+        }
         let read = match take_read_prefetch(&layout, position)? {
             Some(read) => read,
             None => read_logical_block(&layout, position)?.ok_or_else(|| {
@@ -934,8 +946,16 @@ pub fn read_fixed_blocks(
     }
 
     let mut out = Vec::with_capacity(transfer_blocks.saturating_mul(block_size));
-    for _ in 0..transfer_blocks {
+    for transferred in 0..transfer_blocks {
         let position = state.current_position;
+        if state.filemarks.contains(&position) {
+            // NOTE: blocks already transferred in this command are dropped;
+            // a full fix would return them alongside the FILEMARK sense.
+            state.current_position = position.saturating_add(filemark_step);
+            return Err(TapeError::FilemarkDetected {
+                residue: u32::try_from(transfer_blocks - transferred).unwrap_or(u32::MAX),
+            });
+        }
         let read = match take_read_prefetch(&layout, position)? {
             Some(read) => read,
             None => read_logical_block(&layout, position)?.ok_or_else(|| {
@@ -1103,18 +1123,10 @@ pub fn space(state: &mut TapeState, branch: SpaceBranch, count: i64) -> Result<(
                         .ok_or_else(|| {
                             TapeError::OutOfRange("SPACE filemarks before BOT".to_string())
                         })?;
-                    let mark = marks[mark_index];
-                    let file_start = marks[..mark_index]
-                        .last()
-                        .map(|previous_mark| previous_mark.saturating_add(step))
-                        .unwrap_or(0);
-                    position = state
-                        .block_starts
-                        .iter()
-                        .copied()
-                        .filter(|block_start| *block_start >= file_start && *block_start < mark)
-                        .max()
-                        .unwrap_or(file_start);
+                    // SSC-3 6.x SPACE: a reverse filemark space terminates on the
+                    // BOT side of the last filemark crossed, i.e. positioned *at*
+                    // the filemark so that the next READ reports FILEMARK.
+                    position = marks[mark_index];
                 }
             }
             state.current_position = position;

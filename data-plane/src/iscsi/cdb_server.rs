@@ -66,6 +66,9 @@ pub fn sense_frame_to_bytes(frame: &SenseFrame) -> Vec<u8> {
     if frame.end_of_medium {
         s[2] |= 0x40;
     }
+    if frame.sense_key == 0x00 && frame.asc == 0x00 && frame.ascq == 0x01 {
+        s[2] |= 0x80; // FILEMARK
+    }
     if frame.information_valid {
         s[3..7].copy_from_slice(&frame.information.to_be_bytes());
     }
