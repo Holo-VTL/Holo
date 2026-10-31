@@ -80,7 +80,7 @@ func TestTcmuAdapterEnsureLocalMountBackendReusesOneWorkerAndBackstore(t *testin
 			if publication.DeviceRole != "changer" || socketPath == "" {
 				t.Fatalf("unexpected local handler identity/socket: %+v %q", publication, socketPath)
 			}
-			if !hasEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", "lib-a") ||
+			if !hasEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", "lib-a__drive-a") ||
 				!hasEnvAssignment(env, "HOLO_LAYOUT_LIBRARY_ID", "lib-a") ||
 				!hasEnvAssignment(env, "HOLO_CHANGER_DRIVE_IDS", "drive-a,drive-b") {
 				t.Fatalf("changer handler missing library/drive topology: %v", env)
@@ -111,6 +111,44 @@ func TestTcmuAdapterEnsureLocalMountBackendReusesOneWorkerAndBackstore(t *testin
 	}
 	if creates != 1 {
 		t.Fatalf("expected one backstore create, saw %d calls: %v", creates, runner.calls)
+	}
+}
+
+func TestLocalAndPublishedChangersShareDriveMediaState(t *testing.T) {
+	t.Setenv("HOLO_MEDIA_STATE_KEY", "inherited-key")
+	cases := []struct {
+		name    string
+		library string
+		drives  []string
+		key     string
+	}{
+		{name: "numeric-library-single-drive", library: "333", drives: []string{"333-drv-01"}, key: "333__333-drv-01"},
+		{name: "multiple-drives", library: "lib-a", drives: []string{"drive-a", "drive-b"}, key: "lib-a__drive-a"},
+		{name: "no-drive-fallback", library: "lib-empty", key: "lib-empty__unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			descriptor := domain.VTLDeviceDescriptor{
+				DeviceKey: domain.ChangerDeviceKey(tc.library), Kind: domain.LocalDeviceKindChanger,
+				LibraryID: tc.library, DriveIDs: tc.drives, Profile: "ibm-diamondback",
+			}
+			publication := localMountSyntheticPublication(descriptor)
+			for _, env := range [][]string{tcmuHandlerEnv(publication), localMountHandlerEnv(publication, descriptor)} {
+				values := make(map[string]string)
+				for _, assignment := range env {
+					key, value, ok := strings.Cut(assignment, "=")
+					if ok {
+						values[key] = value
+					}
+				}
+				if got := values["HOLO_MEDIA_STATE_KEY"]; got != tc.key {
+					t.Fatalf("changer must share the first drive's slots and load state: got %q, want %q", got, tc.key)
+				}
+				if got := values["HOLO_LAYOUT_LIBRARY_ID"]; got != tc.library {
+					t.Fatalf("library storage routing changed: got %q, want %q", got, tc.library)
+				}
+			}
+		})
 	}
 }
 
