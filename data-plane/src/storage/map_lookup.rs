@@ -116,6 +116,11 @@ fn file_stamp(path: &Path) -> Result<FileStamp, StorageError> {
     })
 }
 
+pub(crate) fn discard_lookup_cache_checked(path: &Path) -> Result<(), StorageError> {
+    lock_storage_mutex(cache(), "lookup")?.remove(path);
+    Ok(())
+}
+
 pub fn load_lookup_records(path: &Path) -> Result<(u64, Vec<MapLookupRecord>), StorageError> {
     ensure_cache_fresh(path)?;
     let guard = lock_storage_mutex(cache(), "lookup")?;

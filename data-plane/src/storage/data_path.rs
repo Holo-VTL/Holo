@@ -399,6 +399,12 @@ pub(crate) fn invalidate_data_segment_cache(path: &Path) {
 }
 
 pub fn discard_layout_caches(paths: &LayoutPaths) {
+    if let Err(err) = super::blk_map::discard_blk_map_cache_checked(&paths.blk_map_file) {
+        eprintln!("[storage] failed to discard blk_map cache: {err}");
+    }
+    if let Err(err) = super::map_lookup::discard_lookup_cache_checked(&paths.lookup_file) {
+        eprintln!("[storage] failed to discard lookup cache: {err}");
+    }
     if let Ok(mut guard) = lock_storage_mutex(checkpoint_cache(), "checkpoint") {
         guard.remove(&paths.metadata_file);
     }
@@ -417,6 +423,8 @@ pub fn discard_layout_caches(paths: &LayoutPaths) {
 
 pub fn discard_layout_caches_checked(paths: &LayoutPaths) -> Result<(), StorageError> {
     super::segment::discard_layout_append_handles(&paths.root)?;
+    super::blk_map::discard_blk_map_cache_checked(&paths.blk_map_file)?;
+    super::map_lookup::discard_lookup_cache_checked(&paths.lookup_file)?;
     lock_storage_mutex(checkpoint_cache(), "checkpoint")?.remove(&paths.metadata_file);
     lock_storage_mutex(pending_sync_writes(), "pending write")?.remove(&paths.metadata_file);
     lock_storage_mutex(data_readers(), "data reader")?
