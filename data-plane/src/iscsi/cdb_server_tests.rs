@@ -3647,6 +3647,108 @@ mod tests {
     }
 
     #[test]
+    fn log_sense_dt_status_is_advertised_and_accepts_veeam_cdb() {
+        let mut state = crate::scsi_tape::state::TapeState::new("dt-status-discovery");
+        state.data_compression_enabled = true;
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td6");
+        let supported =
+            log_sense_drive(&mut state, &[0x4D, 0, 0x40, 0, 0, 0, 0, 8, 0, 0], &profile);
+        assert_eq!(supported.status, SCSI_STATUS_GOOD);
+        assert_eq!(
+            supported.reply,
+            vec![0, 0, 0, 10, 0, 2, 3, 0x0C, 0x11, 0x17, 0x2E, 0x31, 0x32, 0x37]
+        );
+
+        let status = dispatch_raw_cdb(&mut state, &[0x4D, 0, 0x51, 0, 0, 0, 0, 8, 0, 0], &[]);
+        assert_eq!(status.status, SCSI_STATUS_GOOD);
+        assert_eq!(
+            status.reply,
+            vec![0x11, 0, 0, 8, 0, 0, 3, 4, 0x11, 0x20, 0, 0]
+        );
+        assert_eq!(state.command_counters.log_sense_ops, 2);
+    }
+
+    #[test]
+    fn log_sense_dt_status_reflects_media_compression_and_protection() {
+        use crate::scsi_tape::state::MountState::{Empty, Loaded};
+
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td6");
+        for (mount, compression, worm, locked, recovery, flags0, flags1) in [
+            (Empty, true, false, false, false, 0x11, 0x20),
+            (Empty, false, false, false, false, 0x01, 0x20),
+            (Loaded, true, false, false, false, 0x31, 0x17),
+            (Loaded, false, false, false, false, 0x21, 0x17),
+            (Loaded, true, true, false, false, 0x31, 0x17),
+            (Loaded, true, true, true, false, 0x39, 0x17),
+            (Loaded, true, false, false, true, 0x31, 0x17),
+        ] {
+            let mut state = crate::scsi_tape::state::TapeState::new("dt-status-state");
+            state.mount_state = mount;
+            state.cartridge_id = (mount == Loaded).then(|| "dt-status-cartridge".to_string());
+            state.data_compression_enabled = compression;
+            state.retention_policy.is_worm_media = worm;
+            state.retention_policy.retention_locked = locked;
+            state.requires_recovery = recovery;
+            state.current_position = 123;
+            state.eod_position = 456;
+            state.command_counters.read_ops = 99;
+            state.command_counters.write_ops = 100;
+            let cartridge = state.cartridge_id.clone();
+            let response =
+                log_sense_drive(&mut state, &[0x4D, 0, 0x51, 0, 0, 0, 0, 8, 0, 0], &profile);
+
+            assert_eq!(response.status, SCSI_STATUS_GOOD);
+            assert_eq!(
+                response.reply,
+                vec![0x11, 0, 0, 8, 0, 0, 3, 4, flags0, flags1, 0, 0],
+                "mount={mount:?}, compression={compression}, worm={worm}, locked={locked}, recovery={recovery}"
+            );
+            assert_eq!(state.current_position, 123);
+            assert_eq!(state.eod_position, 456);
+            assert_eq!(state.cartridge_id, cartridge);
+            assert_eq!(state.requires_recovery, recovery);
+            assert_eq!(state.command_counters.log_sense_ops, 1);
+        }
+    }
+
+    #[test]
+    fn log_sense_dt_status_ignores_pc_and_honors_allocation_length() {
+        let mut state = crate::scsi_tape::state::TapeState::new("dt-status-allocation");
+        state.data_compression_enabled = true;
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td6");
+        let expected = [0x11, 0, 0, 8, 0, 0, 3, 4, 0x11, 0x20, 0, 0];
+        for pc in [0x00, 0x40, 0x80, 0xC0] {
+            for allocation in [0u16, 1, 3, 4, 8, 11, 12, 2048] {
+                let mut cdb = [0x4D, 0, pc | 0x11, 0, 0, 0, 0, 0, 0, 0];
+                cdb[7..9].copy_from_slice(&allocation.to_be_bytes());
+                let response = log_sense_drive(&mut state, &cdb, &profile);
+                assert_eq!(response.status, SCSI_STATUS_GOOD);
+                assert_eq!(
+                    response.reply,
+                    expected[..usize::from(allocation).min(expected.len())],
+                    "pc={pc:02x}, allocation={allocation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_sense_dt_status_rejects_unsupported_fields() {
+        let mut state = crate::scsi_tape::state::TapeState::new("dt-status-invalid");
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td6");
+        for (index, value) in [(1, 1), (1, 2), (3, 1), (3, 0xFF), (5, 1), (6, 1)] {
+            let mut cdb = [0x4D, 0, 0x51, 0, 0, 0, 0, 8, 0, 0];
+            cdb[index] = value;
+            let response = log_sense_drive(&mut state, &cdb, &profile);
+            assert_eq!(response.status, SCSI_STATUS_CHECK_CONDITION);
+            assert_eq!(response.sense[2] & 0x0F, 0x05);
+            assert_eq!(&response.sense[12..14], &[0x24, 0]);
+            assert!(response.reply.is_empty());
+        }
+        assert_eq!(state.current_position, 0);
+    }
+
+    #[test]
     fn mode_log_pages_include_health_and_state_backed_counters() {
         let mut state = crate::scsi_tape::state::TapeState::new("compat-pages");
         state.mount_state = crate::scsi_tape::state::MountState::Loaded;
