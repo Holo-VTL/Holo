@@ -64,6 +64,151 @@ mod tests {
         while state.take_unit_attention().is_some() {}
     }
 
+    struct FilemarkReadFixture {
+        state: crate::scsi_tape::state::TapeState,
+    }
+
+    impl FilemarkReadFixture {
+        fn new(case: &str, variable: bool) -> Self {
+            use crate::scsi_tape::commands_core::execute;
+
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let drive = format!("filemark-{case}-{nanos}");
+            let cartridge = format!("cart-{case}-{nanos}");
+            fs::create_dir_all(crate::storage::storage_root_dir_for_cartridge(&cartridge))
+                .expect("storage root");
+            let mut state = crate::scsi_tape::state::TapeState::new(drive.clone());
+            crate::media::mount_bridge::attach_cartridge(&mut state, &cartridge).expect("attach");
+            write_shared_loaded_cartridge(&drive, Some(&cartridge)).expect("shared mount");
+            let mode = if variable {
+                CoreCommand::SetBlockModeVariable
+            } else {
+                CoreCommand::SetBlockModeFixed { block_size: 4 }
+            };
+            execute(&mut state, mode).expect("block mode");
+            for payload in [b"AAAA".to_vec(), b"BBBB".to_vec()] {
+                execute(&mut state, CoreCommand::WriteData { payload }).expect("data record");
+            }
+            execute(&mut state, CoreCommand::WriteFilemarks { count: 2 }).expect("two marks");
+            execute(
+                &mut state,
+                CoreCommand::WriteData {
+                    payload: b"CCCC".to_vec(),
+                },
+            )
+            .expect("next file");
+            execute(&mut state, CoreCommand::Rewind).expect("rewind");
+            drain_unit_attention(&mut state);
+            Self { state }
+        }
+    }
+
+    impl Drop for FilemarkReadFixture {
+        fn drop(&mut self) {
+            let layout = self.state.active_layout.clone();
+            let _ = write_shared_loaded_cartridge(&self.state.drive_id, None);
+            let _ = crate::media::mount_bridge::detach_cartridge(&mut self.state);
+            if let Some(layout) = layout {
+                let _ = fs::remove_dir_all(layout.root);
+            }
+        }
+    }
+
+    fn filemark_read_cdb(opcode: u8, fixed: bool, transfer: u32) -> Vec<u8> {
+        let mut cdb = vec![0; if opcode == 0x08 { 6 } else { 16 }];
+        cdb[0] = opcode;
+        cdb[1] = u8::from(fixed);
+        if opcode == 0x08 {
+            cdb[2..5].copy_from_slice(&transfer.to_be_bytes()[1..]);
+        } else {
+            cdb[10..14].copy_from_slice(&transfer.to_be_bytes());
+        }
+        cdb
+    }
+
+    fn assert_filemark_read(response: &CdbResponse, payload: &[u8], residue: u32) {
+        assert_eq!(response.status, SCSI_STATUS_CHECK_CONDITION);
+        assert_eq!(response.sense[0], 0xF0);
+        assert_eq!(response.sense[2], 0x80);
+        assert_eq!(&response.sense[3..7], &residue.to_be_bytes());
+        assert_eq!(&response.sense[12..14], &[0, 1]);
+        assert_eq!(response.reply, payload);
+    }
+
+    #[test]
+    fn filemark_fixed_reads_preserve_partial_payload_through_ipc() {
+        for opcode in [0x08, 0x88] {
+            let mut fixture = FilemarkReadFixture::new("fixed", false);
+            let response =
+                dispatch_raw_cdb(&mut fixture.state, &filemark_read_cdb(opcode, true, 3), &[]);
+            assert_filemark_read(&response, b"AAAABBBB", 1);
+            assert_eq!(fixture.state.current_position, 12);
+            let mut wire = Vec::new();
+            response.encode(&mut wire).expect("encode sense and data");
+            assert_eq!(
+                CdbResponse::decode(&mut Cursor::new(wire)).expect("decode"),
+                response
+            );
+
+            let second =
+                dispatch_raw_cdb(&mut fixture.state, &filemark_read_cdb(opcode, true, 1), &[]);
+            assert_filemark_read(&second, &[], 1);
+            assert_eq!(fixture.state.current_position, 16);
+            let next =
+                dispatch_raw_cdb(&mut fixture.state, &filemark_read_cdb(opcode, true, 1), &[]);
+            assert_eq!(next.status, SCSI_STATUS_GOOD);
+            assert_eq!(next.reply, b"CCCC");
+        }
+    }
+
+    #[test]
+    fn filemark_variable_reads_report_requested_bytes_and_advance_once() {
+        for opcode in [0x08, 0x88] {
+            let mut fixture = FilemarkReadFixture::new("variable", true);
+            crate::scsi_tape::commands_core::execute(
+                &mut fixture.state,
+                CoreCommand::Locate { logical_block: 8 },
+            )
+            .expect("locate mark");
+            for (requested, position) in [(17, 9), (262_144, 10)] {
+                let response = dispatch_raw_cdb(
+                    &mut fixture.state,
+                    &filemark_read_cdb(opcode, false, requested),
+                    &[],
+                );
+                assert_filemark_read(&response, &[], requested);
+                assert_eq!(fixture.state.current_position, position);
+            }
+            let next = dispatch_raw_cdb(
+                &mut fixture.state,
+                &filemark_read_cdb(opcode, false, 4),
+                &[],
+            );
+            assert_eq!(next.status, SCSI_STATUS_GOOD);
+            assert_eq!(next.reply, b"CCCC");
+        }
+    }
+
+    #[test]
+    fn filemark_reads_use_stored_boundaries_after_block_mode_change() {
+        use crate::scsi_tape::commands_core::execute;
+        let mut fixture = FilemarkReadFixture::new("mode-change", false);
+        execute(&mut fixture.state, CoreCommand::Locate { logical_block: 8 }).expect("locate mark");
+        execute(&mut fixture.state, CoreCommand::SetBlockModeVariable).expect("variable mode");
+        for position in [12, 16] {
+            let response =
+                dispatch_raw_cdb(&mut fixture.state, &filemark_read_cdb(0x08, false, 4), &[]);
+            assert_filemark_read(&response, &[], 4);
+            assert_eq!(fixture.state.current_position, position);
+        }
+        let next = dispatch_raw_cdb(&mut fixture.state, &filemark_read_cdb(0x08, false, 4), &[]);
+        assert_eq!(next.status, SCSI_STATUS_GOOD);
+        assert_eq!(next.reply, b"CCCC");
+    }
+
     #[test]
     fn cdb_cache_poison_lock_returns_io_error() {
         let mutex = Mutex::new(());

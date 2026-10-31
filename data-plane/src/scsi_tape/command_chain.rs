@@ -764,6 +764,19 @@ fn truncate_tail_before_write(
     Ok(())
 }
 
+// Filemarks retain their stored extent even if MODE SELECT changes block mode.
+fn advance_past_filemark(state: &mut TapeState) {
+    state.current_position = state
+        .block_starts
+        .iter()
+        .chain(state.filemarks.iter())
+        .copied()
+        .chain(std::iter::once(state.eod_position))
+        .filter(|position| *position > state.current_position)
+        .min()
+        .unwrap_or(state.eod_position);
+}
+
 pub fn read_data(state: &mut TapeState) -> Result<Vec<u8>, TapeError> {
     ensure_loaded(state)?;
     ensure_recovery_complete(state)?;
@@ -774,10 +787,11 @@ pub fn read_data(state: &mut TapeState) -> Result<Vec<u8>, TapeError> {
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?;
 
     if state.filemarks.contains(&state.current_position) {
-        state.current_position = state
-            .current_position
-            .saturating_add(logical_position_step(state));
-        return Err(TapeError::FilemarkDetected { residue: 0 });
+        advance_past_filemark(state);
+        return Err(TapeError::FilemarkDetected {
+            residue: 0,
+            partial_data: Vec::new(),
+        });
     }
 
     let read = read_logical_block(layout, state.current_position)?.ok_or_else(|| {
@@ -903,12 +917,14 @@ pub fn read_fixed_blocks(
         .as_ref()
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?
         .clone();
-    let filemark_step = logical_position_step(state);
     if transfer_blocks == 1 {
         let position = state.current_position;
         if state.filemarks.contains(&position) {
-            state.current_position = position.saturating_add(filemark_step);
-            return Err(TapeError::FilemarkDetected { residue: 1 });
+            advance_past_filemark(state);
+            return Err(TapeError::FilemarkDetected {
+                residue: 1,
+                partial_data: Vec::new(),
+            });
         }
         let read = match take_read_prefetch(&layout, position)? {
             Some(read) => read,
@@ -949,11 +965,10 @@ pub fn read_fixed_blocks(
     for transferred in 0..transfer_blocks {
         let position = state.current_position;
         if state.filemarks.contains(&position) {
-            // NOTE: blocks already transferred in this command are dropped;
-            // a full fix would return them alongside the FILEMARK sense.
-            state.current_position = position.saturating_add(filemark_step);
+            advance_past_filemark(state);
             return Err(TapeError::FilemarkDetected {
                 residue: u32::try_from(transfer_blocks - transferred).unwrap_or(u32::MAX),
+                partial_data: out,
             });
         }
         let read = match take_read_prefetch(&layout, position)? {

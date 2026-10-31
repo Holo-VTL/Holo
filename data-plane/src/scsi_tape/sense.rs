@@ -180,7 +180,7 @@ pub fn resolve_sense_for_error(error: &TapeError) -> SenseFrame {
         TapeError::Storage(_) => sense_for_context(SenseContext::MediumError),
         TapeError::NotFound(_) => sense_for_context(SenseContext::BlankCheckEod),
         // NO SENSE + FILEMARK bit, ASC/ASCQ 00/01 "filemark detected".
-        TapeError::FilemarkDetected { residue } => SenseFrame {
+        TapeError::FilemarkDetected { residue, .. } => SenseFrame {
             status: 0x02,
             sense_key: 0x00,
             asc: 0x00,

@@ -299,12 +299,15 @@ fn veeam_append_probe_reads_filemark_after_reverse_space() {
 
     // First READ must report FILEMARK (not blank check / medium error) and step past it.
     match read_fixed_blocks(&mut state, bs, 1) {
-        Err(TapeError::FilemarkDetected { residue }) => assert_eq!(residue, 1),
+        Err(TapeError::FilemarkDetected { residue, .. }) => assert_eq!(residue, 1),
         other => panic!("expected FilemarkDetected, got {other:?}"),
     }
     assert_eq!(state.current_position, 5 * bsu);
     // And the sense must be NO SENSE + FILEMARK bit, 00/01.
-    let frame = super::commands_core::tape_error_to_sense(&TapeError::FilemarkDetected { residue: 1 });
+    let frame = super::commands_core::tape_error_to_sense(&TapeError::FilemarkDetected {
+        residue: 1,
+        partial_data: Vec::new(),
+    });
     let bytes = crate::iscsi::cdb_server::sense_frame_to_bytes(&frame);
     assert_eq!(bytes[2], 0x80);
     assert_eq!((bytes[12], bytes[13]), (0x00, 0x01));
