@@ -765,16 +765,16 @@ fn truncate_tail_before_write(
 }
 
 // Filemarks retain their stored extent even if MODE SELECT changes block mode.
-fn advance_past_filemark(state: &mut TapeState) {
-    state.current_position = state
+fn position_after_filemark(state: &TapeState, mark: u64) -> u64 {
+    state
         .block_starts
         .iter()
         .chain(state.filemarks.iter())
         .copied()
         .chain(std::iter::once(state.eod_position))
-        .filter(|position| *position > state.current_position)
+        .filter(|position| *position > mark)
         .min()
-        .unwrap_or(state.eod_position);
+        .unwrap_or(state.eod_position)
 }
 
 pub fn read_data(state: &mut TapeState) -> Result<Vec<u8>, TapeError> {
@@ -787,7 +787,7 @@ pub fn read_data(state: &mut TapeState) -> Result<Vec<u8>, TapeError> {
         .ok_or_else(|| TapeError::NotReady("active layout missing".to_string()))?;
 
     if state.filemarks.contains(&state.current_position) {
-        advance_past_filemark(state);
+        state.current_position = position_after_filemark(state, state.current_position);
         return Err(TapeError::FilemarkDetected {
             residue: 0,
             partial_data: Vec::new(),
@@ -920,7 +920,7 @@ pub fn read_fixed_blocks(
     if transfer_blocks == 1 {
         let position = state.current_position;
         if state.filemarks.contains(&position) {
-            advance_past_filemark(state);
+            state.current_position = position_after_filemark(state, position);
             return Err(TapeError::FilemarkDetected {
                 residue: 1,
                 partial_data: Vec::new(),
@@ -965,7 +965,7 @@ pub fn read_fixed_blocks(
     for transferred in 0..transfer_blocks {
         let position = state.current_position;
         if state.filemarks.contains(&position) {
-            advance_past_filemark(state);
+            state.current_position = position_after_filemark(state, position);
             return Err(TapeError::FilemarkDetected {
                 residue: u32::try_from(transfer_blocks - transferred).unwrap_or(u32::MAX),
                 partial_data: out,
@@ -1117,7 +1117,6 @@ pub fn space(state: &mut TapeState, branch: SpaceBranch, count: i64) -> Result<(
                 ));
             }
             let marks = sorted_points(&state.filemarks);
-            let step = logical_position_step(state);
             let mut position = state.current_position;
             if count > 0 {
                 for _ in 0..count {
@@ -1128,7 +1127,7 @@ pub fn space(state: &mut TapeState, branch: SpaceBranch, count: i64) -> Result<(
                         .ok_or_else(|| {
                             TapeError::OutOfRange("SPACE filemarks beyond EOD".to_string())
                         })?;
-                    position = mark.saturating_add(step);
+                    position = position_after_filemark(state, mark);
                 }
             } else {
                 for _ in 0..(-count) {
