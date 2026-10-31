@@ -271,6 +271,11 @@ fn file_stamp(path: &Path) -> Result<FileStamp, StorageError> {
     })
 }
 
+pub(crate) fn discard_blk_map_cache_checked(path: &Path) -> Result<(), StorageError> {
+    lock_storage_mutex(cache(), "blk_map")?.remove(path);
+    Ok(())
+}
+
 pub fn load_blk_map_records(path: &Path) -> Result<(u64, Vec<BlkMapRecord>), StorageError> {
     ensure_cache_fresh(path)?;
     let guard = lock_storage_mutex(cache(), "blk_map")?;
