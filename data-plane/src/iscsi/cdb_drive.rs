@@ -5,7 +5,7 @@ use crate::iscsi::cdb_server::*;
 use crate::iscsi::cdb_wire::CdbResponse;
 use crate::scsi_tape::commands_core::{execute_with_sense, CoreCommand, CoreResponse};
 use crate::scsi_tape::identity::DeviceIdentityProfile;
-use crate::scsi_tape::state::{AllowOverwriteState, TapeState};
+use crate::scsi_tape::state::{AllowOverwriteState, MountState, TapeState};
 use crate::storage::read_logical_block;
 
 const MAX_WRITE_ATTRIBUTE_PARAMETER_LIST_LEN: usize = 64 * 1024;
@@ -1684,7 +1684,7 @@ pub(crate) fn log_sense_drive(
     state.command_counters.log_sense_ops = state.command_counters.log_sense_ops.saturating_add(1);
     let out = match page_code {
         0x00 => {
-            let supported_pages = [0x00u8, 0x02, 0x03, 0x0C, 0x17, 0x2E, 0x31, 0x32, 0x37];
+            let supported_pages = [0x00u8, 0x02, 0x03, 0x0C, 0x11, 0x17, 0x2E, 0x31, 0x32, 0x37];
             let mut page = vec![0x00, 0x00, 0x00, supported_pages.len() as u8];
             page.extend_from_slice(&supported_pages);
             page
@@ -1719,6 +1719,32 @@ pub(crate) fn log_sense_drive(
             );
             finalize_log_page(&mut page);
             page
+        }
+        0x11 => {
+            if cdb.get(1).copied().unwrap_or(0) & 0x02 != 0
+                || cdb.get(3).copied().unwrap_or(0) != 0
+                || read_be16(cdb, 5) != 0
+            {
+                return invalid_field_in_cdb_response();
+            }
+            // IBM LP11 parameter 0000: VHF binary list (PC is ignored).
+            let mut flags = 0x01; // DINIT: VHF data is valid, not a readiness guarantee.
+            if state.data_compression_enabled {
+                flags |= 0x10; // CMPR
+            }
+            if state.mount_state == MountState::Loaded {
+                flags |= 0x20; // MACC: emulated MAM is accessible.
+                if device_specific_mode_parameter(state) & 0x80 != 0 {
+                    flags |= 0x08; // WRTP: same effective protection as MODE SENSE.
+                }
+            }
+            let medium_flags = match state.mount_state {
+                MountState::Loaded => 0x17, // MPRSNT, MSTD, MTHRD, MOUNTED
+                MountState::Empty => 0x20,  // RAA: robotic access is allowed.
+                _ => 0,
+            };
+            // Commands execute synchronously; polling observes idle activity.
+            vec![0x11, 0, 0, 8, 0, 0, 0x03, 4, flags, medium_flags, 0, 0]
         }
         0x17 => {
             let capacity_bytes = active_partition_capacity_bytes(state, profile);
