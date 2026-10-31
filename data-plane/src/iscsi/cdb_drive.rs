@@ -2150,7 +2150,14 @@ pub(crate) fn drive_mam_attributes(
 ) -> Vec<ReadAttributeEntry> {
     let capacity_bytes = active_partition_capacity_bytes(state, profile);
     let remaining_bytes = capacity_bytes.saturating_sub(state.eod_position);
-    let medium_type = medium_type_for_loaded_media(state, profile);
+    // MAM 0408 classifies data/WORM media; MODE SENSE uses separate generation codes.
+    let medium_type = if state.mount_state == crate::scsi_tape::state::MountState::Loaded
+        && state.retention_policy.is_worm_media
+    {
+        0x80
+    } else {
+        0x00
+    };
     let density_code = density_code_for_profile(profile);
     let fallback_serial = profile
         .serial_for_vpd_seed(&state.drive_id)

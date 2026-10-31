@@ -2472,10 +2472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drive_read_attribute_medium_type_matches_loaded_lto_generation() {
-        let mut state = crate::scsi_tape::state::TapeState::new("drive-attr-medium-type-lto9");
-        state.mount_state = crate::scsi_tape::state::MountState::Loaded;
-        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td9");
+    fn test_drive_read_attribute_medium_type_is_class_not_lto_generation() {
         let cdb = vec![
             0x8C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // op/service + partition
             0x04, 0x08, // first attribute (medium type)
@@ -2483,12 +2480,49 @@ mod tests {
             0x00, 0x00,
         ];
 
-        let response = read_attribute_drive(&mut state, &cdb, &profile);
+        for (profile_name, data_mode_type, worm_mode_type, density) in [
+            ("ibm-ult3580-td6", 0x68, 0x6C, 0x5A),
+            ("ibm-ult3580-td9", 0x98, 0x9C, 0x5F),
+        ] {
+            let profile = crate::scsi_tape::profiles::resolve_drive_profile(profile_name);
+            for (worm, locked, mam_type, mode_type) in [
+                (false, false, 0x00, data_mode_type),
+                (true, false, 0x80, worm_mode_type),
+                (true, true, 0x80, worm_mode_type),
+            ] {
+                let mut state = crate::scsi_tape::state::TapeState::new("drive-attr-medium-type");
+                state.mount_state = crate::scsi_tape::state::MountState::Loaded;
+                state.retention_policy.is_worm_media = worm;
+                state.retention_policy.retention_locked = locked;
+                let response = read_attribute_drive(&mut state, &cdb, &profile);
+                assert_eq!(response.status, SCSI_STATUS_GOOD);
+                assert_eq!(&response.reply[4..10], &[0x04, 0x08, 0x80, 0, 1, mam_type]);
+
+                let mode6 = mode_sense_6_drive(&state, &[0x1A, 0, 0, 0, 12, 0], &profile);
+                assert_eq!(mode6.status, SCSI_STATUS_GOOD);
+                assert_eq!(mode6.reply[1], mode_type);
+                assert_eq!(mode6.reply[4], density);
+                let mode10 =
+                    mode_sense_10_drive(&state, &[0x5A, 0, 0, 0, 0, 0, 0, 0, 16, 0], &profile);
+                assert_eq!(mode10.status, SCSI_STATUS_GOOD);
+                assert_eq!(mode10.reply[2], mode_type);
+                assert_eq!(mode10.reply[8], density);
+            }
+        }
+    }
+
+    #[test]
+    fn test_drive_read_attribute_medium_type_no_media_stays_zero() {
+        let mut state = crate::scsi_tape::state::TapeState::new("drive-attr-medium-type-empty");
+        state.retention_policy.is_worm_media = true;
+        let profile = crate::scsi_tape::profiles::resolve_drive_profile("ibm-ult3580-td6");
+        let response = read_attribute_drive(
+            &mut state,
+            &[0x8C, 0, 0, 0, 0, 0, 0, 0, 4, 8, 0, 0, 0, 32, 0, 0],
+            &profile,
+        );
         assert_eq!(response.status, SCSI_STATUS_GOOD);
-        assert_eq!(&response.reply[4..6], &[0x04, 0x08]);
-        assert_eq!(response.reply[6], 0x80);
-        assert_eq!(&response.reply[7..9], &[0x00, 0x01]);
-        assert_eq!(response.reply[9], 0x98);
+        assert_eq!(&response.reply[4..10], &[0x04, 0x08, 0x80, 0, 1, 0]);
     }
 
     #[test]
@@ -2572,7 +2606,7 @@ mod tests {
             &response.reply[medium_type_offset + 3..medium_type_offset + 5],
             &[0x00, 0x01]
         );
-        assert_eq!(response.reply[medium_type_offset + 5], 0x68);
+        assert_eq!(response.reply[medium_type_offset + 5], 0x00);
 
         let _ = write_shared_loaded_cartridge(&drive_id, None);
     }
@@ -2780,7 +2814,7 @@ mod tests {
         assert_eq!(&response.reply[4..6], &[0x04, 0x08]);
         assert_eq!(response.reply[6], 0x80);
         assert_eq!(&response.reply[7..9], &[0x00, 0x01]);
-        assert_eq!(response.reply[9], 0x68);
+        assert_eq!(response.reply[9], 0x00);
     }
 
     #[test]
