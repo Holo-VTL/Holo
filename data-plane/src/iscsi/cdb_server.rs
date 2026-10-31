@@ -66,6 +66,9 @@ pub fn sense_frame_to_bytes(frame: &SenseFrame) -> Vec<u8> {
     if frame.end_of_medium {
         s[2] |= 0x40;
     }
+    if frame.sense_key == 0x00 && frame.asc == 0x00 && frame.ascq == 0x01 {
+        s[2] |= 0x80; // FILEMARK
+    }
     if frame.information_valid {
         s[3..7].copy_from_slice(&frame.information.to_be_bytes());
     }
@@ -246,7 +249,19 @@ fn dispatch_raw_cdb_with_context_inner(
                 let data_in = core_response_to_bytes(state, response, cdb);
                 CdbResponse::good(data_in)
             }
-            Err(sense_frame) => {
+            Err(mut sense_frame) => {
+                if matches!(opcode, 0x08 | 0x88)
+                    && sense_frame.sense_key == 0
+                    && sense_frame.asc == 0
+                    && sense_frame.ascq == 1
+                {
+                    let requested = if opcode == 0x08 {
+                        read_be24(cdb, 2)
+                    } else {
+                        read_be32(cdb, 10)
+                    };
+                    sense_frame.information = u32::try_from(requested).unwrap_or(u32::MAX);
+                }
                 let sense_bytes = sense_frame_to_bytes(&sense_frame);
                 CdbResponse::check_condition(sense_bytes)
             }
@@ -473,9 +488,15 @@ pub(crate) fn dispatch_fixed_block_io_with_context(
                 Ok(out) => out,
                 Err(error) => {
                     let sense_frame = tape_error_to_sense(&error);
-                    return Some(CdbResponse::check_condition(sense_frame_to_bytes(
-                        &sense_frame,
-                    )));
+                    let mut response =
+                        CdbResponse::check_condition(sense_frame_to_bytes(&sense_frame));
+                    if let crate::scsi_tape::error::TapeError::FilemarkDetected {
+                        partial_data, ..
+                    } = error
+                    {
+                        response.reply = partial_data;
+                    }
+                    return Some(response);
                 }
             };
             Some(CdbResponse::good(out))

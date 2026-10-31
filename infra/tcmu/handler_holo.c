@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,7 @@
 #include "libtcmu_common.h"
 #include "tcmu-runner.h"
 #include "tcmur_device.h"
+#include "target_core_user_local.h"
 
 #define HOLO_MAX_REPLY (16U * 1024U * 1024U)
 #define HOLO_MAX_CONTROL_DATA_OUT (1U * 1024U * 1024U)
@@ -83,6 +85,65 @@ static const uint64_t watchdog_threshold_us[HOLO_WATCHDOG_THRESHOLDS] = {
 	15000000ULL,
 	25000000ULL,
 };
+
+/* READ_LEN occupies the reserved word in older libtcmu v2 UAPI headers. */
+#ifndef TCMU_MAILBOX_FLAG_CAP_READ_LEN
+#define TCMU_MAILBOX_FLAG_CAP_READ_LEN (1 << 1)
+#endif
+#ifndef TCMU_UFLAG_READ_LEN
+#define TCMU_UFLAG_READ_LEN 0x2
+#endif
+_Static_assert(offsetof(struct tcmu_cmd_entry, rsp.sense_buffer) == 16,
+               "unsupported TCMU response layout");
+
+static struct tcmu_cmd_entry *holo_read_len_entry(void *map, size_t map_len,
+                                                uint16_t cmd_id)
+{
+	struct tcmu_mailbox *mb = map;
+	size_t off, size, head, tail, walked = 0;
+	if (!mb || map_len < sizeof(*mb) || mb->version != TCMU_MAILBOX_VERSION ||
+	    !(mb->flags & TCMU_MAILBOX_FLAG_CAP_READ_LEN))
+		return NULL;
+	off = mb->cmdr_off;
+	size = mb->cmdr_size;
+	head = mb->cmd_head;
+	tail = mb->cmd_tail;
+	if (off < sizeof(*mb) || off > map_len || size > map_len - off || !size ||
+	    (off | size | head | tail) & 7 || head >= size || tail >= size)
+		return NULL;
+	while (tail != head && walked < size) {
+		struct tcmu_cmd_entry *ent = (void *)((char *)map + off + tail);
+		size_t len = tcmu_hdr_get_len(ent->hdr.len_op);
+		enum tcmu_opcode op = tcmu_hdr_get_op(ent->hdr.len_op);
+		size_t available = head > tail ? head - tail : size - tail;
+		if (len < sizeof(ent->hdr) || len > available)
+			return NULL;
+		if (op == TCMU_OP_CMD)
+			return len >= sizeof(*ent) && ent->hdr.cmd_id == cmd_id ? ent : NULL;
+		if (op != TCMU_OP_PAD || len != size - tail)
+			return NULL;
+		walked += len;
+		tail = 0;
+	}
+	return NULL;
+}
+
+static void holo_record_read_len(struct tcmu_cmd_entry *ent, uint32_t length)
+{
+	if (!ent || !length)
+		return;
+	memcpy((char *)&ent->rsp + 4, &length, sizeof(length));
+	ent->hdr.uflags |= TCMU_UFLAG_READ_LEN;
+}
+
+static bool holo_fixed_multi_read(const uint8_t *cdb)
+{
+	if (!(cdb[1] & 1))
+		return false;
+	if (cdb[0] == 0x08)
+		return cdb[2] || cdb[3] || cdb[4] != 1;
+	return cdb[0] == 0x88 && (cdb[10] || cdb[11] || cdb[12] || cdb[13] > 1);
+}
 
 static uint64_t monotonic_us(void)
 {
@@ -958,6 +1019,8 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 	uint8_t sense_len = 0;
 	uint32_t reply_len_be = 0;
 	uint32_t reply_len = 0;
+	uint32_t copied_data_len = 0;
+	struct tcmu_cmd_entry *read_len_entry = NULL;
 	uint8_t status = 0;
 	uint8_t opcode = 0;
 	uint64_t timing_start = 0;
@@ -987,6 +1050,16 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 	}
 	cdb_len_u8 = (uint8_t)cdb_len;
 	opcode = cdb[0];
+	if (opcode == 0x08 || opcode == 0x88) {
+		void *map = NULL;
+		size_t map_len = 0;
+		char *map_name = tcmu_dev_get_memory_info(dev, &map, &map_len, NULL);
+		read_len_entry = holo_read_len_entry(map, map_len, cmd->cmd_id);
+		free(map_name);
+		/* Fail before tape motion if a partial FILEMARK read cannot be returned. */
+		if (holo_fixed_multi_read(cdb) && !read_len_entry)
+			return TCMU_STS_RD_ERR;
+	}
 	initiator = holo_initiator_id();
 	initiator_len = holo_initiator_len(initiator);
 	initiator_len_u8 = (uint8_t)initiator_len;
@@ -1144,6 +1217,7 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 				return TCMU_STS_BUSY;
 			}
 		}
+		copied_data_len = (uint32_t)copy_len;
 		if (reply_len > copy_len) {
 			ret = discard_full(state->fd, reply_len - copy_len);
 			if (ret < 0) {
@@ -1174,6 +1248,11 @@ static int holo_handle_cmd(struct tcmu_device *dev, struct tcmur_cmd *runner_cmd
 		return TCMU_STS_OK;
 	case 0x02: /* CHECK CONDITION */
 		holo_watchdog_finish(state);
+		if (copied_data_len && (opcode == 0x08 || opcode == 0x88)) {
+			if (!read_len_entry)
+				return TCMU_STS_RD_ERR;
+			holo_record_read_len(read_len_entry, copied_data_len);
+		}
 		return TCMU_STS_PASSTHROUGH_ERR;
 	case 0x08: /* BUSY */
 		holo_watchdog_finish(state);
@@ -1197,9 +1276,10 @@ static struct tcmur_handler holo_handler = {
 	.handle_cmd = holo_handle_cmd,
 	/*
 	 * Serialize handler execution per device to avoid framing corruption on
-	 * a shared UNIX stream socket when multiple IO worker threads are active.
+	 * a shared UNIX stream socket. Synchronous completion also keeps cmd_tail
+	 * on the current command while recording CHECK CONDITION data length.
 	 */
-	.nr_threads = 1,
+	.nr_threads = 0,
 };
 
 int handler_init(void)

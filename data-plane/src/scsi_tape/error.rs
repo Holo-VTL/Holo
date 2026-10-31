@@ -25,6 +25,11 @@ pub enum TapeError {
     InvalidArgument(String),
     #[error("fixed block size mismatch: expected {expected}, actual {actual}")]
     FixedBlockSizeMismatch { expected: u32, actual: u32 },
+    #[error("filemark detected during read (residue {residue})")]
+    FilemarkDetected {
+        residue: u32,
+        partial_data: Vec<u8>,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("out of range: {0}")]
