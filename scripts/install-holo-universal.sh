@@ -1933,7 +1933,11 @@ EOF
   if [[ "${DRY_RUN}" == "1" ]]; then
     printf '%s\n' "${content}" | sed 's/^/[dry-run][summary] /'
   else
-    printf '%s\n' "${content}" >"${summary}"
+    local temporary
+    temporary=$(mktemp "${DATA_DIR}/.install-summary.XXXXXX")
+    printf '%s\n' "${content}" >"${temporary}"
+    chmod 0644 "${temporary}"
+    mv -fT -- "${temporary}" "${summary}"
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "${summary}"
     log "Summary: ${summary}"
   fi

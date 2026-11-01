@@ -351,6 +351,63 @@ EOF
   assert_contains "${out}" "targetcli inspection failed"
 }
 
+test_summary_replacement_in_sticky_data_dir() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "[test][skip] summary ownership regression requires Linux"
+    return
+  fi
+  local root_shell=(bash)
+  if [[ "${EUID}" -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+      echo "[test][skip] summary ownership regression requires root or passwordless sudo"
+      return
+    fi
+    root_shell=(sudo -n bash)
+  fi
+  "${root_shell[@]}" -s -- "${INSTALLER}" "${TMP_ROOT}" <<'EOF'
+set -euo pipefail
+source "$1"
+case_root=$(mktemp -d "$2/summary.XXXXXX")
+trap 'rm -rf -- "${case_root}"' EXIT
+DATA_DIR="${case_root}/data"
+SERVICE_USER=nobody
+SERVICE_GROUP=$(id -gn nobody)
+mkdir "${DATA_DIR}"
+chown root:"${SERVICE_GROUP}" "${DATA_DIR}"
+chmod 1770 "${DATA_DIR}"
+ACTION=install
+write_summary
+ACTION=upgrade
+write_summary
+summary="${DATA_DIR}/install-summary.txt"
+[[ "$(awk -F= '$1 == "action" {print $2}' "${summary}")" == upgrade ]]
+[[ "$(stat -c '%u' "${summary}")" == "$(id -u nobody)" ]]
+[[ "$(stat -c '%a' "${DATA_DIR}")" == 1770 ]]
+
+outside_file="${case_root}/outside.txt"
+printf 'preserve\n' >"${outside_file}"
+rm "${summary}"
+ln -s "${outside_file}" "${summary}"
+write_summary
+[[ -f "${summary}" && ! -L "${summary}" ]]
+[[ "$(cat "${outside_file}")" == preserve ]]
+[[ "$(stat -c '%u' "${outside_file}")" == 0 ]]
+
+outside_dir="${case_root}/outside-dir"
+mkdir "${outside_dir}"
+rm "${summary}"
+ln -s "${outside_dir}" "${summary}"
+write_summary
+[[ -f "${summary}" && ! -L "${summary}" ]]
+[[ -z "$(find "${outside_dir}" -mindepth 1 -print -quit)" ]]
+[[ "$(stat -c '%u' "${outside_dir}")" == 0 ]]
+if compgen -G "${DATA_DIR}/.install-summary.*" >/dev/null; then
+  echo "summary replacement left temporary files" >&2
+  exit 1
+fi
+EOF
+}
+
 test_purge_data_rejected_for_install() {
   local bundle="${TMP_ROOT}/bundle-purge-install"
   local osr="${TMP_ROOT}/purge-install.os-release"
@@ -607,6 +664,8 @@ echo "[test] uninstall purge dry-run"
 test_uninstall_purge_plan
 echo "[test] absent Holo backstore handler"
 test_missing_holo_backstore_handler_is_empty
+echo "[test] repeated summary replacement and symlink destinations"
+test_summary_replacement_in_sticky_data_dir
 echo "[test] purge-data rejected for install"
 test_purge_data_rejected_for_install
 echo "[test] strict storage rejection"
