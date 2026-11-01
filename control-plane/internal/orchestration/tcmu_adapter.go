@@ -628,7 +628,6 @@ func (a *TcmuAdapter) spawnHandlerWithEnv(ctx context.Context, publication *doma
 func localMountHandlerEnv(publication *domain.TargetPublication, descriptor domain.VTLDeviceDescriptor) []string {
 	env := tcmuHandlerEnv(publication)
 	if descriptor.Kind == domain.LocalDeviceKindChanger {
-		env = withEnvAssignment(env, "HOLO_MEDIA_STATE_KEY", descriptor.LibraryID)
 		env = withEnvAssignment(env, "HOLO_CHANGER_DRIVE_IDS", strings.Join(descriptor.DriveIDs, ","))
 	}
 	return env
